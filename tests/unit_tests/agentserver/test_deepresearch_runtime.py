@@ -117,6 +117,14 @@ def test_build_child_env_isolates_python_and_allows_only_http_proxy_family(
         "NO_PROXY": "process-upper.internal",
         "no_proxy": "process-lower.internal",
     }
+    tenant_proxies = {
+        "HTTP_PROXY": "http://tenant-upper-http",
+        "http_proxy": "http://tenant-lower-http",
+        "HTTPS_PROXY": "http://tenant-upper-https",
+        "https_proxy": "http://tenant-lower-https",
+        "NO_PROXY": "tenant-upper.internal",
+        "no_proxy": "tenant-lower.internal",
+    }
     monkeypatch.setenv("PATH", "/process/bin")
     monkeypatch.setenv("PYTHONHOME", "/parent/python-home")
     monkeypatch.setenv("PYTHONPATH", "/parent/python-path")
@@ -126,12 +134,7 @@ def test_build_child_env_isolates_python_and_allows_only_http_proxy_family(
         monkeypatch.setenv(key, value)
     token = bind_task_env_overlay(
         {
-            "HTTP_PROXY": "http://tenant-upper-http",
-            "http_proxy": "http://tenant-lower-http",
-            "HTTPS_PROXY": "http://tenant-upper-https",
-            "https_proxy": "http://tenant-lower-https",
-            "NO_PROXY": "tenant-upper.internal",
-            "no_proxy": "tenant-lower.internal",
+            **tenant_proxies,
             "ALL_PROXY": "socks5://tenant-forbidden-upper",
             "all_proxy": "socks5://tenant-forbidden-lower",
             "LLM_API_KEY": "tenant-secret",
@@ -145,6 +148,32 @@ def test_build_child_env_isolates_python_and_allows_only_http_proxy_family(
     assert child_env["VIRTUAL_ENV"] == str(python.parent.parent)
     assert child_env["PATH"].split(os.pathsep)[0] == str(python.parent)
     assert child_env["PATH"].split(os.pathsep)[1:] == ["/process/bin"]
-    assert {key: child_env[key] for key in process_proxies} == process_proxies
+    # Proxy keys resolve tip/overlay first (mirrors http_proxy_config), so the
+    # bound tenant overlay wins over the process spawn values.
+    assert {key: child_env[key] for key in tenant_proxies} == tenant_proxies
     for forbidden in ("PYTHONHOME", "PYTHONPATH", "ALL_PROXY", "all_proxy", "LLM_API_KEY"):
         assert forbidden not in child_env
+
+
+def test_build_child_env_falls_back_to_process_proxy_without_overlay(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from jiuwenswarm.agents.harness.common.tools.deepresearch.runtime import build_child_env
+
+    python = _fake_venv_python(tmp_path)
+    # Only uppercase keys: on Windows os.environ is case-insensitive and
+    # HTTP_PROXY/http_proxy collapse into one entry, so use non-colliding names.
+    process_proxies = {
+        "HTTP_PROXY": "http://process-upper-http",
+        "HTTPS_PROXY": "http://process-upper-https",
+        "NO_PROXY": "process-upper.internal",
+    }
+    monkeypatch.setenv("PATH", "/process/bin")
+    for key, value in process_proxies.items():
+        monkeypatch.setenv(key, value)
+
+    child_env = build_child_env(python)
+
+    # No overlay/tip bound → process spawn values are the fallback.
+    assert {key: child_env[key] for key in process_proxies} == process_proxies
