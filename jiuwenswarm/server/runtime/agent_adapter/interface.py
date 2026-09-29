@@ -79,7 +79,6 @@ from jiuwenswarm.agents.harness.common.auto_memory import (
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     EVOLUTION_INTERRUPT_METADATA_SOURCES,
     is_interrupt_resume_payload,
-    peek_hitl_batch_members,
     strip_hitl_seq_suffix,
 )
 from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
@@ -2182,16 +2181,10 @@ class JiuWenSwarm:
         else:
             confirm_payload = {"approved": False, "auto_confirm": False, "feedback": f"未知选项: {value}"}
 
-        # P4 批量卡答案展开：批量卡（同批同 auto_confirm_key 合并）的答案
-        # 需对批内每个成员 tool_call_id 逐个 update，rail 侧按各自 id 读取
-        # 后放行整批。成员注册表在发射侧（DeepAdapter）写入，此处 peek。
-        expand_ids = peek_hitl_batch_members(request_id)
-        update_targets = tuple(expand_ids) if expand_ids else (request_id,)
-        for target_id in update_targets:
-            interactive_input.update(target_id, confirm_payload)
+        interactive_input.update(request_id, confirm_payload)
         logger.info(
-            "[JiuWenSwarm] PermissionRail InteractiveInput.update: request_id=%s payload=%s members=%d",
-            request_id, confirm_payload, len(update_targets)
+            "[JiuWenSwarm] PermissionRail InteractiveInput.update: request_id=%s payload=%s",
+            request_id, confirm_payload
         )
 
         return interactive_input

@@ -295,6 +295,16 @@ class TeamManager:
         )
         # 当 cancel 请求到达时设置，通知正在执行的 pause 操作中止自身并让 cancel 执行
         self._cancel_requested: dict[str, bool] = {}
+        # session_id → 最近一次 runtime 被中断拆除的原因（"cancelled" / "paused"）。
+        # 供 follow-up waiter 区分"流任务因中断拆除而退出"与"正常 team.completed"：
+        # _cancel_requested 在 cancel_session_runtime 内即被 pop，活不到 waiter 醒来
+        # 的时刻，故由本表跨清理存活到 waiter 查询，并在下一轮 stream task 注册时清除。
+        self._session_terminal_states: dict[str, str] = {}
+        # session_id → 单调递增的 runtime 世代号。每个新回合注册 pending runtime
+        # （prepare_runtime_activation）时递增一次；cancel/pause 在入口捕获当前世代，
+        # 并在破坏性步骤前校验——世代变了说明慢 await（如 30 人团队 Runner 清理
+        # ~53s）期间已有新回合注册，本次迟到拆除必须放弃，不得误杀新回合。
+        self._session_runtime_epochs: dict[str, int] = {}
         # 追踪当前正在执行的 pause 任务，供 cancel 抢占取消
         self._active_pause_tasks: dict[str, asyncio.Task] = {}
         self._active_team_names: dict[str, str] = {}
@@ -346,6 +356,43 @@ class TeamManager:
 
     def pop_stream_task(self, session_id: str) -> asyncio.Task | None:
         return self._stream_tasks.pop(session_id, None)
+
+    def record_session_terminal_state(self, session_id: str, state: str) -> None:
+        """Record why the session's team runtime was last torn down (cancelled/paused)."""
+        self._session_terminal_states[session_id] = state
+
+    def get_session_terminal_state(self, session_id: str) -> str | None:
+        """Return the last recorded interrupt teardown reason, if any.
+
+        Read by the follow-up waiter when it exits because the team stream task
+        disappeared, to report an interrupted terminal state instead of a false
+        completion. Cleared when a new stream round registers.
+        """
+        return self._session_terminal_states.get(session_id)
+
+    def clear_session_terminal_state(self, session_id: str) -> None:
+        self._session_terminal_states.pop(session_id, None)
+
+    def bump_session_runtime_epoch(self, session_id: str) -> int:
+        """Advance and return the per-session runtime generation.
+
+        Called once at the start of every new team round, when
+        prepare_runtime_activation registers the pending runtime. Round-scoped
+        teardown operations (cancel/pause) capture the epoch at entry and
+        re-validate it before destructive steps: a changed epoch means a newer
+        round started while the teardown was stuck in a slow await, so the late
+        teardown must be abandoned instead of tearing down the new round.
+        """
+        epoch = self._session_runtime_epochs.get(session_id, 0) + 1
+        self._session_runtime_epochs[session_id] = epoch
+        return epoch
+
+    def get_session_runtime_epoch(self, session_id: str) -> int:
+        return self._session_runtime_epochs.get(session_id, 0)
+
+    def _is_current_runtime_epoch(self, session_id: str, epoch: int) -> bool:
+        """Return True when no new round has started since ``epoch`` was captured."""
+        return self._session_runtime_epochs.get(session_id, 0) == epoch
 
     def is_session_initialized(self, session_id: str) -> bool:
         """Return whether the session has ever initialized a team runtime."""
@@ -1045,9 +1092,12 @@ class TeamManager:
                     reason="switch runtime: ",
                 )
                 self._pending_team_names[session_id] = team_name
+                # 新回合起点：递增世代号。迟到的 cancel/pause 据此放弃拆除。
+                self.bump_session_runtime_epoch(session_id)
             return
 
         self._pending_team_names[session_id] = team_name
+        self.bump_session_runtime_epoch(session_id)
 
     async def _wait_same_session_runner_runtime_released(
         self,
@@ -2024,6 +2074,9 @@ class TeamManager:
         return self._workflow_handlers.pop(session_id, None)
 
     def register_stream_task(self, session_id: str, task: asyncio.Task) -> None:
+        # 新回合开始：上一轮的中断终态记录不再有效，清除以免把后续正常退出
+        # 误判为中断。
+        self.clear_session_terminal_state(session_id)
         self._stream_tasks[session_id] = task
 
     def _has_local_team_runtime(self, session_id: str) -> bool:
@@ -2454,6 +2507,10 @@ class TeamManager:
             "[TeamManager] cancel_session_runtime 入口: session_id=%s reason=%s",
             session_id, reason,
         )
+        # 世代校验（方案 epoch）：在入口（一切慢 await 之前）捕获当前世代，
+        # 后续破坏性步骤前逐一复核——期间若有新回合注册（世代已递增），
+        # 说明本次 cancel 迟到，必须放弃拆除以免误杀新回合。
+        target_epoch = self.get_session_runtime_epoch(session_id)
         # 通知正在执行的 pause 操作中止自身，让 cancel 尽快获取 lifecycle lock
         self._cancel_requested[session_id] = True
 
@@ -2479,6 +2536,19 @@ class TeamManager:
             language=language,
         )
 
+        # 世代校验点 1：上面的 settle 是慢 await（Runner 清理可达数十秒），
+        # 期间新回合可能已注册。世代变了 → 本次 cancel 迟到：放弃一切拆除，
+        # 不写终态记录（否则新回合的 waiter 会把正常退出误报为取消），
+        # 也不清理新回合的 checkpoint 断点（那属于新回合的审批状态）。
+        if not self._is_current_runtime_epoch(session_id, target_epoch):
+            self._cancel_requested.pop(session_id, None)
+            logger.info(
+                "[TeamManager] %slate cancel superseded by newer round: session_id=%s",
+                reason,
+                session_id,
+            )
+            return False
+
         # 如果 lifecycle lock 被其他操作（如 pause）持有，先尝试直接停止 Runner
         # 以避免 cancel 被 pause 阻塞长达数分钟
         lock = self._get_lifecycle_lock(session_id)
@@ -2497,6 +2567,17 @@ class TeamManager:
             # 清理 cancel_requested 标志
             self._cancel_requested.pop(session_id, None)
 
+            # 世代校验点 2：等锁期间新回合仍可能注册（register_stream_task
+            # 是同步方法，不拿本锁）。迟到 → 放弃拆除且不写终态记录。
+            if not self._is_current_runtime_epoch(session_id, target_epoch):
+                logger.info(
+                    "[TeamManager] %slate cancel superseded by newer round "
+                    "(inside lifecycle lock): session_id=%s",
+                    reason,
+                    session_id,
+                )
+                return False
+
             has_stream_task = session_id in self._stream_tasks
             has_local_team_runtime = self._has_local_team_runtime(session_id)
             has_team_runtime = (
@@ -2507,6 +2588,10 @@ class TeamManager:
             )
             if has_stream_task or has_team_runtime:
                 cancelled = True
+                # 记录终态原因：stream task 被拆除后，follow-up waiter 靠它区分
+                # "被取消退出"与"正常完成"，不再假报 is_complete
+                # （_cancel_requested 在本函数内即被 pop，活不到 waiter 查询时刻）
+                self.record_session_terminal_state(session_id, "cancelled")
                 logger.info(
                     "[TeamManager] %s cancel team session runtime: session_id=%s",
                     reason,
@@ -2629,6 +2714,9 @@ class TeamManager:
         tearing down the foreground stream task and parking the Runner-owned
         runtime in paused state so a later `chat.send` can resume it.
         """
+        # 世代校验（方案 epoch）：入口捕获当前世代，拆除前复核——
+        # 慢 await 期间新回合已注册则本次 pause 迟到，放弃拆除。
+        target_epoch = self.get_session_runtime_epoch(session_id)
         async with self._get_lifecycle_lock(session_id):
             has_stream_task = session_id in self._stream_tasks
             has_local_team_runtime = self._has_local_team_runtime(session_id)
@@ -2649,11 +2737,25 @@ class TeamManager:
                 )
                 return False
 
+            # 世代校验：等锁期间新回合可能已注册（register_stream_task
+            # 是同步方法，不拿本锁）。迟到 → 放弃拆除，不写终态记录，
+            # 否则新回合的 waiter 会把正常退出误报为暂停。
+            if not self._is_current_runtime_epoch(session_id, target_epoch):
+                logger.info(
+                    "[TeamManager] %slate pause superseded by newer round: session_id=%s",
+                    reason,
+                    session_id,
+                )
+                return False
+
             logger.info(
                 "[TeamManager] %s pause team session runtime: session_id=%s",
                 reason,
                 session_id,
             )
+            # 记录终态原因：pause 同样会拆除当前流任务（interface 随后调
+            # cancel_session_task），follow-up waiter 靠它如实上报"已暂停"而非假报完成
+            self.record_session_terminal_state(session_id, "paused")
 
             team_name = self._resolve_session_team_name(session_id)
             runner_paused = False
@@ -2679,6 +2781,18 @@ class TeamManager:
                             "[TeamManager] %s pause aborted: cancelled by cancel request, session_id=%s",
                             reason, session_id,
                         )
+                        # 世代校验：被 cancel 抢占时的让路拆除也可能迟到——
+                        # 若 Runner.pause 等待期间新回合已注册，这里的
+                        # stop/cleanup 会误杀新回合，改为放弃（cancel 自身
+                        # 会在校验中同步放弃）。
+                        if not self._is_current_runtime_epoch(session_id, target_epoch):
+                            logger.info(
+                                "[TeamManager] %slate pause abort superseded by "
+                                "newer round: session_id=%s",
+                                reason,
+                                session_id,
+                            )
+                            return False
                         team_name = self._resolve_session_team_name(session_id)
                         if team_name:
                             await self._stop_runner_team_runtime(
