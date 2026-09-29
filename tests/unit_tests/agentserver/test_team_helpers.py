@@ -93,6 +93,11 @@ class _InactiveTeamRuntimeManagerMixin:
         self._workflow_completed.pop(session_id, None)
 
     @staticmethod
+    def get_session_terminal_state(session_id: str) -> str | None:
+        # Inactive runtime was never interrupted: no terminal state recorded.
+        return None
+
+    @staticmethod
     def is_runtime_active(session_id: str) -> bool:
         _ = session_id
         return False

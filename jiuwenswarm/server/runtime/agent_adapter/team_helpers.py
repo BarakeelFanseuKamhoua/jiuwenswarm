@@ -356,6 +356,31 @@ def _build_team_event_chunk_meta(event: Any) -> tuple[dict | None, dict]:
     return agent_ref, metadata
 
 
+def _follow_up_waiter_interrupt_error(terminal_state: str | None) -> dict[str, str] | None:
+    """Map a session terminal state to the chat.error payload a follow-up waiter
+    should emit when it exits because the team stream task was torn down.
+
+    cancel_session_runtime / pause_session_runtime 在拆除 runtime 前写入终态
+    （"cancelled" / "paused"），waiter 因此退出时按终态如实上报中断，而不是
+    无条件发 is_complete 假完成。非中断退出（终态缺失/未知）返回 None，
+    保持既有行为（正常 is_complete 收尾）。chat.error 携带结构化 code，
+    relay-claw 侧透传为 errorCode 供前端精确识别。
+    """
+    if terminal_state == "cancelled":
+        return {
+            "event_type": "chat.error",
+            "error": "任务已被手动停止，本轮未完成",
+            "code": "team_cancelled",
+        }
+    if terminal_state == "paused":
+        return {
+            "event_type": "chat.error",
+            "error": "任务已暂停，本轮未完成",
+            "code": "team_paused",
+        }
+    return None
+
+
 def _extract_query_directives(query: str) -> tuple[str, bool, bool]:
     """Strip all leading slash directives from the first team query.
 
@@ -2411,6 +2436,7 @@ async def process_team_message_stream(
                     session_id,
                     rid,
                 )
+                saw_team_completed = False
                 try:
                     while True:
                         try:
@@ -2431,9 +2457,31 @@ async def process_team_message_stream(
                             is_complete=False,
                         )
                         if event.get("event_type") == "team.completed":
+                            saw_team_completed = True
                             break
                 finally:
                     team_manager.remove_waiter(session_id, rid)
+                if not saw_team_completed:
+                    # waiter 因流任务消失而退出：查终态记录区分"被 cancel/pause
+                    # 拆除"与"其他退出"。被中断时先发 chat.error 如实上报
+                    # （relay-claw 渲染为非成功终态），不再无条件假报完成。
+                    terminal_state = team_manager.get_session_terminal_state(session_id)
+                    interrupt_error = _follow_up_waiter_interrupt_error(terminal_state)
+                    if interrupt_error is not None:
+                        logger.info(
+                            "[TeamHelpers] follow-up waiter ends by terminal state %s: "
+                            "channel_id=%s session_id=%s request_id=%s",
+                            terminal_state,
+                            _resolve_channel_id(channel_id),
+                            session_id,
+                            rid,
+                        )
+                        yield AgentResponseChunk(
+                            request_id=rid,
+                            channel_id=channel_id,
+                            payload=interrupt_error,
+                            is_complete=False,
+                        )
                 yield AgentResponseChunk(
                     request_id=rid,
                     channel_id=channel_id,
