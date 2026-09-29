@@ -295,6 +295,11 @@ class TeamManager:
         )
         # 当 cancel 请求到达时设置，通知正在执行的 pause 操作中止自身并让 cancel 执行
         self._cancel_requested: dict[str, bool] = {}
+        # session_id → 最近一次 runtime 被中断拆除的原因（"cancelled" / "paused"）。
+        # 供 follow-up waiter 区分"流任务因中断拆除而退出"与"正常 team.completed"：
+        # _cancel_requested 在 cancel_session_runtime 内即被 pop，活不到 waiter 醒来
+        # 的时刻，故由本表跨清理存活到 waiter 查询，并在下一轮 stream task 注册时清除。
+        self._session_terminal_states: dict[str, str] = {}
         # 追踪当前正在执行的 pause 任务，供 cancel 抢占取消
         self._active_pause_tasks: dict[str, asyncio.Task] = {}
         self._active_team_names: dict[str, str] = {}
@@ -346,6 +351,22 @@ class TeamManager:
 
     def pop_stream_task(self, session_id: str) -> asyncio.Task | None:
         return self._stream_tasks.pop(session_id, None)
+
+    def record_session_terminal_state(self, session_id: str, state: str) -> None:
+        """Record why the session's team runtime was last torn down (cancelled/paused)."""
+        self._session_terminal_states[session_id] = state
+
+    def get_session_terminal_state(self, session_id: str) -> str | None:
+        """Return the last recorded interrupt teardown reason, if any.
+
+        Read by the follow-up waiter when it exits because the team stream task
+        disappeared, to report an interrupted terminal state instead of a false
+        completion. Cleared when a new stream round registers.
+        """
+        return self._session_terminal_states.get(session_id)
+
+    def clear_session_terminal_state(self, session_id: str) -> None:
+        self._session_terminal_states.pop(session_id, None)
 
     def is_session_initialized(self, session_id: str) -> bool:
         """Return whether the session has ever initialized a team runtime."""
@@ -2024,6 +2045,9 @@ class TeamManager:
         return self._workflow_handlers.pop(session_id, None)
 
     def register_stream_task(self, session_id: str, task: asyncio.Task) -> None:
+        # 新回合开始：上一轮的中断终态记录不再有效，清除以免把后续正常退出
+        # 误判为中断。
+        self.clear_session_terminal_state(session_id)
         self._stream_tasks[session_id] = task
 
     def _has_local_team_runtime(self, session_id: str) -> bool:
@@ -2507,6 +2531,10 @@ class TeamManager:
             )
             if has_stream_task or has_team_runtime:
                 cancelled = True
+                # 记录终态原因：stream task 被拆除后，follow-up waiter 靠它区分
+                # "被取消退出"与"正常完成"，不再假报 is_complete
+                # （_cancel_requested 在本函数内即被 pop，活不到 waiter 查询时刻）
+                self.record_session_terminal_state(session_id, "cancelled")
                 logger.info(
                     "[TeamManager] %s cancel team session runtime: session_id=%s",
                     reason,
@@ -2654,6 +2682,9 @@ class TeamManager:
                 reason,
                 session_id,
             )
+            # 记录终态原因：pause 同样会拆除当前流任务（interface 随后调
+            # cancel_session_task），follow-up waiter 靠它如实上报"已暂停"而非假报完成
+            self.record_session_terminal_state(session_id, "paused")
 
             team_name = self._resolve_session_team_name(session_id)
             runner_paused = False
