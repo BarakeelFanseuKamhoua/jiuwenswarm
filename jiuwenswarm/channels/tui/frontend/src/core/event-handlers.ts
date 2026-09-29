@@ -1211,12 +1211,6 @@ export function handleIncomingFrame(delegate: AppEventDelegate, frame: EventFram
       const requestId = typeof payload.request_id === "string" ? payload.request_id : "";
       const eventSessionId =
         typeof payload.session_id === "string" ? payload.session_id : activeSessionId;
-      // 终态广播：cancel/supplement 后服务端作废该会话全部未应答 HITL 卡片。
-      // 本地 pending question 即死卡——立即清除，防止用户提交 stale 应答
-      // 触发后端 stale_interrupt_response 循环。
-      if (payload.invalidate_pending_cards === true) {
-        delegate.setPendingQuestion(null);
-      }
       if (intent === "cancel") {
         // 先通知等待型 waiter，让其 resolve/reject。
         // 服务端可能不回显 TUI 的 requestId（使用自己的 interrupt_xxx 格式），
@@ -1329,9 +1323,8 @@ export function handleIncomingFrame(delegate: AppEventDelegate, frame: EventFram
     }
 
     case "chat.ask_user_question_expired": {
-      // 卡片失效（reason=superseded：被新一代卡片取代；subagent 审批超时/取消）。
-      // 被取代的旧卡应答会被后端死卡守卫拒绝（stale_interrupt_response），
-      // 按 request_id 精确移除当前挂起卡，屏幕上只保留最新活卡。
+      // 卡片失效（subagent 委托审批超时/取消）。按 request_id 精确匹配时
+      // 移除当前挂起卡；不匹配（其他会话/其他卡片）则忽略。
       const expiredRequestId =
         typeof payload.request_id === "string" ? payload.request_id.trim() : "";
       const current = delegate.getPendingQuestion();

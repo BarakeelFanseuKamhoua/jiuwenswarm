@@ -267,11 +267,8 @@ from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     SKILL_EVOLUTION_APPROVAL_SCHEMA,
     PermissionRailBuildOptions,
-    annotate_hitl_batch_card,
     build_permission_rail,
     convert_interactions_to_ask_user_question,
-    discard_hitl_batch_member_entry,
-    read_hitl_batch_merge_key,
     strip_hitl_seq_suffix,
 )
 from jiuwenswarm.agents.harness.common.tools.todo_compat import (
@@ -2525,12 +2522,18 @@ class JiuWenSwarmDeepAdapter:
         # 同一 base tool_call_id 同一时刻至多一张活卡（新卡发出即取代旧卡）。
         #   _hitl_card_instances: final_id -> base tcid（卡片身份登记）
         #   _hitl_base_live_instance: base tcid -> 当前活卡 final_id
+        #   _hitl_base_live_questions: base tcid -> 当前活卡 questions_key
+        #     （挂起表复用判定：resume 重放撞见同 base 同 questions 的挂起卡
+        #     → 重发原卡而非生成新代，见 _dedupe_ask_user_card 复用分支）
         #   _hitl_dead_card_ids: 已死卡 final_id（被新卡取代/终态/轮次结束）
         # 应答到达时（guard_stale_interrupt_response）：命中死卡 → stale 拒绝，
         # 不进 runtime 重放——切断"点一张旧卡 → resume → 再弹新卡"反馈循环。
+        # 作答被接受时（_consume_hitl_live_card_for_answer）：挂起表销毁该
+        # base 条目（不进死卡集）——回答了"还挂着没有"，而非"发过没有"。
         # 内存态：进程重启后失效（fail-open，由磁盘态相位守卫兜底）。
         self._hitl_card_instances: dict[str, str] = {}
         self._hitl_base_live_instance: dict[str, str] = {}
+        self._hitl_base_live_questions: dict[str, str] = {}
         self._hitl_dead_card_ids: set[str] = set()
         self._task_execution_rail: TaskExecutionRail | None = None
         self._skill_turbo_prompt_rail: Any = None
@@ -13860,6 +13863,11 @@ class JiuWenSwarmDeepAdapter:
                 request.session_id,
                 exc_info=True,
             )
+        # 作答消费销毁（挂起表转移）：guard 放行（含 fail-open）= 该卡应答
+        # 被接受为当前代，挂起表摘除该 base 条目——覆盖 SkillTurbo resume
+        # 与 deferred DeepAgent 两条路径（guard 唯一公共入口在此）。此后
+        # resume 重放若重新走到同 base 发卡点，走新代兜底而非复用已作答卡。
+        self._consume_hitl_live_card_for_answer(request)
         from openjiuwen.core.session.agent import create_agent_session
 
         session = create_agent_session(
@@ -14153,15 +14161,6 @@ class JiuWenSwarmDeepAdapter:
                             _resume_emitted_ask_questions,
                         ):
                             continue
-                        # 新卡顶替旧卡时，先广播旧卡失效再发新卡（superseded）。
-                        _superseded_expiry = self._pop_superseded_expiry_chunk(
-                            _payload,
-                            request_id=rid,
-                            channel_id=cid,
-                            session_id=getattr(request, "session_id", None),
-                        )
-                        if _superseded_expiry is not None:
-                            yield _superseded_expiry
                     yield hitl_chunk
                 return
             except SkillTurboNotHandled as exc:
@@ -15360,11 +15359,6 @@ class JiuWenSwarmDeepAdapter:
             "success": success,
             "message": message,
         }
-        if intent in ("cancel", "supplement"):
-            # 终态广播：通知前端作废该 session 全部未应答的 HITL 卡片。
-            # cancel/supplement 终止整个任务，所有 pending 卡片均为死卡；
-            # 前端据此置灰/移除，防止用户点击死卡触发 stale resume。
-            payload["invalidate_pending_cards"] = True
 
         if new_input:
             payload["new_input"] = new_input
@@ -15480,8 +15474,6 @@ class JiuWenSwarmDeepAdapter:
             "success": True,
             "message": message,
         }
-        # 终态广播：作废该 session 全部未应答的 HITL 卡片（见 process_interrupt）
-        payload["invalidate_pending_cards"] = True
         if new_input:
             payload["new_input"] = new_input
         if paused_goal_payload is not None:
@@ -20193,9 +20185,7 @@ class JiuWenSwarmDeepAdapter:
                 and not attach_goal_request
                 and not goal_stream_request
             )
-            # P4：排空窗包装器合并同批同 auto_confirm_key 的权限/确认中断
-            # （size==1 组原样透传，行为与未包装一致）。
-            async for chunk in self._merge_batch_interaction_stream(interaction_stream):
+            async for chunk in interaction_stream:
                 # RESUME_SIGNAL（agent-core resume 分支）：应答已受理、重放开
                 # 始——先标相位（paused → resumed），再交给 suppress 清除决策
                 # （suppress 生效时该信号 chunk 会 skip，标记必须在 continue 前）。
@@ -20257,11 +20247,6 @@ class JiuWenSwarmDeepAdapter:
                     if parsed is not None:
                         if should_skip_duplicate_ask_user(parsed):
                             continue
-                        _superseded_expiry = self._pop_superseded_expiry_chunk(
-                            parsed, request_id=rid, channel_id=cid, session_id=session_id
-                        )
-                        if _superseded_expiry is not None:
-                            yield _superseded_expiry
                         if self._is_ask_user_payload(parsed):
                             hitl_pending_stream = True
                         if accumulated_text:
@@ -20444,11 +20429,6 @@ class JiuWenSwarmDeepAdapter:
                                 )
                             if should_skip_duplicate_ask_user(parsed):
                                 continue
-                            _superseded_expiry = self._pop_superseded_expiry_chunk(
-                                parsed, request_id=rid, channel_id=cid, session_id=session_id
-                            )
-                            if _superseded_expiry is not None:
-                                yield _superseded_expiry
                             if self._is_ask_user_payload(parsed):
                                 hitl_pending_stream = True
                             if parsed.get("event_type") == "chat.final":
@@ -20489,11 +20469,6 @@ class JiuWenSwarmDeepAdapter:
                             )
                         if should_skip_duplicate_ask_user(parsed):
                             continue
-                        _superseded_expiry = self._pop_superseded_expiry_chunk(
-                            parsed, request_id=rid, channel_id=cid, session_id=session_id
-                        )
-                        if _superseded_expiry is not None:
-                            yield _superseded_expiry
                         if self._is_ask_user_payload(parsed):
                             hitl_pending_stream = True
                         if parsed.get("event_type") == "chat.final":
@@ -20565,11 +20540,6 @@ class JiuWenSwarmDeepAdapter:
                         )
                     if should_skip_duplicate_ask_user(parsed):
                         continue
-                    _superseded_expiry = self._pop_superseded_expiry_chunk(
-                        parsed, request_id=rid, channel_id=cid, session_id=session_id
-                    )
-                    if _superseded_expiry is not None:
-                        yield _superseded_expiry
                     if self._is_ask_user_payload(parsed):
                         hitl_pending_stream = True
                     if parsed.get("event_type") == "chat.final":
@@ -20936,9 +20906,9 @@ class JiuWenSwarmDeepAdapter:
                 is_complete=True,
             )
         else:
-            # 重放轮正常完成且无新卡在飞：相位回 idle（仅 resumed 时转换；
-            # paused/终态/普通轮次 no-op，见方法 docstring）。
-            self._mark_interrupt_idle_inmemory()
+            # 重放轮正常完成且无新卡在飞：轮次收口（相位回 idle + 全部
+            # 活卡转死卡，见方法 docstring）。
+            self._mark_round_end_inmemory()
             yield AgentResponseChunk(
                 request_id=rid,
                 channel_id=cid,
@@ -20972,96 +20942,6 @@ class JiuWenSwarmDeepAdapter:
         source = str(payload.get("source") or "").strip()
         return source not in {"subagent_skill_load", "subagent_tool_permission"}
 
-    # P4 批量卡排空窗：同批权限/确认中断在 commit_interrupt 中背靠背写入，
-    # 0.2s 内连续到达视为同批；窗口超时即认为批次结束。
-    _HITL_BATCH_DRAIN_TIMEOUT_SEC = 0.2
-
-    async def _merge_batch_interaction_stream(self, interaction_stream):
-        """P4 排空窗合并包装器：同批同 auto_confirm_key 的权限/确认中断合并。
-
-        遇到合并候选 chunk（``read_hitl_batch_merge_key`` 非 None）即开启排
-        空窗：在 ``_HITL_BATCH_DRAIN_TIMEOUT_SEC`` 窗长内持续吸收紧邻的候
-        选 chunk 并按 auto_confirm_key 分组；窗内每组 size==1 原样透传（与
-        未包装行为完全一致），size>=2 合成列表 payload 的 ``__interaction__``
-        chunk（由 ``annotate_hitl_batch_card`` 在解析侧出批量卡）。非候选
-        chunk 关闭窗口并按原序透传。
-
-        排空等待必须使用持久 anext 任务 + ``asyncio.wait(timeout=)``：超时
-        不取消任务——``InteractionOutputStream.__anext__`` 被取消会丢弃已
-        出队未返回的 chunk（agent 永久挂起）；任务保留至下一轮继续等待同
-        一任务。finally 中的 cancel 只发生在生成器被外部放弃的终止路径。
-        """
-        from types import SimpleNamespace
-
-        _unset = object()
-        aiter = interaction_stream.__aiter__()
-        anext_task: asyncio.Future | None = None
-        pending: Any = _unset
-
-        try:
-            while True:
-                # 1) 取下一个 chunk：优先消费窗口关闭时回推的预读 chunk。
-                if pending is not _unset:
-                    chunk, pending = pending, _unset
-                else:
-                    if anext_task is None:
-                        anext_task = asyncio.ensure_future(aiter.__anext__())
-                    try:
-                        chunk = await anext_task
-                    except StopAsyncIteration:
-                        return
-                    anext_task = None
-
-                # 2) 非合并候选（普通 chunk / ask_user / activate_confirm /
-                #    列表 payload）原样透传。
-                key = read_hitl_batch_merge_key(chunk)
-                if key is None:
-                    yield chunk
-                    continue
-
-                # 3) 排空窗：持续吸收紧邻候选 chunk，按 auto_confirm_key 分
-                #    组（dict 保持插入序 = 到达序）。
-                window: dict[str, list[Any]] = {key: [chunk]}
-                stream_done = False
-                while True:
-                    if anext_task is None:
-                        anext_task = asyncio.ensure_future(aiter.__anext__())
-                    done, _ = await asyncio.wait(
-                        {anext_task}, timeout=self._HITL_BATCH_DRAIN_TIMEOUT_SEC
-                    )
-                    if not done:
-                        break  # 窗口超时关闭；anext 任务保留待下轮继续
-                    try:
-                        next_chunk = anext_task.result()
-                    except StopAsyncIteration:
-                        anext_task = None
-                        stream_done = True
-                        break
-                    anext_task = None
-                    next_key = read_hitl_batch_merge_key(next_chunk)
-                    if next_key is None:
-                        # 非候选：关闭窗口，该 chunk 回推保持原序。
-                        pending = next_chunk
-                        break
-                    window.setdefault(next_key, []).append(next_chunk)
-
-                # 4) flush 各组：size==1 原样透传；size>=2 合成列表 payload。
-                for members in window.values():
-                    if len(members) == 1:
-                        yield members[0]
-                    else:
-                        yield SimpleNamespace(
-                            type="__interaction__",
-                            payload=[member.payload for member in members],
-                        )
-                if stream_done:
-                    return
-        finally:
-            # 终止路径（GeneratorExit / 外部取消）：消费者已放弃本流，丢弃
-            # 挂起的 anext 任务。正常运行路径不进入此分支。
-            if anext_task is not None and not anext_task.done():
-                anext_task.cancel()
-
     def _dedupe_ask_user_card(
         self,
         parsed: dict | None,
@@ -21072,6 +20952,14 @@ class JiuWenSwarmDeepAdapter:
 
         - 同一中断的多通道重复（独立 ``__interaction__`` 与 controller 嵌套）：
           同 call id + 同 questions → 跳过。
+        - 挂起表复用（跨请求）：该 base 仍有同 questions 的活卡挂起（作答
+          消费时销毁，见 _consume_hitl_live_card_for_answer）→ 重发原卡
+          而非生成新代。典型场景：乱序点击后 resume 重放会重新走到未作答
+          interrupt 的发卡点，若无此分支将诞生 ``{id}#{n+1}`` 新卡取代原卡
+          ——用户点回原卡即被 stale 守卫拒绝，空流被 relay-claw 空回弹启发式
+          误判中止（full.log 2026-09-28 事故形态）。重发同 request_id 对
+          relay-claw 五层幂等（注册早退 + 前端 requestId 去重），wire 协议
+          零变动；序号计数不动（不新增代次）。
         - 同一外层 skill_acceleration_exec 内的第 N 次中断共用同一 call id：
           questions 不同 → 卡片 request_id 改为 ``{id}#{n}`` 放行（前端才显示为
           独立卡片）；作答回传时由 _build_interactive_input_from_answers 入口
@@ -21091,6 +20979,15 @@ class JiuWenSwarmDeepAdapter:
             for fid, qk in emitted_questions.items()
         ):
             return True
+        # 挂起表复用：活卡还挂着且 questions 一致 → 重发原卡（不改代次、
+        # 不动相位）；questions 不同则落回下方新代逻辑（合法 re-ask 场景）。
+        live_final = getattr(self, "_hitl_base_live_instance", {}).get(request_id)
+        live_questions = getattr(self, "_hitl_base_live_questions", {}).get(request_id)
+        if live_final and live_questions is not None and live_questions == questions_key:
+            parsed["request_id"] = live_final
+            emitted_request_ids.add(live_final)
+            emitted_questions[live_final] = questions_key
+            return False
         seq = self._ask_user_card_seq.get(request_id, 0)
         final_id = request_id if seq == 0 else f"{request_id}#{seq + 1}"
         self._ask_user_card_seq[request_id] = seq + 1
@@ -21098,21 +20995,12 @@ class JiuWenSwarmDeepAdapter:
         emitted_questions[final_id] = questions_key
         if final_id != request_id:
             parsed["request_id"] = final_id
-        # P4 批量注册表清理：非批量卡（permission/confirm 单卡，无
-        # batch_size）以同 base 发出时，作废旧批量注册——否则后续作答会
-        # 误展开到已不存在的批成员。批量卡（有 batch_size）的 record 已在
-        # annotate_hitl_batch_card 中按同 base 覆盖，无需处理。
-        if parsed.get("source") in ("permission_interrupt", "confirm_interrupt"):
-            if "batch_size" not in parsed:
-                discard_hitl_batch_member_entry(request_id)
         # 中断实例活性登记：新卡发出即取代同 base 的旧卡（旧卡应答将成为
         # stale 被守卫拒绝）。同一中断的多通道重复已在上方 questions_key
         # 判定中跳过，不会走到这里。
-        superseded_id = self._register_hitl_card_instance(base_id=request_id, final_id=final_id)
-        if superseded_id:
-            # 内部标记（下划线前缀）：调用方在新卡 chunk 之前据此广播旧卡
-            # 失效（reason=superseded），随 yield 前 pop，不发给前端。
-            parsed["_superseded_request_id"] = superseded_id
+        self._register_hitl_card_instance(
+            base_id=request_id, final_id=final_id, questions_key=questions_key
+        )
         # 中断状态机：新卡片发出 → 相位重开为 paused（取消上一代终态）。
         # 只标内存态（runtime/loop session）：HITL 中断时 checkpointer 的
         # interrupt_agent_execute 会随 loop session 状态落盘；卡片本身是
@@ -21120,74 +21008,45 @@ class JiuWenSwarmDeepAdapter:
         self._mark_interrupt_paused_inmemory(card_id=final_id, source=str(parsed.get("source") or ""))
         return False
 
-    @staticmethod
-    def _pop_superseded_expiry_chunk(
-        parsed: dict | None,
+    def _register_hitl_card_instance(
+        self,
         *,
-        request_id: str,
-        channel_id: str,
-        session_id: str | None = None,
-    ) -> "AgentResponseChunk | None":
-        """取出（并移除）parsed 中的被取代旧卡标记，构造旧卡失效事件。
-
-        配套 ``_dedupe_ask_user_card``：新卡顶替同 base 旧卡时，前端屏幕上
-        旧卡仍显示、可点击，但应答已被死卡守卫拒绝（stale_interrupt_response）。
-        在新卡 chunk 之前先 yield 本事件（chat.ask_user_question_expired,
-        reason=superseded），前端按 request_id 精确移除旧卡，屏幕上只保留
-        最新活卡。无被取代旧卡时返回 None（调用方 no-op）。
-        """
-        if not isinstance(parsed, dict):
-            return None
-        superseded_id = parsed.pop("_superseded_request_id", None)
-        if not isinstance(superseded_id, str) or not superseded_id:
-            return None
-        payload: dict = {
-            "event_type": "chat.ask_user_question_expired",
-            "request_id": superseded_id,
-            "reason": "superseded",
-        }
-        if session_id:
-            payload["session_id"] = session_id
-        source = str(parsed.get("source") or "").strip()
-        if source:
-            payload["source"] = source
-        logger.info(
-            "[JiuWenClaw] superseded hitl card invalidated: old=%s new=%s "
-            "session_id=%s",
-            superseded_id,
-            str(parsed.get("request_id") or ""),
-            session_id or "",
-        )
-        return AgentResponseChunk(
-            request_id=request_id,
-            channel_id=channel_id,
-            payload=payload,
-            is_complete=False,
-        )
-
-    def _register_hitl_card_instance(self, *, base_id: str, final_id: str) -> str | None:
+        base_id: str,
+        final_id: str,
+        questions_key: str = "",
+    ) -> None:
         """登记新卡片实例并取代同 base 的旧卡（旧卡标记为死卡）。
 
-        返回被取代的旧卡 final_id（无旧卡/登记失败返回 None）——调用方据此
-        在新卡 chunk 之前向前端广播旧卡失效（chat.ask_user_question_expired,
-        reason=superseded），避免屏幕上堆积已死的旧卡被用户误点。
+        questions_key 随活卡一起登记（挂起表复用判定用）；空串表示未知
+        questions（外部直接调用兼容路径），永不命中复用分支——落回新代
+        逻辑，保守安全。
+
+        死卡集供 guard_stale_interrupt_response 拒绝旧卡应答；被取代的
+        旧卡不再向前端广播失效事件——旧卡应答会被守卫拒绝，屏幕上的
+        旧卡由新卡到达自行覆盖或随会话清理。
         """
         try:
             self._hitl_card_instances[final_id] = base_id
             prev_live = self._hitl_base_live_instance.get(base_id)
-            superseded: str | None = None
             if prev_live is not None and prev_live != final_id:
                 self._hitl_dead_card_ids.add(prev_live)
-                superseded = prev_live
             self._hitl_base_live_instance[base_id] = final_id
+            self._hitl_base_live_questions[base_id] = questions_key
             # 有界注册表：防止长生命周期 adapter 无限增长
             if len(self._hitl_card_instances) > 1024:
                 for old_id in list(self._hitl_card_instances.keys())[:512]:
-                    self._hitl_card_instances.pop(old_id, None)
+                    old_base = self._hitl_card_instances.pop(old_id, None)
                     self._hitl_dead_card_ids.discard(old_id)
+                    # 淘汰条目若恰为该 base 的当前活卡，live/questions 一并
+                    # 摘除（否则两表泄漏指向已淘汰 final_id 的悬空条目）。
+                    if (
+                        old_base is not None
+                        and self._hitl_base_live_instance.get(old_base) == old_id
+                    ):
+                        self._hitl_base_live_instance.pop(old_base, None)
+                        self._hitl_base_live_questions.pop(old_base, None)
                 if len(self._hitl_dead_card_ids) > 2048:
                     self._hitl_dead_card_ids.clear()
-            return superseded
         except Exception:  # noqa: BLE001 — 登记失败不影响发卡主流程
             logger.debug(
                 "[JiuWenClaw] register hitl card instance failed base=%s final=%s",
@@ -21195,7 +21054,6 @@ class JiuWenSwarmDeepAdapter:
                 final_id,
                 exc_info=True,
             )
-            return None
 
     def _invalidate_all_hitl_card_instances(self) -> None:
         """终态/轮次结束：全部活卡转死卡（注册表未初始化时 no-op）。"""
@@ -21206,6 +21064,30 @@ class JiuWenSwarmDeepAdapter:
         for final_id in live.values():
             dead.add(final_id)
         live.clear()
+        questions = getattr(self, "_hitl_base_live_questions", None)
+        if isinstance(questions, dict):
+            questions.clear()
+
+    def _consume_hitl_live_card_for_answer(self, request: AgentRequest) -> None:
+        """作答被接受（stale 守卫放行后）：销毁该 base 的挂起表活条目。
+
+        挂起表的语义是"还挂着没有"而非"发过没有"：作答被接受即不再挂起。
+        条目销毁后，resume 重放若重新走到同 base 发卡点，说明答案未注入该
+        interrupt（或新 questions），按新代兜底而非误判复用。销毁不进死卡
+        集——同代卡的重复应答由 PermissionResponseLedger 按原始 id 幂等
+        去重（语义锚点 test_stale_answer_rejects_non_live_generation_of_
+        known_base：销毁后该卡应答 base 未登记，fail-open）。
+        """
+        params = request.params if isinstance(getattr(request, "params", None), dict) else {}
+        base_id = strip_hitl_seq_suffix(str(params.get("request_id") or ""))
+        if not base_id:
+            return
+        live = getattr(self, "_hitl_base_live_instance", None)
+        if isinstance(live, dict):
+            live.pop(base_id, None)
+        questions = getattr(self, "_hitl_base_live_questions", None)
+        if isinstance(questions, dict):
+            questions.pop(base_id, None)
 
     def _is_stale_hitl_card_answer(self, final_id: str) -> bool:
         """应答是否命中已死卡片实例（未登记的卡片 fail-open 由相位守卫裁决）。
@@ -21305,6 +21187,19 @@ class JiuWenSwarmDeepAdapter:
                 "[JiuWenClaw] mark interrupt idle failed",
                 exc_info=True,
             )
+
+    def _mark_round_end_inmemory(self) -> None:
+        """轮次正常完成且无新卡在飞：相位回 idle + 全部活卡转死卡。
+
+        idle 标记仅 resumed 时转换（paused/终态/普通轮次 no-op）；活卡
+        失效无条件执行——走到本调用点时本轮流内已无 pending 卡（在飞的
+        轮次走 paused 收尾分支），注册表残留的活卡必然是历史轮已答/被
+        绕开的死卡。失效后其应答由 ``guard_stale_interrupt_response``
+        回 ``stale_interrupt_response`` 拒绝，不再 fail-open 静默吞答案
+        （兑现注册表注释「轮次结束」失效语义）。
+        """
+        self._mark_interrupt_idle_inmemory()
+        self._invalidate_all_hitl_card_instances()
 
     async def guard_stale_interrupt_response(self, request: AgentRequest) -> bool:
         """终态守卫：HITL 应答是否落在已被取消/补充的会话上（True = 过期，应拒绝）。
@@ -21858,15 +21753,6 @@ class JiuWenSwarmDeepAdapter:
                     return None
 
                 if chunk_type == "__interaction__":
-                    if isinstance(payload, (list, tuple)):
-                        # P4 批量卡：同批同 auto_confirm_key 合并出的列表
-                        # payload。卡面取首成员（id 即首成员 tool_call_id），
-                        # annotate 追加 ×N 文案并注册成员供应答侧展开。
-                        batch_card = convert_interactions_to_ask_user_question(
-                            list(payload)
-                        )
-                        annotate_hitl_batch_card(batch_card, payload)
-                        return batch_card
                     if isinstance(payload, dict) and payload.get("interaction_type") == "activate_confirm":
                         return {
                             "event_type": "harness.activate_interaction",
