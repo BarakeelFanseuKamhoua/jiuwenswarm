@@ -19,7 +19,7 @@ from jiuwenswarm.agents.harness.common.tools.deepresearch.path_safety import (
     is_direct_regular_file,
     private_mode_is_compatible,
 )
-from jiuwenswarm.common.local_env_config import export_spawn_environ
+from jiuwenswarm.common.local_env_config import export_spawn_environ, read_env_if_set
 
 _ALLOWED_PROXY_KEYS = (
     "HTTP_PROXY",
@@ -116,8 +116,15 @@ def build_child_env(executable: Path) -> dict[str, str]:
     for key in _FORBIDDEN_INHERITED_KEYS:
         child_env.pop(key, None)
     for key in _ALLOWED_PROXY_KEYS:
-        value = os.environ.get(key)
-        if value is not None:
+        # Tip/overlay first (agent env refreshed on login / proxy change via catalog
+        # sync), then the process spawn value as fallback. Mirrors
+        # jiuwenswarm.common.http_proxy_config so a child spawned after a proxy
+        # change inherits the current proxy without a sidecar restart. A fresh child
+        # is spawned per research run, so each run resolves the latest proxy at spawn.
+        value = read_env_if_set(key)
+        if value is None or not str(value).strip():
+            value = os.environ.get(key)
+        if value:
             child_env[key] = value
         else:
             child_env.pop(key, None)

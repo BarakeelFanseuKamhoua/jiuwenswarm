@@ -448,6 +448,9 @@ class AgentWebSocketServer:
                 ping_interval=self._ping_interval,
                 ping_timeout=self._ping_timeout,
                 max_size=AGENT_WS_MAX_MESSAGE_BYTES,
+                # 控制帧(含 keepalive ping)必须始终可读：max_queue 默认 32 满时
+                # transfer_data 阻塞不再读后续帧，ping 无 pong → 保活误判超时掐断在途请求。
+                max_queue=None,
             )
         except ImportError:
             import websockets
