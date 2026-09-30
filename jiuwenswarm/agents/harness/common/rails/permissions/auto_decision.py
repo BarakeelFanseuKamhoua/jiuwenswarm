@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -371,8 +372,45 @@ def _text_arg(args: Mapping[str, Any], *keys: str) -> str:
 def _closed_internal_args_valid(facts: ToolDecisionFacts, network: Any) -> bool:
     family = facts.capability.operation_family
     args = facts.untrusted_args
+    if family == "internal_readonly":
+        name = facts.tool_name
+        if name == "cron_list_jobs":
+            return not args
+        if name == "heartbeat_list_jobs":
+            return args.keys() <= {"scope"} and args.get("scope") in (None, "current")
+        if name == "convert_timestamp_to_utc8_time":
+            value = args.get("timestamp")
+            # Accept only JSON numbers, not bool or subclasses with custom numeric behavior.
+            integer = type(value) is int  # pylint: disable=huawei-unidiomatic-typecheck
+            floating = type(value) is float  # pylint: disable=huawei-unidiomatic-typecheck
+            return args.keys() == {"timestamp"} and (integer or (floating and math.isfinite(value)))
+        field = "job_id" if name.startswith(("cron_", "heartbeat_")) else "terminal_id"
+        preview = name.endswith("preview_job")
+        # bool is an int subclass but is not a valid preview count.
+        integer_count = type(args.get("count")) is int  # pylint: disable=huawei-unidiomatic-typecheck
+        return bool(
+            args.keys() <= ({field, "count"} if preview else {field})
+            and isinstance(args.get(field), str) and args[field].strip()
+            and ("count" not in args or integer_count)
+        )
     if family == "session_status":
-        return not args
+        schemas = {
+            "session_list": {"query", "limit", "offset"},
+            "session_message_list": {"target_session_id", "limit", "offset"},
+            "session_read": {"target_session_id", "cursor", "limit", "max_output_chars"},
+        }
+        allowed = schemas.get(facts.tool_name)
+        if allowed is None or not args.keys() <= allowed:
+            return False
+        if facts.tool_name == "session_read" and "target_session_id" not in args:
+            return False
+        for key, value in args.items():
+            if key in {"limit", "offset", "max_output_chars"}:
+                if type(value) is not int or value < (0 if key == "offset" else 1):
+                    return False
+            elif not isinstance(value, str) or (key != "query" and not value.strip()):
+                return False
+        return True
     if family == "skill_read":
         name = args.get("skill_name")
         path = args.get("relative_file_path")
@@ -436,9 +474,12 @@ def terminal_internal_route(
     facts: ToolDecisionFacts,
     *,
     subagent_runtime_control_verified: bool = False,
+    readonly_binding_verified: bool = False,
 ) -> DecisionRoute | None:
     """Return the allow route for closed canonical Host actions."""
     network = _internal_network_scope(facts)
+    if facts.capability.operation_family == "internal_readonly" and not readonly_binding_verified:
+        return None
     if (
         facts.capability.facts_source != "host_static"
         or facts.capability.alias_conflict
@@ -461,6 +502,7 @@ def terminal_internal_route(
     if network.absolute_uris:
         return None
     allowed_effects = {
+        "internal_readonly": frozenset(),
         "browser_session_observe": frozenset({"session_cache_write"}),
         "browser_session_recall": frozenset(),
         "memory_read": frozenset(),

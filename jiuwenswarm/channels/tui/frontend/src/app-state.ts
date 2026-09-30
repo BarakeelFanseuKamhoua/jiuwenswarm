@@ -1316,8 +1316,8 @@ export class CliPiAppState {
           code: "NOT_SUPERVISED",
           message: "Running outside agentos-tui launcher; start via `agentos-tui` to use /switch",
         },
-      requestHandoff: (target, switchContent) => this.handoffPort
-        ? this.handoffPort.requestHandoff(target, switchContent)
+      requestHandoff: (target, switchContent, cmd) => this.handoffPort
+        ? this.handoffPort.requestHandoff(target, switchContent, cmd)
         : Promise.reject(new Error("Handoff port not available (not supervised)")),
       hasServerTask: () => this.taskLifecycle?.hasServerTask() ?? this.hasServerTask(),
       cancelAndWaitForIdle: (opts) => this.taskLifecycle
@@ -3075,6 +3075,7 @@ export class CliPiAppState {
           ...tool,
           status: orphan.tool.status,
           result: orphan.tool.result,
+          renderedResult: orphan.tool.renderedResult,
           summary: orphan.tool.summary,
           isError: orphan.tool.isError,
         }

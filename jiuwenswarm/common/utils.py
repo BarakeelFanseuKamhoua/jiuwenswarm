@@ -21,7 +21,8 @@ Runtime layout:
 - <root>/agent/sessions
 - <root>/agent/workspace/agent-data.json
 - <root>/agent/.checkpoint
-- <root>/agent/.logs（gateway.log / channel.log / agent_server.log / full.log）
+- <root>/agent/.logs（channel.log / agent_server.log / full.log；gateway.log 默认同目录，
+  可通过环境变量 AGENTOS_GATEWAY_LOG_DIR 指定独立目录，如 Linux 部署的 /var/log/agentos）
 
 内置模板位于包内 ``jiuwenswarm/resources/``（含 ``agent/`` 下各技能模板以及 ``skills_state.json``）。
 """
@@ -45,8 +46,15 @@ import logging
 from logging.handlers import BaseRotatingHandler
 from ruamel.yaml import YAML
 
+from jiuwenswarm.common.runtime_log_filter import install_runtime_log_filter
+
 _LOG_FILE_MAX_BYTES = 20 * 1024 * 1024
 _LOG_FILE_BACKUP_COUNT = 20
+
+# gateway 支持独立的日志目录（与其余组件日志分离），轮转归档文件同样落在该目录下。
+# 默认不启用（gateway.log 与其它日志同目录），由环境变量 AGENTOS_GATEWAY_LOG_DIR 指定，
+# Linux 部署脚本（deploy/yuanrong/gateway_handler.sh）注入 /var/log/agentos。
+_GATEWAY_LOG_DIR_ENV = "AGENTOS_GATEWAY_LOG_DIR"
 
 
 @dataclass
@@ -290,6 +298,17 @@ class _ComponentNameFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         return _log_component_from_logger_name(record.name) == self.component
+
+
+class _ExcludeComponentFilter(logging.Filter):
+    """仅拦截指定组件（由 logger 名判定）的日志记录，其余全部放行。"""
+
+    def __init__(self, component: str) -> None:
+        super().__init__()
+        self.component = component
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _log_component_from_logger_name(record.name) != self.component
 
 
 class _CompositeFilter(logging.Filter):
@@ -726,6 +745,7 @@ def _install_default_builtin_skills(
     - huawei-cloud-maas-setup: 华为云MaaS购买与配置引导
     - rsi-program-dataset-creator: 程序演进任务设计与评测编排
     - agent-creator: Agent 模板包创建助手
+    - agent-group-creator: 专家团包创建助手
     - plugin-creator: 插件能力扩展包创建助手
     - baoyu-image-gen: AI 图像生成（多平台 API，文生图/参考图/批量生成）
     - docx-pro: Word 富格式文档生成/Markdown 互转/目录水印
@@ -749,6 +769,7 @@ def _install_default_builtin_skills(
         "huawei-cloud-maas-setup",
         "rsi-program-dataset-creator",
         "agent-creator",
+        "agent-group-creator",
         "plugin-creator",
         "baoyu-image-gen",
         "docx-pro",
@@ -824,6 +845,7 @@ def ensure_default_builtin_skills() -> None:
         "huawei-cloud-maas-setup",
         "rsi-program-dataset-creator",
         "agent-creator",
+        "agent-group-creator",
         "plugin-creator",
         "baoyu-image-gen",
         "docx-pro",
@@ -866,6 +888,14 @@ def ensure_config_migrated_from_template(
 
     版本号短路：用户 config.config_version == 程序 VERSION 时跳过迁移；
     不一致时迁移，迁移成功后由 migrate_config_from_template 把 config_version 写回程序版本。
+
+    合并为纯增量操作：只补齐模板新增项，不会删除用户 config.yaml 中
+    模板里没有的配置项（模板是示例文档而非 schema，其中本就包含留给
+    用户填写的开放式配置节）。因此本函数可以每次启动安全调用。
+
+    Merges newly added template keys into the user's config.yaml. The merge is
+    purely additive: keys the operator added that the template does not contain
+    are preserved, so this is safe to call on every start.
     """
     from jiuwenswarm.common.config import migrate_config_from_template, load_yaml_round_trip
     from jiuwenswarm.common._build_config import VERSION
@@ -1075,17 +1105,6 @@ def prepare_workspace(
             overwrite=overwrite,
         ):
             shutil.copy2(config_yaml_src, config_yaml_dest)
-
-    builtin_rules_src = resources_dir / "builtin_rules.yaml"
-    builtin_rules_dest = config_dest_dir / "builtin_rules.yaml"
-    if builtin_rules_src.is_file() and (overwrite or not builtin_rules_dest.exists()):
-        with TrackCopyDiff(
-            dest=builtin_rules_dest,
-            is_file=True,
-            cumulative=cumulative_diff,
-            overwrite=overwrite,
-        ):
-            shutil.copy2(builtin_rules_src, builtin_rules_dest)
 
     resolved_lang = _resolve_preferred_language(config_yaml_dest, preferred_language)
 
@@ -1450,7 +1469,7 @@ def _ensure_mcp_builtins(
             if path.is_dir() and not path.name.startswith(".")
         ]
         packages = iter_mcp_packages(tmp_dir)
-        if not package_dirs or len(packages) != len(package_dirs):
+        if len(packages) != len(package_dirs):
             raise OSError("MCP seed contains an invalid package manifest")
     except (OSError, zipfile.BadZipFile) as exc:
         logger.error("[mcp_builtins] extract %s failed: %s", seed_zip, exc)
@@ -1487,13 +1506,21 @@ def _ensure_mcp_builtins(
         pass  # 仅登记到 diff 摘要，文件已解压就位
 
 
-def prepare_runtime_workspace(*, cleanup_stale_descs: bool = True) -> None:
+def prepare_runtime_workspace(
+    *,
+    cleanup_stale_descs: bool = True,
+    migrate_config: bool = True,
+) -> None:
     """Perform the idempotent workspace work required before runtime children start.
 
     Desktop and the ``jiuwenswarm.app`` supervisor call this once before they
     launch AgentServer and Gateway.  The children can then skip the same disk
     work via ``JIUWENSWARM_RUNTIME_WORKSPACE_READY=1``.  Standalone child
     entrypoints intentionally retain this function as their fallback.
+
+    AgentServer Front skips ``cleanup_stale_descs`` and ``migrate_config``
+    because both import OpenJiuwen / ``common.config``. Runtime backend
+    completes those steps after the port is listening.
     """
     if cleanup_stale_descs:
         cleanup_stale_openjiuwen_descs()
@@ -1518,7 +1545,8 @@ def prepare_runtime_workspace(*, cleanup_stale_descs: bool = True) -> None:
     if workspace_preparation_needed:
         prepare_workspace(overwrite=False, workspace_dir=workspace_dir)
 
-    ensure_config_migrated_from_template(workspace_dir)
+    if migrate_config:
+        ensure_config_migrated_from_template(workspace_dir)
     ensure_default_builtin_skills()
 
 
@@ -1581,7 +1609,6 @@ def init_user_workspace(
 
     上述内容会被复制到:
     - ~/.jiuwenswarm/config/config.yaml（含 preferred_language）
-    - ~/.jiuwenswarm/config/builtin_rules.yaml（内置 shell 安全规则模板，与 config 同目录）
     - ~/.jiuwenswarm/config/.env
     - ~/.jiuwenswarm/agent/...
 
@@ -2381,6 +2408,20 @@ def get_logs_dir() -> Path:
     return get_agent_root_dir() / ".logs"
 
 
+def get_gateway_log_dir() -> Optional[Path]:
+    """获取 gateway 独立日志目录；未配置时返回 ``None``（与其它日志同目录）。
+
+    gateway.log 及其轮转归档文件可独立存放于该目录，与其它组件日志
+    （channel.log / agent_server.log / full.log 位于 ``agent/.logs``）分离。
+    通过环境变量 ``AGENTOS_GATEWAY_LOG_DIR`` 指定（如 Linux 部署的
+    ``/var/log/agentos``）；服务可能运行于 Windows 等系统，代码中不设默认值。
+    """
+    env_dir = os.getenv(_GATEWAY_LOG_DIR_ENV, "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return None
+
+
 def get_xy_tmp_dir() -> Path:
     workspace_dir = get_user_workspace_dir()
     xy_tmp_dir = workspace_dir / "tmp" / "xiaoyi"
@@ -2452,23 +2493,24 @@ _KV_SENSITIVE_PATTERN = re.compile(
     r"amap[_-]?key|map[_-]?ak)"
     r"(?![A-Za-z0-9])(\s*[:=]\s*)([\"']?)([^,\s\"'\]\}]+)([\"']?)"
 )
-# 匹配“键名包含敏感关键词”且“值被引号包裹”的场景，覆盖:
-# - 'CAT_CAFE_CALLBACK_TOKEN': 'xxxx'
-# - 'CAT_CAFE_USER_ID': 'CSDN-weixin'
-# - "my_private_key"="xxxx"
-# 分组说明：
-# 1) 完整的 key + 分隔符（含可选引号）
-# 2) 值的起始引号（' 或 "）
-# 3) 值内容（非贪婪）
-# 4) 结束引号（通过 (\2) 强制与起始引号一致）
-_NAMED_SENSITIVE_KV_PATTERN = re.compile(
-    r"(?i)([\"']?[A-Za-z0-9_.-]*"
-    r"(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
+# 匹配被引号包裹的通用键值对起点；键是否敏感在 Python 代码中判断。
+#
+# 旧实现把两个无界 ``[A-Za-z0-9_.-]*``、关键词分支、``.*?`` 与反向
+# 引用组合在一个正则中。面对 10KB 连续标识符且最终不匹配时，Python ``re``
+# 会从大量位置反复回溯，呈近似 O(n²) 退化。这里用左边界保证每个 key token
+# 只尝试一次，并用单向扫描查找结束引号，避免日志输入阻塞事件循环。
+# 与 upstream 1236f407 的 lookbehind 单正则修复等价地消除该回溯，并在其
+# 之上额外修复未闭合引号场景的明文泄露——勿回退为单正则形态。
+_NAMED_QUOTED_KV_START_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])"
+    r"(?P<prefix>[\"']?(?P<key>[A-Za-z0-9_.-]+)[\"']?\s*[:=]\s*)"
+    r"(?P<quote>[\"'])"
+)
+_NAMED_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
     r"secret[_-]?key|authorization|auth[_-]?code|auth[_-]?token|"
-    r"credential|private[_-]?key|"
-    r"user[_-]?id|userid|project[_-]?id|"
+    r"credential|private[_-]?key|user[_-]?id|userid|project[_-]?id|"
     r"amap[_-]?key|map[_-]?ak)"
-    r"[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)"
 )
 # 匹配 Authorization Bearer 令牌，保留 "Bearer " 前缀，仅掩码后面的令牌值。
 # 分组：1) "Bearer " 前缀；2) 令牌值本体（用于算指纹）。
@@ -2504,6 +2546,9 @@ _SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
 _SENSITIVE_PII_PATTERNS: tuple[re.Pattern[str], ...] = tuple(_SENSITIVE_PATTERNS[-3:])
 # 凭证类 prefix pattern：掩码并附指纹（同 key 指纹一致可关联、不可逆）。
 _SENSITIVE_CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(_SENSITIVE_PATTERNS[:4])
+_SAFE_AUTHORIZATION_OUTCOME_PATTERN = re.compile(
+    r'"authorization_outcome":"(?:allow|deny|block|cancel)"'
+)
 
 
 def _fingerprint(value: str) -> str:
@@ -2550,20 +2595,80 @@ def _masked_with_fp(value: Any) -> str:
     return f"{_SENSITIVE_MASK}(fp:{fp})"
 
 
+def _mask_named_sensitive_kv(text: str) -> str:
+    """Mask quoted values whose key contains a sensitive keyword.
+
+    The scan advances monotonically.  In particular, a long identifier that
+    is not a quoted key/value pair is inspected once instead of being retried
+    from every character position by a backtracking regular expression.
+    The closing-quote lookup never crosses a newline: an unclosed quote masks
+    only to the end of the current line, and scanning resumes on the next
+    line so its sensitive pairs stay matchable and unrelated lines stay
+    readable.
+    """
+    chunks: list[str] = []
+    copy_from = 0
+    search_from = 0
+
+    while True:
+        match = _NAMED_QUOTED_KV_START_PATTERN.search(text, search_from)
+        if match is None:
+            break
+        search_from = match.end()
+        if _NAMED_SENSITIVE_KEY_PATTERN.search(match.group("key")) is None:
+            continue
+
+        quote = match.group("quote")
+        value_start = match.end()
+        line_end = text.find("\n", value_start)
+        if line_end < 0:
+            line_end = len(text)
+        value_end = text.find(quote, value_start, line_end)
+        if value_end < 0:
+            # A malformed quoted secret must not leak.  Mask the rest of the
+            # current line and resume after the newline instead of swallowing
+            # later lines: their quotes must remain available as value
+            # boundaries for their own sensitive keys.
+            chunks.append(text[copy_from:value_start])
+            chunks.append(_masked_with_fp(text[value_start:line_end]))
+            copy_from = line_end
+            search_from = line_end
+            continue
+
+        chunks.append(text[copy_from:value_start])
+        chunks.append(_masked_with_fp(text[value_start:value_end]))
+        chunks.append(quote)
+        copy_from = value_end + 1
+        search_from = copy_from
+
+    if not chunks:
+        return text
+    chunks.append(text[copy_from:])
+    return "".join(chunks)
+
+
 def _sanitize_log_text(text: str) -> str:
     if not text:
         return text
 
-    masked = text
+    protected = text
+    replacements: list[tuple[str, str]] = []
+    for index, match in enumerate(
+        tuple(_SAFE_AUTHORIZATION_OUTCOME_PATTERN.finditer(text))
+    ):
+        marker = f"__JIUWEN_SAFE_OUTCOME_{index}__"
+        while marker in text:
+            marker += "_"
+        protected = protected.replace(match.group(0), marker, 1)
+        replacements.append((marker, match.group(0)))
+
+    masked = protected
     masked = _DATA_IMAGE_PATTERN.sub("data:image/*;base64,******", masked)
     # _KV_SENSITIVE_PATTERN: 组1=键名, 组2=分隔符, 组4=值（组3/5 为可选引号）。
     masked = _KV_SENSITIVE_PATTERN.sub(
         lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(4))}", masked
     )
-    # _NAMED_SENSITIVE_KV_PATTERN: 组1=键+分隔符, 组2=起始引号, 组3=值, 组4=结束引号。
-    masked = _NAMED_SENSITIVE_KV_PATTERN.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(3))}{m.group(4)}", masked
-    )
+    masked = _mask_named_sensitive_kv(masked)
     # _BEARER_SENSITIVE_PATTERN: 组1=Bearer 前缀, 组2=令牌值。
     masked = _BEARER_SENSITIVE_PATTERN.sub(
         lambda m: f"{m.group(1)}{_masked_with_fp(m.group(2))}", masked
@@ -2578,6 +2683,8 @@ def _sanitize_log_text(text: str) -> str:
     # PII（邮箱/手机/身份证）：纯掩码，不附指纹。
     for pattern in _SENSITIVE_PII_PATTERNS:
         masked = pattern.sub(_SENSITIVE_MASK, masked)
+    for marker, original in replacements:
+        masked = masked.replace(marker, original)
     return masked
 
 
@@ -2597,13 +2704,17 @@ class SensitiveDataFilter(logging.Filter):
     """Mask sensitive data in all log messages and tracebacks."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "jiuwen_sensitive_sanitized", False):
+            return True
+
+        sanitized = True
         try:
             message = record.getMessage()
             record.msg = _sanitize_log_text(message)
             record.args = ()
         except Exception:
             # Never block logging because of desensitization failure.
-            pass
+            sanitized = False
 
         # Traceback 由 Formatter.formatException() 在 record.exc_text 中单独渲染，
         # 不经过 record.getMessage()，因此 message 脱敏覆盖不到。这里提前把
@@ -2627,7 +2738,9 @@ class SensitiveDataFilter(logging.Filter):
                 record.exc_text = _sanitize_log_text(record.exc_text)
         except Exception:
             # 同样不因脱敏失败而阻断日志输出。
-            pass
+            sanitized = False
+        if sanitized:
+            record.jiuwen_sensitive_sanitized = True
         return True
 
 
@@ -2688,6 +2801,7 @@ def install_source_record_masking() -> None:
                 record.exc_info = None
             elif record.exc_text:
                 record.exc_text = _sanitize_log_text(record.exc_text)
+            record.jiuwen_sensitive_sanitized = True
         except Exception:
             # 永不因脱敏失败而阻断日志输出。但记录失败（计数 + 首次 stderr 提示），
             # 避免静默吞掉异常导致 api_key 在无感知下明文泄露。
@@ -2707,19 +2821,46 @@ def install_source_record_masking() -> None:
     _source_record_masking_installed = True
 
 
+def _reconfigure_stdio_utf8() -> None:
+    """把 ``sys.stdout`` / ``sys.stderr`` 原地重配置为 UTF-8。
+
+    Windows 控制台默认编码常为 cp1252，无法编码中文日志消息（例如扩展加载器的
+    ``[ExtensionLoader] 开始搜索扩展路径``），会导致 ``logging.StreamHandler.emit``
+    抛出 ``UnicodeEncodeError``；随后的 ``logging.handleError`` 想把异常栈打印到
+    ``sys.stderr``，又因同一编码问题二次失败，连锁中断启动。这里在日志体系初始化前
+    把标准流原地改为 UTF-8 + ``backslashreplace``，覆盖 emit / handleError / print 三个路径。
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if not callable(_reconfigure):
+            continue
+        try:
+            _reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError, RuntimeError):
+            # 流已被使用 / 不支持重配置：忽略，保留原流，避免影响启动。
+            pass
+
+
 def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
-    """配置 ``jiuwenswarm`` 根日志：控制台 + 分组件文件 + 汇总 full.log。
+    """配置 ``jiuwenswarm`` 根日志：控制台 + 分组件文件 + 汇总 full.log（不含 gateway）。
 
     各模块应使用 ``logging.getLogger(__name__)``，分文件规则：
     - ``jiuwenswarm.channel.*`` → channel.log
     - ``jiuwenswarm.agents.*`` 或 ``jiuwenswarm.server.*`` → agent_server.log
     - 其余 ``jiuwenswarm.*``（含 ``jiuwenswarm.app``、gateway、evolution、utils 等）→ gateway.log
 
-    所有分类日志同时写入 ``full.log``。输出目录：``~/.jiuwenswarm/agent/.logs/``。
+    channel / agent_server（含 permissions）日志同时汇总写入 ``full.log``；
+    gateway 日志**不写入** full.log（无论 gateway.log 是否独立目录）。输出目录：
+    ``~/.jiuwenswarm/agent/.logs/``；gateway.log 默认同目录，可通过环境变量
+    ``AGENTOS_GATEWAY_LOG_DIR`` 指定独立目录（如 Linux 部署的 ``/var/log/agentos``；
+    目录不可写时降级回 ``agent/.logs``）。
 
     级别由 ``config.yaml`` 的 ``logging`` 段控制；环境变量 ``LOG_LEVEL`` 仅覆盖**控制台**级别
     （``log_level`` 参数为 ``None`` 时）。若传入 ``log_level``（如单测），则控制台与各文件级别均为该值。
     """
+    install_runtime_log_filter()
+    # 必须在创建 StreamHandler 之前完成：cp1252 → UTF-8，否则中文日志会触发 UnicodeEncodeError。
+    _reconfigure_stdio_utf8()
     logs_root = get_logs_dir()
     logs_root.mkdir(parents=True, exist_ok=True)
 
@@ -2741,27 +2882,49 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     def _add_rotating(
         filename: str,
         level: int,
-        name_filter: Optional[_ComponentNameFilter] = None,
+        name_filter: Optional[logging.Filter] = None,
         custom_formatter: Optional[logging.Formatter] = None,
+        target_dir: Optional[Path] = None,
     ) -> None:
+        base_dir = target_dir if target_dir is not None else logs_root
         h = SafeRotatingFileHandler(
-            filename=logs_root / filename,
+            filename=base_dir / filename,
             maxBytes=_LOG_FILE_MAX_BYTES,
             backupCount=_LOG_FILE_BACKUP_COUNT,
             encoding="utf-8",
         )
         h.setLevel(level)
         h.setFormatter(custom_formatter if custom_formatter is not None else formatter)
-        h.addFilter(privacy_filter)
         if name_filter is not None:
             h.addFilter(name_filter)
+        h.addFilter(privacy_filter)
         root.addHandler(h)
 
-    _add_rotating("gateway.log", levels.gateway, _ComponentNameFilter("gateway"))
+    # gateway 日志独立目录（仅当环境变量 AGENTOS_GATEWAY_LOG_DIR 指定时启用），
+    # 轮转归档同样落在该目录。目录不可创建/不可写时降级回 logs_root，
+    # 避免日志目录权限问题导致服务无法启动。
+    gateway_log_dir = get_gateway_log_dir()
+    if gateway_log_dir is not None:
+        try:
+            gateway_log_dir.mkdir(parents=True, exist_ok=True)
+            # 探测可写性（部分场景目录存在但无写权限）
+            _probe = gateway_log_dir / ".write_probe"
+            _probe.touch()
+            _probe.unlink()
+        except OSError as exc:
+            print(
+                f"[jiuwenswarm] gateway log dir {gateway_log_dir} is not writable ({exc}); "
+                f"falling back to {logs_root}",
+                file=sys.stderr,
+            )
+            gateway_log_dir = None
+
+    _add_rotating("gateway.log", levels.gateway, _ComponentNameFilter("gateway"),
+        target_dir=gateway_log_dir)
     _add_rotating("channel.log", levels.channel, _ComponentNameFilter("channel"))
     _add_rotating("agent_server.log", levels.agent_server,
         _CompositeFilter([_ComponentNameFilter("agent_server"), _ComponentNameFilter("permissions")]))
-    _add_rotating("full.log", levels.full, None)
+    _add_rotating("full.log", levels.full, _ExcludeComponentFilter("gateway"))
     json_formatter = JsonOnlyFormatter()
     _add_rotating("permissions.log", levels.agent_server, _ComponentNameFilter("permissions"), json_formatter)
 

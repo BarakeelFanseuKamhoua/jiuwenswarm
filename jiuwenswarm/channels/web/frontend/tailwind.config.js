@@ -48,6 +48,7 @@ export default {
           strong: color('--color-text-strong'),
           muted: color('--color-text-secondary'),
           meta: color('--color-text-meta'),
+          disabled: color('--color-text-disabled'),
           inverse: color('--color-text-inverse'),
           link: color('--color-text-link'),
           divider: color('--color-text-divider'),
@@ -58,6 +59,7 @@ export default {
           strong: color('--color-border-strong'),
           hover: color('--color-border-hover'),
           accent: translucentColor('--color-border-accent'),
+          'input-strong': color('--color-border-input-strong'),
         },
         accent: {
           DEFAULT: color('--color-action-primary'),

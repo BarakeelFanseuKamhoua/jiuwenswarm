@@ -1,3 +1,4 @@
+import { AssetPublishHost } from './components/AssetPublishDrawer';
 // Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 
 /**
@@ -6,8 +7,9 @@
  * 应用主布局，整合所有组件
  */
 
-import { useState, useCallback, useEffect, useRef, Component, ReactNode, useMemo, lazy, Suspense, type PointerEvent as ReactPointerEvent } from 'react';
+import { useState, useCallback, useEffect, useRef, Component, ReactNode, useMemo, lazy, Suspense, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { ChatPanel } from './components/ChatPanel';
+import { DesktopTextEditContextMenu } from './components/DesktopTextEditContextMenu';
 import { SessionSidebar } from './components/SessionSidebar';
 import { SkillPanel } from './components/SkillPanel';
 import { AgentManagementPanel } from './components/AgentManagementPanel';
@@ -24,6 +26,8 @@ import { ToolPanel } from './components/ToolPanel';
 import { UpdatePanel } from './components/UpdatePanel';
 import { ExternalCliInstallDialog, type ExternalCliInstallStatuses } from './components/ExternalCliInstallDialog';
 import { PersonalContextPanel } from './components/PersonalContext';
+import { ToastStack } from './components/ui';
+import { toast } from './components/ui/Toast/toastStore';
 import { SettingsPage } from './features/settings/SettingsPage';
 import type { SettingsPageDefinition } from './features/settings/registry/types';
 import type { SettingsRequest } from './features/settings/services/settingsContract';
@@ -33,17 +37,13 @@ import {
   type SettingsModuleTarget,
 } from './features/settings/settingsNavigation';
 import { ConnectorMarketPanel } from './components/ConnectorMarket';
-import {
-  ShareImageDocument,
-  exportShareImageNode,
-  type ShareImageSnapshot,
-} from './features/shareImageExport';
+import { LoginDialog } from './components/LoginDialog';
 import type { CodeReviewTarget } from './features/code-mode/types';
 
 import { FEATURE_APP_UPDATER_UI, FEATURE_PERSONAL_CONTEXT_UI } from './featureFlags';
 import {
   beginHistoryRestore,
-  fetchHistoryPage,
+  fetchHistoryCursorBatch,
   HISTORY_GET_METHOD,
   mergeHistoryToolReplayItems,
   recoverSubagentToolHistory,
@@ -51,25 +51,36 @@ import {
   type HistoryHarnessReplayItem,
   type HistorySubagentReplayItem,
   type HistoryToolReplayItem,
-  type FetchHistoryPageResult,
+  type FetchHistoryCursorBatchResult,
+  type HistoryRestoreFailure,
 } from './features/historyRestore';
-import { prefetchHistoryPages } from './features/historyPagination';
+import {
+  canApplyHistoryCursorBatch,
+  prefetchHistoryBatches,
+} from './features/historyPagination';
 import { isPlanWireMode, resolvePlanWireMode } from './features/planMode/wireMode';
 import { queueOrAddGoalObjectiveMessage } from './features/goalPendingObjectiveBubble';
-import { LoginPage } from './features/auth/LoginPage';
-import { LogoutButton } from './features/auth/LogoutButton';
 import {
   normalizeToolCallPayload,
   normalizeToolResultPayload,
 } from './features/tool-events/toolEventNormalizer';
 import { readAgentTemplateName } from './features/agentIdentity';
+import { normalizeTeamLeaderIdentity } from './features/teamLeaderIdentity';
 import { useWebSocket, mergePersistedGoalCompletionMessages, stampGoalObjectiveMessages, useResponsiveLayout, useResponsivePanelResize } from './hooks';
 import { webRequest } from './services/webClient';
 import type { WorkflowRun } from './components/teamArea/workflowTypes';
-import { processOAuthCallback } from './utils/gitcodeOAuth';
 import { useTeamPanelState } from './features/teamPanelState';
 import { useSingleAgentPanelState } from './features/singleAgentPanelState';
-import { AgentMode, MediaItem, UserAnswer, ModelEntry, type Session } from './types';
+import { useBrowserAgentActivity } from './features/browserAgentActivity';
+import {
+  AgentMode,
+  MediaItem,
+  type ChatSendOptions,
+  UserAnswer,
+  ModelEntry,
+  type MessageForkPoint,
+  type Session,
+} from './types';
 import type { WorkMode } from './features/workspace/projectTypes';
 import {
   EXTERNAL_CLI_AGENT_KINDS,
@@ -97,11 +108,9 @@ import {
 } from './stores';
 import { useChatRoute } from './multi-session/routing/useChatRoute';
 import { ConversationSidebar, type NewConversationOptions } from './multi-session/sidebar/ConversationSidebar';
-import { DeleteDialog } from './multi-session/dialogs/Dialogs';
 import {
   NEW_CONVERSATION_ID,
   createConversationTitle,
-  forgetCreatedConversation,
   isConversationMissing,
   registerCreatedConversation,
   resolveNewConversationEntrySettings,
@@ -136,13 +145,21 @@ import {
   buildA2UIClientEventContent,
   setA2UIActionHandler,
 } from './features/a2ui/actionBridge';
-import { saveBlob } from './utils/desktopSave';
+import { executeDesktopSave } from './utils/desktopSave';
 import { restoreSessionEquipment } from './utils/enabledExtensions';
 import { generateUuidV4 } from './utils/uuid';
 import { ApplicationPluginOutlet } from './applicationPlugins/ApplicationPluginOutlet';
 import { enabledApplicationPlugins } from './applicationPlugins/manifest';
 import { useApplicationPlugins } from './applicationPlugins/useApplicationPlugins';
 import type { ApplicationPluginNavKey } from './applicationPlugins/types';
+import {
+  findShareImageJobForSession,
+  forgetPendingShareImageJob,
+  readPendingShareImageJobId,
+  readShareImageJobResponse,
+  rememberPendingShareImageJob,
+  type ShareImageExportJobStatus,
+} from './features/shareImageJob';
 import {
   ModelSetupGuide,
   type ModelSetupGuideStep,
@@ -155,6 +172,7 @@ import {
 } from './features/trajectory/SingleAgentSurface';
 import {
   shouldInsetTrajectoryForFloatingTasks,
+  trajectoryComposerClearance,
 } from './features/trajectory/trajectoryLayout';
 import {
   normalizeTrajectoryUiEnabled,
@@ -177,6 +195,7 @@ type ChatPanelResizeDrag = {
   startPct: number;
   containerWidth: number;
 };
+
 const PREVIEW_MODEL_SETUP_GUIDE = import.meta.env.DEV
   && new URLSearchParams(window.location.search).get('modelSetupGuide') === '1';
 
@@ -195,10 +214,12 @@ function normalizeConfigBoolean(value: unknown): boolean {
 
 type MainNavKey = SidebarNavKey | 'connectorMarket' | ApplicationPluginNavKey;
 
-type LoadedHistoryPage = {
-  pageIdx: number;
-  totalPages: number;
-  result: FetchHistoryPageResult | null;
+type LoadedHistoryBatch = {
+  batchSeq: number;
+  requestCursor: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+  result: FetchHistoryCursorBatchResult;
 };
 
 function getWorkContextForSession(sessionId: string): {
@@ -307,12 +328,47 @@ function ErrorFallback({ error }: { error: Error | null }) {
   );
 }
 
-async function saveShareImage(blob: Blob, filename: string): Promise<boolean> {
-  const outcome = await saveBlob(blob, filename);
-  if (outcome === 'failed') {
-    throw new Error('share_desktop_save_failed');
+const SHARE_IMAGE_EXPORT_POLL_MS = 500;
+
+async function saveShareImageJob(jobId: string, filename: string): Promise<boolean> {
+  const downloadUrl = `/share-api/jobs/${encodeURIComponent(jobId)}/download`;
+  const desktopDownload = window.pywebview?.api?.download_file;
+  if (desktopDownload) {
+    const outcome = await executeDesktopSave(() => desktopDownload(downloadUrl, filename));
+    if (outcome === 'failed') throw new Error('share_desktop_save_failed');
+    return outcome === 'saved';
   }
-  return outcome === 'saved';
+  if (!window.pywebview) {
+    const response = await fetch(downloadUrl, { method: 'HEAD', cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`share_export_download_http_${response.status}`);
+    }
+    const anchor = document.createElement('a');
+    anchor.href = downloadUrl;
+    anchor.download = filename;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return true;
+  }
+  throw new Error('share_desktop_download_unavailable');
+}
+
+async function waitForShareImageJob(
+  initialStatus: ShareImageExportJobStatus,
+  isCurrentMonitor: () => boolean,
+): Promise<ShareImageExportJobStatus | null> {
+  let status = initialStatus;
+  while (status.state === 'queued' || status.state === 'running') {
+    if (!isCurrentMonitor()) return null;
+    await new Promise(resolve => window.setTimeout(resolve, SHARE_IMAGE_EXPORT_POLL_MS));
+    status = await readShareImageJobResponse(await fetch(
+      `/share-api/jobs/${encodeURIComponent(status.job_id)}`,
+      { cache: 'no-store' },
+    ));
+  }
+  return isCurrentMonitor() ? status : null;
 }
 
 function AppContent({
@@ -331,6 +387,11 @@ function AppContent({
     return 'new';
   });
   const [chatSurfaceViews, setChatSurfaceViews] = useState<Record<string, ChatSurfaceView>>({});
+  // Whether the composer kept available on the trajectory view is collapsed to
+  // watch-only, per session, alongside which view that session last showed.
+  const [trajectoryComposerCollapsed, setTrajectoryComposerCollapsed] = useState<Record<string, boolean>>({});
+  const [trajectoryComposerHeight, setTrajectoryComposerHeight] = useState(0);
+  const [chatWelcomeVariant, setChatWelcomeVariant] = useState<'group-create' | null>(null);
   const [trajectoryUiRequested, setTrajectoryUiRequested] = useState(false);
 
   const [activeNav, setActiveNav] = useState<MainNavKey>('chat');
@@ -339,26 +400,27 @@ function AppContent({
   );
   const loadPersonalContextConfig = usePersonalContextStore((s) => s.loadConfig);
   const [serverConfig, setServerConfig] = useState<Record<string, unknown> | null>(null);
-  const kvCacheAffinityEnabled = normalizeConfigBoolean(
-    serverConfig?.kv_cache_affinity_enabled,
-  );
   const trajectoryUiEnabled = useTrajectoryUiEnabled();
   const [configError, setConfigError] = useState<string | null>(null);
   const [initialDataLoaded, setInitialDataLoaded] = useState(false);
   const [restartModalOpen, setRestartModalOpen] = useState(false);
   const [restartSuccess, setRestartSuccess] = useState(false);
-  const [isExportingShare, setIsExportingShare] = useState(false);
-  const [shareExportSnapshot, setShareExportSnapshot] = useState<ShareImageSnapshot | null>(null);
+  const [exportingShareSessionIds, setExportingShareSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const [restartSeenDisconnect, setRestartSeenDisconnect] = useState(false);
   const [appliedWithoutRestart, setAppliedWithoutRestart] = useState(false);
   const [saveToastVisible, setSaveToastVisible] = useState(false);
   const [proactiveToastVisible, setProactiveToastVisible] = useState(false);
+  const [authToastVisible, setAuthToastVisible] = useState(false);
   const [proactiveToastMessage, setProactiveToastMessage] = useState('');
   const [securityAlertVisible, setSecurityAlertVisible] = useState(false);
   const [securityAlertContent, setSecurityAlertContent] = useState('');
   const [externalCliInstallDialogOpen, setExternalCliInstallDialogOpen] = useState(false);
   const [externalCliInstallStatuses, setExternalCliInstallStatuses] = useState<ExternalCliInstallStatuses>({});
   const [hasVisitedAgents, setHasVisitedAgents] = useState(false);
+  const [agentManagementNavigationRequest, setAgentManagementNavigationRequest] = useState<{
+    target: 'agent' | 'group';
+    requestId: number;
+  } | null>(null);
   // Deferred CLI agent choices held here (not inside Settings) so they survive
   // leaving/returning to Settings and a full page refresh while an install runs.
   const [externalCliPendingChoices, setExternalCliPendingChoices] =
@@ -372,6 +434,7 @@ function AppContent({
   const [requestedSettingsModuleId, setRequestedSettingsModuleId] = useState<SettingsModuleTarget | null>(null);
   const {
     isMobile,
+    isToolPanelAutoHideViewport,
     conversationSidebarCollapsed,
     setConversationSidebarCollapsed,
     conversationSidebarFloating,
@@ -380,36 +443,14 @@ function AppContent({
   } = useResponsiveLayout();
 
   const [modelSetupGuideStep, setModelSetupGuideStep] = useState<ModelSetupGuideStep | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
-  const [dialogBusy, setDialogBusy] = useState(false);
-  const [dialogError, setDialogError] = useState<string | null>(null);
   const [composerFocusNonce, setComposerFocusNonce] = useState(0);
   const [missingSessionId, setMissingSessionId] = useState<string | null>(null);
   const startupUpdateCheckRef = useRef(false);
   const modelSetupGuideEvaluatedRef = useRef(false);
-  /** OAuth 回调恢复导航后标记，防止 fetchConfig 等后续逻辑覆盖 activeNav */
-  const oauthNavRestoredRef = useRef(false);
 
   useEffect(() => {
     tRef.current = t;
   }, [t]);
-
-  // OAuth 回调处理：页面加载时检测 URL 中的 code，自动换 token + 获取用户信息
-  useEffect(() => {
-    processOAuthCallback()
-      .finally(() => {
-        // 备份：OAuth 回调完成后再次确认导航（通常路由 effect 已设置）
-        const nav = sessionStorage.getItem('oauth_redirect_nav');
-        if (nav) {
-          sessionStorage.removeItem('oauth_redirect_nav');
-          oauthNavRestoredRef.current = true;
-          setActiveNav(nav as MainNavKey);
-          if (nav === 'skills') setHasVisitedSkills(true);
-        }
-        // 无论成功或失败都派发事件，SkillPanel 根据有无 oauth_error 决定显示错误或开抽屉
-        window.dispatchEvent(new CustomEvent('oauth-callback-complete'));
-      });
-  }, []);
 
   useEffect(() => {
     if (activeNav === 'chat') {
@@ -462,6 +503,7 @@ function AppContent({
   const restartAutoCloseTimerRef = useRef<number | null>(null);
   const saveToastTimerRef = useRef<number | null>(null);
   const proactiveToastTimerRef = useRef<number | null>(null);
+  const authToastTimerRef = useRef<number | null>(null);
   const settingsHasChangesRef = useRef(false);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [historyPrepending, setHistoryPrepending] = useState(false);
@@ -472,24 +514,25 @@ function AppContent({
   const [historyBootstrapKey, setHistoryBootstrapKey] = useState(0);
   const sessionIdRef = useRef(sessionId);
   const sessionRestoreQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const kvcViewIdRef = useRef(generateUuidV4());
-  const kvcPreparedInputSessionRef = useRef<string | null>(null);
+  const sessionMetadataRequestsRef = useRef(new Map<string, Promise<Session | null>>());
+  const sessionViewIdRef = useRef(generateUuidV4());
+  const inputIntentSessionRef = useRef<string | null>(null);
   const historyLoadingSessionsRef = useRef(new Set<string>());
   const historyRestoreHandlesRef = useRef(new Map<string, HistoryRestoreHandle>());
   const subagentHistoryRestoreHandlesRef = useRef(new Map<string, HistoryRestoreHandle>());
   const subagentHistoryRestoreRevisionRef = useRef(new Map<string, string>());
   const subagentToolReplayBySessionRef = useRef(new Map<string, HistoryToolReplayItem[]>());
-  const historyPageHandlesRef = useRef(new Map<string, HistoryRestoreHandle>());
-  const historyPagePromisesRef = useRef(new Map<string, Promise<LoadedHistoryPage | null>>());
-  const historyPageCancelRef = useRef(new Map<string, () => void>());
+  const historyBatchHandlesRef = useRef(new Map<string, HistoryRestoreHandle>());
+  const historyBatchPromisesRef = useRef(new Map<string, Promise<LoadedHistoryBatch | null>>());
+  const historyBatchCancelRef = useRef(new Map<string, () => void>());
   const historyBackgroundPrefetchTokensRef = useRef(new Map<string, number>());
+  const historyCursorFailuresRef = useRef(new Map<string, HistoryRestoreFailure>());
+  const historyRevealTargetRef = useRef(new Map<string, number>());
   const creatingSessionRef = useRef(false);
   /** 离开新建任务页后，仍未发送的临时会话可以被再次打开。 */
   const pendingNewConversationRef = useRef(route.kind === 'chat-new');
   const sessionIdsCreatedInThisPageRef = useRef(new Set<string>());
-  const shareExportRef = useRef<HTMLDivElement>(null);
-  const shareExportFilenameRef = useRef('jiuwenswarm-share.png');
-  const shareExportTokenRef = useRef(0);
+  const shareExportMonitorTokensRef = useRef(new Map<string, symbol>());
   const preserveSelectedProjectOnChatNewRef = useRef(false);
   const newConversationProjectRef = useRef<Pick<Session, 'project_id' | 'project_dir'> | null>(null);
   const newConversationPreviousSessionRef = useRef<PendingPreviousSession | null>(null);
@@ -515,11 +558,14 @@ function AppContent({
   useEffect(() => {
     sessionIdRef.current = sessionId;
     // A new foreground visit gets one fresh input-intent opportunity. Merely
-    // switching to the Session still does not prefetch; the first real editor
-    // insertion below does.
-    kvcPreparedInputSessionRef.current = null;
+    // switching to the Session does not publish input intent; the first real
+    // editor insertion below does.
+    inputIntentSessionRef.current = null;
     setHistoryLoadingMore(false);
-    setHistoryPrepending(historyLoadingSessionsRef.current.has(sessionId));
+    // Background cursor prefetch does not mutate the published timeline.  Treating
+    // it as a visible prepend leaves a revisited Session unable to reveal batches
+    // that have already arrived, because the top-boundary gate stays disabled.
+    setHistoryPrepending(false);
   }, [sessionId]);
 
   useEffect(() => {
@@ -527,9 +573,9 @@ function AppContent({
     // Session is used elsewhere. In that case `sessionId` never changes, so
     // the per-visit input latch above would otherwise remain consumed by the
     // Session's initial turn. Re-arm only when this page returns to the
-    // foreground; focus/visibility alone still does not issue a prefetch.
+    // foreground; focus/visibility alone still does not publish input intent.
     const rearmInputIntent = () => {
-      kvcPreparedInputSessionRef.current = null;
+      inputIntentSessionRef.current = null;
     };
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -569,21 +615,13 @@ function AppContent({
   } = useSingleAgentPanelState();
 
   useEffect(() => {
-    const oauthNav = sessionStorage.getItem('oauth_redirect_nav');
-    const targetNav = (oauthNav || 'chat') as MainNavKey;
-    if (oauthNav === 'skills') setHasVisitedSkills(true);
     if (route.kind === 'chat-session') {
       sessionIdRef.current = route.sessionId;
       setSessionId(route.sessionId);
-      setActiveNav(targetNav);
+      setActiveNav('chat');
     } else if (route.kind === 'chat-new') {
       if (window.location.pathname !== '/chat/new') {
-        if (oauthNav) {
-          // OAuth 重定向：用 replaceState 改 URL 但不触发 route 变化，避免 effect 重跑覆盖 activeNav
-          window.history.replaceState(null, '', '/chat/new');
-        } else {
-          navigate({ kind: 'chat-new' }, { replace: true });
-        }
+        navigate({ kind: 'chat-new' }, { replace: true });
       }
       pendingNewConversationRef.current = true;
       if (preserveSelectedProjectOnChatNewRef.current) {
@@ -593,26 +631,17 @@ function AppContent({
       }
       sessionIdRef.current = 'new';
       setSessionId('new');
-      setActiveNav(targetNav);
-      if (!oauthNav) {
-        setTeamAreaExpanded(false);
-        setSingleAgentPanelExpanded(false);
-      }
+      setActiveNav('chat');
+      setTeamAreaExpanded(false);
+      setSingleAgentPanelExpanded(false);
     }
-  }, [navigate, route, setSingleAgentPanelExpanded, setTeamAreaExpanded, setHasVisitedSkills]);
+  }, [navigate, route, setSingleAgentPanelExpanded, setTeamAreaExpanded]);
 
   useEffect(() => {
     ensureSessionRuntimes(sessionId);
     useChatStore.getState().setActiveSessionId(sessionId);
     useSubagentStore.getState().hydrateRuntime(sessionId);
   }, [sessionId]);
-
-  useEffect(() => {
-    if (!initialDataLoaded) {
-      return;
-    }
-    void loadProjects();
-  }, [initialDataLoaded, loadProjects]);
 
   const {
     setCurrentSession,
@@ -630,6 +659,13 @@ function AppContent({
       : sessions.find((s) => s.session_id === sessionId);
     const raw = session?.title?.trim() ?? '';
     return toDisplaySessionTitle(raw);
+  }, [currentSession, sessions, sessionId]);
+  const continuedFromSessionId = useMemo(() => {
+    const session = currentSession?.session_id === sessionId
+      ? currentSession
+      : sessions.find((item) => item.session_id === sessionId);
+    const sourceSessionId = session?.forked_from?.trim() ?? '';
+    return sourceSessionId && sourceSessionId !== sessionId ? sourceSessionId : null;
   }, [currentSession, sessions, sessionId]);
   const sessionProjectName = useMemo(() => {
     const session = currentSession?.session_id === sessionId
@@ -662,9 +698,18 @@ function AppContent({
         : { ...current, [sessionId]: nextView }
     ));
   }, [sessionId]);
+  const composerDocked = chatSurfaceView === 'trajectory';
+  const composerCollapsed = trajectoryComposerCollapsed[sessionId] ?? false;
+  const toggleTrajectoryComposer = useCallback(() => {
+    setTrajectoryComposerCollapsed((current) => ({
+      ...current,
+      [sessionId]: !(current[sessionId] ?? false),
+    }));
+  }, [sessionId]);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[sessionId]?.teamTaskEvents ?? []);
   const teamTasks = useSessionStore((s) => s.runtimes[sessionId]?.teamTasks ?? []);
   const teamMembers = useSessionStore((s) => s.runtimes[sessionId]?.teamMembers ?? []);
+  const browserAgentActive = useBrowserAgentActivity(sessionId);
   const [chatPanelWidthPct, setChatPanelWidthPct] = useState(CHAT_PANEL_DEFAULT_WIDTH_PCT);
   const chatPanelResizeDragRef = useRef<ChatPanelResizeDrag | null>(null);
   const [codeReviewTarget, setCodeReviewTarget] = useState<CodeReviewTarget | null>(null);
@@ -708,6 +753,20 @@ function AppContent({
     }
     setSingleAgentPanelExpanded(expanded);
   }, [mode, setSingleAgentPanelExpanded, setTeamAreaActiveTab, setTeamAreaExpanded, teamAreaActiveTab]);
+
+  const browserAutoExpandedSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!window.jiuwenDesktop?.isElectron || !browserAgentActive) return;
+    // Electron 内置浏览器页签只在浏览器 Agent 真正被调用后出现；每个会话只自动
+    // 展开一次，之后尊重用户手动收起的选择。team 模式不抢 tab，等回到单 agent
+    // 模式再展开。
+    if (mode === 'team') return;
+    if (browserAutoExpandedSessionRef.current === sessionId) return;
+    browserAutoExpandedSessionRef.current = sessionId;
+    setToolPanelHidden(false);
+    setSingleAgentPanelActiveTab('browser');
+    setSingleAgentPanelExpanded(true);
+  }, [browserAgentActive, mode, sessionId, setSingleAgentPanelActiveTab, setSingleAgentPanelExpanded, setToolPanelHidden]);
 
   const handleOpenCodeReview = useCallback((target: CodeReviewTarget) => {
     setHeartbeatPanelOpen(false);
@@ -852,13 +911,15 @@ function AppContent({
         }
       }
       subagentToolReplayBySessionRef.current.delete(targetSid);
-      for (const [key, handle] of Array.from(historyPageHandlesRef.current.entries())) {
+      historyCursorFailuresRef.current.delete(targetSid);
+      historyRevealTargetRef.current.delete(targetSid);
+      for (const [key, handle] of Array.from(historyBatchHandlesRef.current.entries())) {
         if (!key.startsWith(`${targetSid}:`)) continue;
         handle.dispose();
-        historyPageHandlesRef.current.delete(key);
-        historyPagePromisesRef.current.delete(key);
-        historyPageCancelRef.current.get(key)?.();
-        historyPageCancelRef.current.delete(key);
+        historyBatchHandlesRef.current.delete(key);
+        historyBatchPromisesRef.current.delete(key);
+        historyBatchCancelRef.current.get(key)?.();
+        historyBatchCancelRef.current.delete(key);
       }
     };
 
@@ -870,7 +931,7 @@ function AppContent({
     for (const targetSid of new Set([
       ...historyRestoreHandlesRef.current.keys(),
       ...Array.from(subagentHistoryRestoreHandlesRef.current.keys(), (key) => key.split(':', 1)[0]),
-      ...Array.from(historyPageHandlesRef.current.keys(), (key) => key.split(':', 1)[0]),
+      ...Array.from(historyBatchHandlesRef.current.keys(), (key) => key.split(':', 1)[0]),
       ...historyLoadingSessionsRef.current,
     ])) {
       cancelSession(targetSid);
@@ -890,7 +951,11 @@ function AppContent({
   const proactiveNotificationMessage = useHarnessStore((s) => s.proactiveNotificationMessage);
   const setProactiveNotification = useHarnessStore((s) => s.setProactiveNotification);
 
+  const isElectron = Boolean(window.jiuwenDesktop?.isElectron);
   const toolPanelHasContent = useMemo(() => {
+    // Electron 下工具面板始终可达（内置浏览器页签等桌面能力），但新建会话首页
+    // 没有任何会话内容，悬浮收起条不应出现（tool-panel-collapsed 首页闪现 bug）。
+    if (isElectron) return sessionId !== NEW_CONVERSATION_ID;
     const hasMessages = messages.length > 0;
     const hasCodeEnvironment = sessionProject?.work_mode === 'code' && sessionId !== NEW_CONVERSATION_ID;
     switch (mode) {
@@ -904,7 +969,7 @@ function AppContent({
           || hasMessages
           || hasCodeEnvironment;
     }
-  }, [mode, todos.length, subagentCount, teamTaskEvents.length, teamTasks.length, teamMembers.length, extensionReady?.runtimePath, messages.length, isRestoringTeamHistory, sessionId, sessionProject?.work_mode]);
+  }, [isElectron, mode, todos.length, subagentCount, teamTaskEvents.length, teamTasks.length, teamMembers.length, extensionReady?.runtimePath, messages.length, isRestoringTeamHistory, sessionId, sessionProject?.work_mode]);
   // 单 agent 模式同样复用集群模式的展开布局（百分比宽度 + 可拖拽分割线），
   // 避免右侧面板与聊天面板平分空间导致宽度与集群模式不一致；auto_harness 走收起态分支。
   const panelExpanded = mode === 'team' ? teamAreaExpanded : singleAgentPanelExpanded;
@@ -942,11 +1007,13 @@ function AppContent({
     request,
     persistMedia,
     persistDocuments,
+    discardMedia,
     sendMessage,
     sendStructuredChatContent,
     pause,
     cancel,
     supplement,
+    resume,
     sendUserAnswer,
     setGoalObjective,
     pauseGoal,
@@ -1048,8 +1115,8 @@ function AppContent({
       if (subagentHistoryRestoreRevisionRef.current.get(key) === revisionMarker) continue;
       if (subagentHistoryRestoreHandlesRef.current.has(key)) continue;
       subagentHistoryRestoreRevisionRef.current.set(key, revisionMarker);
-      const pageHandles = new Set<HistoryRestoreHandle>();
-      const pageSettlers = new Set<(page: LoadedHistoryPage | null) => void>();
+      const batchHandles = new Set<HistoryRestoreHandle>();
+      const batchSettlers = new Set<(batch: LoadedHistoryBatch | null) => void>();
       let disposed = false;
       const handle: HistoryRestoreHandle = {
         generation: 0,
@@ -1057,73 +1124,65 @@ function AppContent({
           if (disposed) return;
           disposed = true;
           useSubagentStore.getState().finishHistoryRestore(sid, subagentId);
-          for (const settlePending of pageSettlers) {
+          for (const settlePending of batchSettlers) {
             settlePending(null);
           }
-          pageSettlers.clear();
-          for (const pageHandle of pageHandles) {
-            pageHandle.dispose();
+          batchSettlers.clear();
+          for (const batchHandle of batchHandles) {
+            batchHandle.dispose();
           }
-          pageHandles.clear();
+          batchHandles.clear();
         },
       };
       subagentHistoryRestoreHandlesRef.current.set(key, handle);
       useSubagentStore.getState().beginHistoryRestore(sid, subagentId);
 
-      const fetchSubagentHistoryPage = (
-        pageIdx: number,
-        fallbackTotalPages: number,
-      ): Promise<LoadedHistoryPage | null> => new Promise((resolve) => {
+      const fetchSubagentHistoryBatch = (
+        cursor: string | null,
+        batchSeq: number,
+      ): Promise<LoadedHistoryBatch | null> => new Promise((resolve) => {
         if (disposed) {
           resolve(null);
           return;
         }
 
         let settled = false;
-        let pageHandle: HistoryRestoreHandle | null = null;
-        const settle = (page: LoadedHistoryPage | null) => {
+        let batchHandle: HistoryRestoreHandle | null = null;
+        const settle = (batch: LoadedHistoryBatch | null) => {
           if (settled) return;
           settled = true;
-          pageSettlers.delete(settle);
-          if (pageHandle) pageHandles.delete(pageHandle);
-          resolve(page);
+          batchSettlers.delete(settle);
+          if (batchHandle) batchHandles.delete(batchHandle);
+          resolve(batch);
         };
-        pageSettlers.add(settle);
+        batchSettlers.add(settle);
 
-        pageHandle = fetchHistoryPage({
+        batchHandle = fetchHistoryCursorBatch({
           sessionId: sid,
           subagentId,
-          pageIdx,
-          onReady: (result: FetchHistoryPageResult) => {
+          cursor,
+          onReady: (result) => {
             settle({
-              pageIdx,
-              totalPages: result.totalPages ?? fallbackTotalPages,
+              batchSeq,
+              requestCursor: result.cursor.requestCursor,
+              nextCursor: result.cursor.nextCursor,
+              hasMore: result.cursor.hasMore,
               result,
             });
           },
-          onEmpty: (totalPages) => {
-            if (pageIdx > 1) {
-              settle(null);
-              return;
-            }
-            settle({
-              pageIdx,
-              totalPages: totalPages ?? fallbackTotalPages,
-              result: null,
-            });
-          },
-          onTimeout: () => {
+          onFailure: () => {
             settle(null);
           },
           onError: (message) => console.warn('[subagent.history]', message),
         });
-        pageHandles.add(pageHandle);
+        batchHandles.add(batchHandle);
         void request(HISTORY_GET_METHOD, {
           session_id: sid,
           subagent_id: subagentId,
-          page_idx: pageIdx,
+          cursor,
+          limit: 50,
         }).catch((error) => {
-          pageHandle?.dispose();
+          batchHandle?.dispose();
           settle(null);
           console.warn('[subagent.history] request failed', error);
         });
@@ -1137,34 +1196,36 @@ function AppContent({
           }
         };
         let hasSubagentHistory = false;
-        const applyPage = (page: LoadedHistoryPage) => {
-          const items = page.result?.subagentReplay ?? [];
+        const applyBatch = (batch: LoadedHistoryBatch) => {
+          const items = batch.result.subagentReplay;
           if (items.length > 0) {
             hasSubagentHistory = true;
             applySubagentHistoryReplay(sid, items);
           }
         };
 
-        const firstPage = await fetchSubagentHistoryPage(1, 1);
-        if (disposed || !firstPage) {
+        const firstBatch = await fetchSubagentHistoryBatch(null, 1);
+        if (disposed || !firstBatch) {
           cleanup();
           return;
         }
-        applyPage(firstPage);
+        applyBatch(firstBatch);
 
-        const prefetchOutcome = await prefetchHistoryPages({
-          initialLoadedPages: 1,
-          initialTotalPages: firstPage.totalPages,
+        const prefetchOutcome = await prefetchHistoryBatches({
+          initialCursor: firstBatch.nextCursor,
+          initialHasMore: firstBatch.hasMore,
+          initialBatchSeq: 1,
           isCurrent: () => !disposed,
-          fetchPage: (pageIdx, totalPages) => fetchSubagentHistoryPage(pageIdx, totalPages),
-          applyPage,
+          fetchBatch: (nextCursor, nextBatchSeq) =>
+            fetchSubagentHistoryBatch(nextCursor, nextBatchSeq),
+          applyBatch,
           waitForNextPaint: async () => {},
         });
         if (disposed || prefetchOutcome !== 'completed') {
           cleanup();
           return;
         }
-        if (!hasSubagentHistory && firstPage.result === null) {
+        if (!hasSubagentHistory) {
           useSubagentStore.getState().dropCachedSubagent(
             sid,
             subagentId,
@@ -1230,11 +1291,21 @@ function AppContent({
     restoreSubagentHistory(sid);
   }, [restoreSubagentHistory, setSingleAgentPanelActiveTab]);
 
-  const applyHistoryPageResult = useCallback((sid: string, result: FetchHistoryPageResult) => {
-    // 只 stamp 徽章：merge 完成卡只适合整页 replace（首次 history 恢复）。
-    // 这里若再 merge，localStorage 里的完成卡不在本页 messages 里就会被再次注入，
+  const applyHistoryBatchResult = useCallback((
+    sid: string,
+    result: FetchHistoryCursorBatchResult,
+    batchSeq: number,
+  ) => {
+    // 只 stamp 徽章：merge 完成卡只适合整批 replace（首次 history 恢复）。
+    // 这里若再 merge，localStorage 里的完成卡不在本批 messages 里就会被再次注入，
     // prepend 又不按 id 去重，导致完成卡重复。
-    prependMessages(sid, stampGoalObjectiveMessages(sid, result.messages));
+    prependMessages(
+      sid,
+      stampGoalObjectiveMessages(
+        sid,
+        result.messages.map((message) => ({ ...message, historyBatchSeq: batchSeq })),
+      ),
+    );
     if (result.contextUsageSnapshot) {
       useSessionStore.getState().receiveContextUsage(result.contextUsageSnapshot);
     }
@@ -1247,14 +1318,18 @@ function AppContent({
             id: n.id,
             name: n.name,
             arguments: n.arguments,
+            outputOrder: n.outputOrder,
             description: n.description,
             formatted_args: n.formatted_args,
+            call_goal: n.call_goal,
             display_name: n.display_name,
             memberName: n.memberName,
+            reviewer: n.reviewer,
           },
           {
             startedAt: item.at,
             agentTemplateName: readAgentTemplateName(item.payload),
+            historyBatchSeq: batchSeq,
           }
         );
       } else {
@@ -1272,6 +1347,7 @@ function AppContent({
             ...(n.mermaid ? { mermaid: n.mermaid } : {}),
             ...(n.timedOut ? { timedOut: true } : {}),
             ...(n.beamSearch ? { beamSearch: n.beamSearch } : {}),
+            reviewer: n.reviewer,
           },
           { updatedAt: item.at }
         );
@@ -1328,126 +1404,178 @@ function AppContent({
       const store = useChatStore.getState();
       const current = store.runtimes[sid]?.reasoningSegments ?? [];
       const currentItems = current.map((segment) => ({
+        // 后台逐批恢复会反复合并该列表；沿用 ID，避免已发布的折叠节点被重新挂载。
+        id: segment.id,
         at: new Date(segment.startedAt + 1).toISOString(),
         text: segment.text,
         agentTemplateName: segment.agentTemplateName,
         // live 内存里的真实末帧时刻并入 replay，刷新重建后耗时终点不丢。
         updatedAt: segment.updatedAt,
+        historyBatchSeq: segment.historyBatchSeq,
       }));
-      store.restoreReasoningSegments(sid, [...result.reasoningReplay, ...currentItems]);
+      store.restoreReasoningSegments(sid, [
+        ...result.reasoningReplay.map((item) => ({ ...item, historyBatchSeq: batchSeq })),
+        ...currentItems,
+      ]);
     }
   }, [addToolCall, addToolResult, applyRecoveredSubagentToolHistory, applySubagentHistoryReplay, prependMessages, settleHistoricalToolExecutions]);
 
-  const fetchHistoryPageResult = useCallback(async (
+  const fetchHistoryBatch = useCallback(async (
     sid: string,
-    pageIdx: number,
-    fallbackTotalPages: number
-  ): Promise<LoadedHistoryPage | null> => {
-    const pageKey = `${sid}:${pageIdx}`;
-    const existingPromise = historyPagePromisesRef.current.get(pageKey);
+    cursor: string,
+    batchSeq: number,
+  ): Promise<LoadedHistoryBatch | null> => {
+    const batchKey = `${sid}:${cursor}`;
+    const existingPromise = historyBatchPromisesRef.current.get(batchKey);
     if (existingPromise) return existingPromise;
 
-    const promise = new Promise<LoadedHistoryPage | null>((resolve) => {
+    const promise = new Promise<LoadedHistoryBatch | null>((resolve) => {
       let settled = false;
       const settleCanceled = () => settle(null);
-      const settle = (page: LoadedHistoryPage | null) => {
+      const settle = (batch: LoadedHistoryBatch | null) => {
         if (settled) return;
         settled = true;
-        if (historyPageCancelRef.current.get(pageKey) === settleCanceled) {
-          historyPageCancelRef.current.delete(pageKey);
+        if (historyBatchCancelRef.current.get(batchKey) === settleCanceled) {
+          historyBatchCancelRef.current.delete(batchKey);
         }
-        historyPageHandlesRef.current.delete(pageKey);
-        historyPagePromisesRef.current.delete(pageKey);
-        resolve(page);
+        historyBatchHandlesRef.current.delete(batchKey);
+        historyBatchPromisesRef.current.delete(batchKey);
+        resolve(batch);
       };
-      historyPageCancelRef.current.set(pageKey, settleCanceled);
+      historyBatchCancelRef.current.set(batchKey, settleCanceled);
 
-      const pageHandle = fetchHistoryPage({
+      const batchHandle = fetchHistoryCursorBatch({
         sessionId: sid,
-        pageIdx,
+        cursor,
         onReady: (result) => {
-          const totalPages = result.totalPages ?? fallbackTotalPages;
-          settle({ pageIdx, totalPages, result });
+          historyCursorFailuresRef.current.delete(sid);
+          settle({
+            batchSeq,
+            requestCursor: result.cursor.requestCursor,
+            nextCursor: result.cursor.nextCursor,
+            hasMore: result.cursor.hasMore,
+            result,
+          });
         },
-        onEmpty: (emptyTotalPages) => {
-          // 已正常结束的页面即使没有主对话展示项，也必须推进页码。
-          const totalPages = emptyTotalPages ?? fallbackTotalPages;
-          settle({ pageIdx, totalPages, result: null });
+        onFailure: (failure) => {
+          historyCursorFailuresRef.current.set(sid, failure);
+          settle(null);
         },
-        onTimeout: () => settle(null),
         onError: (message) => {
-          console.warn('[history.page]', message);
+          console.warn('[history.cursor]', message);
         },
       });
-      historyPageHandlesRef.current.set(pageKey, pageHandle);
+      historyBatchHandlesRef.current.set(batchKey, batchHandle);
 
       void request(HISTORY_GET_METHOD, {
         session_id: sid,
-        page_idx: pageIdx,
+        cursor,
+        limit: 50,
       }).catch((error) => {
-        pageHandle.dispose();
-        if (historyPageHandlesRef.current.get(pageKey) === pageHandle) {
-          historyPageHandlesRef.current.delete(pageKey);
+        batchHandle.dispose();
+        if (historyBatchHandlesRef.current.get(batchKey) === batchHandle) {
+          historyBatchHandlesRef.current.delete(batchKey);
         }
         console.error('Failed to load older history:', error);
         settle(null);
       });
     });
-    historyPagePromisesRef.current.set(pageKey, promise);
+    historyBatchPromisesRef.current.set(batchKey, promise);
     return promise;
   }, [request]);
 
-  const applyLoadedHistoryPage = useCallback((sid: string, page: LoadedHistoryPage) => {
-    if (page.result) {
-      applyHistoryPageResult(sid, page.result);
+  const applyLoadedHistoryBatch = useCallback((
+    sid: string,
+    batch: LoadedHistoryBatch,
+  ): boolean => {
+    const runtime = useChatStore.getState().runtimes[sid];
+    const current = runtime?.historyPagerMeta;
+    if (!current || !canApplyHistoryCursorBatch(current, {
+      requestCursor: batch.requestCursor,
+      nextCursor: batch.nextCursor,
+      hasMore: batch.hasMore,
+      batchSeq: batch.batchSeq,
+      snapshotId: batch.result.cursor.snapshotId,
+      snapshotEnd: batch.result.cursor.snapshotEnd,
+    })) {
+      return false;
     }
-    setHistoryPagerMeta(sid, {
-      loadedPages: page.pageIdx,
-      totalPages: page.totalPages,
-    });
-  }, [applyHistoryPageResult, setHistoryPagerMeta]);
 
-  const startBackgroundHistoryPrefetch = useCallback((sid: string, initialLoadedPages: number, initialTotalPages: number) => {
-    if (initialLoadedPages >= initialTotalPages || historyLoadingSessionsRef.current.has(sid)) {
+    const revealTarget = historyRevealTargetRef.current.get(sid) ?? 0;
+    const shouldPublish = revealTarget >= batch.batchSeq;
+    if (shouldPublish && sessionIdRef.current === sid) {
+      setHistoryPrepending(true);
+    }
+    applyHistoryBatchResult(sid, batch.result, batch.batchSeq);
+    setHistoryPagerMeta(sid, {
+      nextCursor: batch.nextCursor,
+      hasMore: batch.hasMore,
+      snapshotId: current.snapshotId,
+      snapshotEnd: current.snapshotEnd,
+      loadedBatchSeq: batch.batchSeq,
+      publishedBatchSeq: shouldPublish ? batch.batchSeq : current.publishedBatchSeq,
+      historyComplete: !batch.hasMore,
+    });
+    if (shouldPublish) {
+      historyRevealTargetRef.current.delete(sid);
+      window.requestAnimationFrame(() => {
+        if (sessionIdRef.current === sid) {
+          setHistoryPrepending(false);
+          setHistoryLoadingMore(false);
+        }
+      });
+    }
+    return true;
+  }, [applyHistoryBatchResult, setHistoryPagerMeta]);
+
+  const startBackgroundHistoryPrefetch = useCallback((sid: string) => {
+    const initialMeta = useChatStore.getState().runtimes[sid]?.historyPagerMeta;
+    if (!initialMeta?.hasMore || !initialMeta.nextCursor || historyLoadingSessionsRef.current.has(sid)) {
       return;
     }
     const token = (historyBackgroundPrefetchTokensRef.current.get(sid) ?? 0) + 1;
     historyBackgroundPrefetchTokensRef.current.set(sid, token);
     historyLoadingSessionsRef.current.add(sid);
     setHistoryRetryAvailable(sid, false);
-    if (sessionIdRef.current === sid) {
-      setHistoryPrepending(true);
-    }
 
     void (async () => {
       try {
-        const outcome = await prefetchHistoryPages({
-          initialLoadedPages,
-          initialTotalPages,
+        const outcome = await prefetchHistoryBatches({
+          initialCursor: initialMeta.nextCursor,
+          initialHasMore: initialMeta.hasMore,
+          initialBatchSeq: initialMeta.loadedBatchSeq,
           isCurrent: () => token === historyBackgroundPrefetchTokensRef.current.get(sid),
-          fetchPage: (pageIdx, totalPages) =>
-            fetchHistoryPageResult(sid, pageIdx, totalPages),
-          applyPage: (page) => {
-            applyLoadedHistoryPage(sid, page);
-          },
+          fetchBatch: (cursor, batchSeq) =>
+            fetchHistoryBatch(sid, cursor, batchSeq),
+          applyBatch: (batch) => applyLoadedHistoryBatch(sid, batch),
           waitForNextPaint,
         });
         if (
           outcome === 'failed' &&
           token === historyBackgroundPrefetchTokensRef.current.get(sid)
         ) {
-          setHistoryRetryAvailable(sid, true);
+          const failure = historyCursorFailuresRef.current.get(sid);
+          if (failure?.code === 'HISTORY_SNAPSHOT_CHANGED') {
+            setHistoryPagerMeta(sid, null);
+            if (sessionIdRef.current === sid) {
+              setHistoryBootstrapKey((value) => value + 1);
+            }
+          } else {
+            setHistoryRetryAvailable(sid, true);
+            historyRevealTargetRef.current.delete(sid);
+            if (sessionIdRef.current === sid) {
+              setHistoryLoadingMore(false);
+              setHistoryPrepending(false);
+            }
+          }
         }
       } finally {
         historyLoadingSessionsRef.current.delete(sid);
-        if (sessionIdRef.current === sid) {
-          setHistoryPrepending(false);
-        }
       }
     })();
   }, [
-    applyLoadedHistoryPage,
-    fetchHistoryPageResult,
+    applyLoadedHistoryBatch,
+    fetchHistoryBatch,
     setHistoryRetryAvailable,
   ]);
 
@@ -1464,18 +1592,86 @@ function AppContent({
     }
   }, []);
 
-  const loadSessionMetadata = useCallback(async (targetSessionId: string): Promise<Session | null> => {
+  const fetchSessionMetadata = useCallback(async (targetSessionId: string): Promise<Session | null> => {
+    const queueSnapshot = useChatStore.getState().beginQueuedSessionMessageSnapshot(targetSessionId);
     try {
-      const session = await request<Session>('session.get_metadata', {
+      const response = await request<Session>('session.get_metadata', {
         session_id: targetSessionId,
       });
+      const { queued_session_messages: queuedMessages, ...fetched } = response;
+      if ((fetched as unknown as Record<string, unknown>).archived === true) {
+        if (sessionIdRef.current === targetSessionId) {
+          navigate({ kind: 'chat-new' }, { replace: true });
+        }
+        return null;
+      }
+      if (Array.isArray(queuedMessages)) {
+        useChatStore.getState().reconcileQueuedSessionMessageSnapshot(
+          targetSessionId,
+          queueSnapshot,
+          queuedMessages
+            .filter((message) => message.status === 'queued' && message.target_session_id === targetSessionId)
+            .map((message) => ({
+              messageId: message.message_id,
+              sourceSessionId: message.source_session_id,
+              sourceTitle: message.source_title,
+              content: message.content,
+            }))
+        );
+      }
+      // The Gateway counts a paused Team as busy, but a paused session is not
+      // running anything: keep it settled, as chat.processing_status does,
+      // otherwise the pause leaves a spinner that nothing ever clears.
+      const session = fetched.is_processing
+        && useChatStore.getState().getRuntime(targetSessionId)?.isPaused
+        ? { ...fetched, is_processing: false }
+        : fetched;
       upsertSessionMetadata(session, { setCurrent: sessionIdRef.current === targetSessionId });
       useWorkspaceStore.getState().upsertSession(session);
+      // is_processing 由 Gateway 在 session.get_metadata 响应入队前读取当前
+      // session 的运行态并覆盖，不是磁盘 metadata 的历史值。刷新页面时用这条
+      // 明确状态恢复停止按钮；之后同一 WebSocket 上的 processing_status 事件
+      // 继续按发送顺序推进状态机。
+      if (typeof session.is_processing === 'boolean') {
+        setProcessing(targetSessionId, session.is_processing);
+        if (!session.is_processing) {
+          setThinking(targetSessionId, false);
+        }
+      }
       if (session.session_equipment && typeof session.session_equipment === 'object') {
         restoreSessionEquipment(targetSessionId, session.session_equipment);
       }
       if (sessionIdRef.current === targetSessionId) {
         setMissingSessionId((current) => (current === targetSessionId ? null : current));
+        if (Object.prototype.hasOwnProperty.call(session, 'agent_group_name')) {
+          const pendingAgentGroupBinding = useSessionStore.getState()
+            .getRuntime(targetSessionId)?.agentGroupBindingPending;
+          const sessionGroupBinding = typeof session.agent_group_name === 'string'
+            ? session.agent_group_name.trim()
+            : '';
+          // 首次 chat.send 的 session metadata 可能先于后端绑定落盘返回空值。
+          // 保留本地乐观锁，交给 reconcileAgentGroupBinding 的成功/失败结果收敛，
+          // 避免路由恢复的 metadata 读回把发送瞬间的锁定提前清掉。
+          const confirmedAgentGroupBinding = useSessionStore.getState()
+            .getRuntime(targetSessionId)?.agentGroupBinding;
+          if (sessionGroupBinding || (!pendingAgentGroupBinding && !confirmedAgentGroupBinding)) {
+            useSessionStore.getState().setAgentGroupBinding(targetSessionId, sessionGroupBinding || null);
+            if (!sessionGroupBinding && !pendingAgentGroupBinding && !confirmedAgentGroupBinding) {
+              // 旧版本允许在已有普通 Team 上留下专家团草稿；该会话并没有可绑定的
+              // 首次构建窗口，恢复 metadata 时一并清掉，避免后续发送再次提交非法字段。
+              useSessionStore.getState().clearAgentGroupSelectionIntent(targetSessionId);
+            }
+          }
+        }
+        const sessionGroupId = typeof session.agent_group_name === 'string'
+          ? session.agent_group_name.trim()
+          : '';
+        useSessionStore.getState().setTeamLeaderIdentity(
+          targetSessionId,
+          sessionGroupId && Object.prototype.hasOwnProperty.call(session, 'team_leader_identity')
+            ? normalizeTeamLeaderIdentity(session.team_leader_identity)
+            : null,
+        );
         // 同 handleRestoreSession：拿到后端 metadata 里的 model 后还原 selectedModelName，
         // 覆盖"targetSession 为空、走 loadSessionMetadata"这条恢复路径（如从 cron 触发
         // 会话列表点进来的占位 session 之后补全元数据的场景，bug002）。
@@ -1504,7 +1700,27 @@ function AppContent({
       }
       return null;
     }
-  }, [request, upsertSessionMetadata]);
+  }, [navigate, request, setProcessing, setThinking, upsertSessionMetadata]);
+
+  const handleContinueQueuedSessionMessages = useCallback(async (targetSessionId: string) => {
+    try {
+      await request('session.message.continue_queued', { session_id: targetSessionId });
+    } catch {
+      toast.open({ content: t('network.resumeFailed'), variant: 'error' });
+    }
+  }, [request, t]);
+
+  const loadSessionMetadata = useCallback((targetSessionId: string): Promise<Session | null> => {
+    const inFlight = sessionMetadataRequestsRef.current.get(targetSessionId);
+    if (inFlight) return inFlight;
+    const pending = fetchSessionMetadata(targetSessionId).finally(() => {
+      if (sessionMetadataRequestsRef.current.get(targetSessionId) === pending) {
+        sessionMetadataRequestsRef.current.delete(targetSessionId);
+      }
+    });
+    sessionMetadataRequestsRef.current.set(targetSessionId, pending);
+    return pending;
+  }, [fetchSessionMetadata]);
 
   // 获取服务端配置（通过 WS 方法）
   const fetchConfig = useCallback(async () => {
@@ -1517,7 +1733,7 @@ function AppContent({
       setConfigError(null);
       if (!modelSetupGuideEvaluatedRef.current) {
         modelSetupGuideEvaluatedRef.current = true;
-        if (!oauthNavRestoredRef.current && (shouldPreviewModelSetupGuide() || isSetupGuideEnabled(config.setup_guide_enabled))) {
+        if (shouldPreviewModelSetupGuide() || isSetupGuideEnabled(config.setup_guide_enabled)) {
           setActiveNav('chat');
           setModelSetupGuideStep(1);
         }
@@ -1635,6 +1851,24 @@ function AppContent({
     }
   }, [request, setAvailableModels]);
 
+  useEffect(() => {
+    const onAuthChanged = (event: Event) => {
+      void handleModelsRefresh();
+      if (!(event as CustomEvent<{ islogin?: boolean }>).detail?.islogin) return;
+      setAuthToastVisible(true);
+      if (authToastTimerRef.current != null) window.clearTimeout(authToastTimerRef.current);
+      authToastTimerRef.current = window.setTimeout(() => {
+        setAuthToastVisible(false);
+        authToastTimerRef.current = null;
+      }, 3000);
+    };
+    window.addEventListener('jiuwen:auth-changed', onAuthChanged);
+    return () => {
+      window.removeEventListener('jiuwen:auth-changed', onAuthChanged);
+      if (authToastTimerRef.current != null) window.clearTimeout(authToastTimerRef.current);
+    };
+  }, [handleModelsRefresh]);
+
   const detectExternalCli = useCallback(async (cliAgent: ExternalCliAgentKind, cliPath?: string) => {
     return request<{
       cli_agent: ExternalCliAgentKind;
@@ -1727,10 +1961,11 @@ function AppContent({
 
   const savePermissionSilent = useCallback(async (updates: Record<string, string>) => {
     try {
-      await request<{ updated?: string[]; applied_without_restart?: boolean }>('config.set', updates);
+      const payload = await request<{ canonical_config?: Record<string, string> }>('config.set', updates);
       setServerConfig((prev) => {
-        if (!prev) return updates;
-        return { ...prev, ...updates };
+        const canonical = payload?.canonical_config ?? {};
+        if (!prev) return { ...updates, ...canonical };
+        return { ...prev, ...updates, ...canonical };
       });
     } catch (error) {
       console.error('Failed to save permission:', error);
@@ -1826,6 +2061,34 @@ function AppContent({
     })();
   }, [fetchConfig, initialDataLoaded, isConnected]);
 
+  const initialProjectsLoadedRef = useRef(false);
+
+  useEffect(() => {
+    if (!initialDataLoaded || !isConnected || initialProjectsLoadedRef.current) {
+      return;
+    }
+    let cancelled = false;
+    const retryDelaysMs = [2000, 5000, 10000, 15000, 30000];
+    const run = async () => {
+      if (await loadProjects()) {
+        if (!cancelled) initialProjectsLoadedRef.current = true;
+        return;
+      }
+      for (const delayMs of retryDelaysMs) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (cancelled) return;
+        if (await loadProjects()) {
+          if (!cancelled) initialProjectsLoadedRef.current = true;
+          return;
+        }
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialDataLoaded, isConnected, loadProjects]);
+
   useEffect(() => {
     if (!isConnected || !routeSessionId) {
       setMissingSessionId(null);
@@ -1907,11 +2170,7 @@ function AppContent({
         useSubagentStore.getState().removeRuntime(sessionId);
       } else {
         setLoadingHistory(sessionId, false);
-        startBackgroundHistoryPrefetch(
-          sessionId,
-          existingRuntime.historyPagerMeta.loadedPages,
-          existingRuntime.historyPagerMeta.totalPages
-        );
+        startBackgroundHistoryPrefetch(sessionId);
         return;
       }
     }
@@ -1975,7 +2234,7 @@ function AppContent({
     // 开始历史会话加载
     const restoreHandle = beginHistoryRestore({
       sessionId: sessionId,
-      onReady: (messages, totalPages) => {
+      onReady: (messages, cursorMeta) => {
         historyRestoreFromPanelHintRef.current = false;
         // "目标完成"回显消息纯前端合成，从未写进后端 session 历史，history.get 拉回来的
         // messages 里不会有它——按时间戳把本地持久化的记录补回去，见
@@ -1984,15 +2243,25 @@ function AppContent({
         // 见 stampGoalObjectiveMessages。
         replaceHistoryMessages(
           sessionId,
-          stampGoalObjectiveMessages(sessionId, mergePersistedGoalCompletionMessages(sessionId, messages))
+          stampGoalObjectiveMessages(
+            sessionId,
+            mergePersistedGoalCompletionMessages(
+              sessionId,
+              messages.map((message) => ({ ...message, historyBatchSeq: 1 })),
+            ),
+          )
         );
-        const restoredTotalPages = totalPages ?? 1;
         setHistoryPagerMeta(sessionId, {
-          loadedPages: 1,
-          totalPages: restoredTotalPages,
+          nextCursor: cursorMeta.nextCursor,
+          hasMore: cursorMeta.hasMore,
+          snapshotId: cursorMeta.snapshotId,
+          snapshotEnd: cursorMeta.snapshotEnd,
+          loadedBatchSeq: 1,
+          publishedBatchSeq: 1,
+          historyComplete: !cursorMeta.hasMore,
         });
         setLoadingHistory(sessionId, false);
-        startBackgroundHistoryPrefetch(sessionId, 1, restoredTotalPages);
+        startBackgroundHistoryPrefetch(sessionId);
         restoreWorkflowSnapshot(sessionId);
         queueMicrotask(() => {
           if (historyRestoreHandlesRef.current.get(sessionId) === restoreHandle) {
@@ -2003,12 +2272,16 @@ function AppContent({
       onContextUsage: (payload) => {
         useSessionStore.getState().receiveContextUsage(payload);
       },
-      onEmpty: (emptyTotalPages) => {
+      onEmpty: (cursorMeta) => {
         replaceHistoryMessages(sessionId, mergePersistedGoalCompletionMessages(sessionId, []));
-        const restoredTotalPages = emptyTotalPages ?? 1;
         setHistoryPagerMeta(sessionId, {
-          loadedPages: 1,
-          totalPages: restoredTotalPages,
+          nextCursor: cursorMeta.nextCursor,
+          hasMore: cursorMeta.hasMore,
+          snapshotId: cursorMeta.snapshotId,
+          snapshotEnd: cursorMeta.snapshotEnd,
+          loadedBatchSeq: 1,
+          publishedBatchSeq: 1,
+          historyComplete: !cursorMeta.hasMore,
         });
         if (historyRestoreFromPanelHintRef.current) {
           historyRestoreFromPanelHintRef.current = false;
@@ -2020,7 +2293,7 @@ function AppContent({
           });
         }
         setLoadingHistory(sessionId, false);
-        startBackgroundHistoryPrefetch(sessionId, 1, restoredTotalPages);
+        startBackgroundHistoryPrefetch(sessionId);
         restoreWorkflowSnapshot(sessionId);
         if (historyRestoreHandlesRef.current.get(sessionId) === restoreHandle) {
           historyRestoreHandlesRef.current.delete(sessionId);
@@ -2039,14 +2312,18 @@ function AppContent({
                 id: n.id,
                 name: n.name,
                 arguments: n.arguments,
+            outputOrder: n.outputOrder,
                 description: n.description,
                 formatted_args: n.formatted_args,
+                call_goal: n.call_goal,
                 display_name: n.display_name,
                 memberName: n.memberName,
+                reviewer: n.reviewer,
               },
               {
                 startedAt: item.at,
                 agentTemplateName: readAgentTemplateName(item.payload),
+                historyBatchSeq: 1,
               }
             );
           } else {
@@ -2064,6 +2341,7 @@ function AppContent({
                 ...(n.mermaid ? { mermaid: n.mermaid } : {}),
                 ...(n.timedOut ? { timedOut: true } : {}),
                 ...(n.beamSearch ? { beamSearch: n.beamSearch } : {}),
+                reviewer: n.reviewer,
               },
               { updatedAt: item.at }
             );
@@ -2117,7 +2395,10 @@ function AppContent({
         applySubagentHistoryReplay(sessionId, items);
       },
       onReasoningReplay: (items) => {
-        restoreReasoningSegments(sessionId, items);
+        restoreReasoningSegments(
+          sessionId,
+          items.map((item) => ({ ...item, historyBatchSeq: 1 })),
+        );
       },
       onCompactionReplay: (info) => {
         // 回显「本轮完成上下文压缩 N 次」：恢复进 chatStore，渲染与实时事件同一处
@@ -2128,9 +2409,39 @@ function AppContent({
           summaries: info.summaries,
         });
       },
+      onPendingQuestionReplay: (items) => {
+        // 防御性兜底：当前 materializeHistoryTimeline 把未答问题也渲染成只读
+        // qa.summary 卡片（不弹实时交互框——web 重连后后端不重发挂起中断，弹框 +
+        // resume 会报 "session has no active execution"），所以 pendingQuestionReplay
+        // 恒为空、本回调不会被触发。保留此钩子是为了将来后端支持重发挂起中断时
+        // 可直接重新启用，无需改接口。
+        const chatStore = useChatStore.getState();
+        chatStore.ensureRuntime(sessionId);
+        const sorted = [...items].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
+        for (const item of sorted) {
+          chatStore.enqueuePendingQuestion(sessionId, item.payload);
+        }
+      },
       onError: (message) => {
         console.warn('[history.restore]', message);
+      },
+      onFailure: (failure) => {
+        historyRestoreFromPanelHintRef.current = false;
+        if (historyRestoreHandlesRef.current.get(sessionId) === restoreHandle) {
+          historyRestoreHandlesRef.current.delete(sessionId);
+        }
+        setHistoryPagerMeta(sessionId, null);
         setLoadingHistory(sessionId, false);
+        if (sessionIdRef.current === sessionId) {
+          clearMessages(sessionId);
+          addMessage(sessionId, {
+            id: `history-load-failed-${Date.now()}`,
+            role: 'system',
+            content: tRef.current('sessions.errors.restoreFailed', { sessionId }),
+            timestamp: new Date().toISOString(),
+          });
+        }
+        console.error('[history.restore]', failure.code, failure.message);
       },
     });
     historyRestoreHandlesRef.current.set(sessionId, restoreHandle);
@@ -2140,7 +2451,8 @@ function AppContent({
       try {
         await request(HISTORY_GET_METHOD, {
           session_id: sessionId,
-          page_idx: 1,
+          cursor: null,
+          limit: 50,
         });
       } catch (error) {
         historyRestoreFromPanelHintRef.current = false;
@@ -2152,9 +2464,7 @@ function AppContent({
         setHistoryPagerMeta(sessionId, null);
         console.error('Failed to load history:', error);
         setLoadingHistory(sessionId, false);
-        // 忽略 "invalid page_idx or session history not found" 错误，因为这是新会话的正常情况
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        if (sessionIdRef.current === sessionId && !errorMessage.includes('invalid page_idx or session history not found')) {
+        if (sessionIdRef.current === sessionId) {
           clearMessages(sessionId);
           addMessage(sessionId, {
             id: `history-load-failed-${Date.now()}`,
@@ -2288,7 +2598,7 @@ function AppContent({
       currentMode: currentRuntime?.mode ?? mode,
       pending: newConversationPreviousSessionRef.current,
       newConversationId: NEW_CONVERSATION_ID,
-      clear: lifecycle.clearPreviousSession,
+      clear: lifecycle.clearPreviousSession || options.clearPreviousSession,
     });
     // 返回尚未发送的新建任务时，恢复该临时会话自己的模式和模型；真正开始一个新任务时，
     // 仍固定使用配置的默认模型，不继承当前正式会话手动切换过的模型。
@@ -2304,6 +2614,7 @@ function AppContent({
     // agent 模式（bug003）。
     const nextMode = options.forceMode ?? resolvedEntrySettings.mode;
     const { selectedModelName } = resolvedEntrySettings;
+    setChatWelcomeVariant(options.welcomeVariant ?? null);
     const selectedProject = options.project ?? useWorkspaceStore.getState().selectedProject;
     const projectDir = resolveNewConversationProjectDir(
       options.preserveProject,
@@ -2314,13 +2625,22 @@ function AppContent({
       currentSessionId !== NEW_CONVERSATION_ID ? currentSessionId : undefined,
     );
     setHistoryLoadingMore(false);
-    const pendingAgentSelection = shouldRestorePendingNewConversation
+    const preservePendingDefinitionSelections = shouldRestorePendingNewConversation && !options.welcomeVariant;
+    const pendingAgentSelection = preservePendingDefinitionSelections
       && pendingNewRuntime?.agentSelectionIntent.kind === 'select'
       ? pendingNewRuntime.agentSelectionIntent
+      : null;
+    const pendingAgentGroupSelection = preservePendingDefinitionSelections
+      && nextMode === 'team'
+      && pendingNewRuntime?.agentGroupSelectionIntent.kind === 'select'
+      ? pendingNewRuntime.agentGroupSelectionIntent
       : null;
     resetNewConversationRuntime({ mode: nextMode, selectedModelName, projectDir });
     if (pendingAgentSelection) {
       useSessionStore.getState().setAgentSelectionIntent(NEW_CONVERSATION_ID, pendingAgentSelection);
+    }
+    if (pendingAgentGroupSelection) {
+      useSessionStore.getState().setAgentGroupSelectionIntent(NEW_CONVERSATION_ID, pendingAgentGroupSelection);
     }
     if (options.initialInputValue) {
       useChatStore.getState().setInputValue(NEW_CONVERSATION_ID, options.initialInputValue);
@@ -2351,7 +2671,11 @@ function AppContent({
     setCurrentSession(null);
     setTeamAreaExpanded(false);
     setSingleAgentPanelExpanded(false);
-    navigate({ kind: 'chat-new' });
+    // 删除/归档当前会话后 replace，避免后退回到已失效的 /chat/session/:id
+    navigate(
+      { kind: 'chat-new' },
+      (lifecycle.clearPreviousSession || options.clearPreviousSession) ? { replace: true } : undefined,
+    );
     setActiveNav('chat');
     requestComposerFocus();
   }, [disposeInFlightHistoryHandles, mode, navigate, requestComposerFocus, setCurrentSession, setSelectedProject, setSingleAgentPanelExpanded, setTeamAreaExpanded]);
@@ -2385,6 +2709,8 @@ function AppContent({
   const handleSwitchMode = useCallback((targetMode: AgentMode) => {
     const currentId = sessionIdRef.current;
     if (useChatStore.getState().getRuntime(currentId)?.isProcessing) return;
+    const currentSessionRuntime = useSessionStore.getState().getRuntime(currentId);
+    if ((currentSessionRuntime?.agentGroupBinding || currentSessionRuntime?.agentGroupBindingPending) && targetMode !== 'team') return;
     if (currentId === NEW_CONVERSATION_ID) {
       setMode(NEW_CONVERSATION_ID, targetMode);
       return;
@@ -2392,24 +2718,20 @@ function AppContent({
     enterNewConversation(targetMode);
   }, [enterNewConversation, setMode]);
 
-  const handleKVCInputIntent = useCallback((targetSessionId: string) => {
-    // OFF must remain the ordinary JiuwenSwarm path: do not emit even the
-    // best-effort prepare control request. AgentServer keeps its own gate as
-    // a fail-closed boundary for stale or non-Web clients.
-    if (!kvCacheAffinityEnabled) return;
+  const handleSessionInputIntent = useCallback((targetSessionId: string) => {
     if (!targetSessionId || targetSessionId === NEW_CONVERSATION_ID) return;
-    if (kvcPreparedInputSessionRef.current === targetSessionId) return;
+    if (inputIntentSessionRef.current === targetSessionId) return;
 
-    // Leading-edge intent: start prefetch on the first real insertion instead
-    // of waiting until the user stops typing. InputArea reports beforeinput,
-    // paste and input as browser-compatible fallbacks; this latch collapses
-    // them into one control request for the current foreground visit.
-    kvcPreparedInputSessionRef.current = targetSessionId;
+    // Publish on the first real insertion instead of waiting until the user
+    // stops typing. InputArea reports beforeinput, paste and input as browser-
+    // compatible fallbacks; this latch collapses them into one lifecycle
+    // notification for the current foreground visit.
+    inputIntentSessionRef.current = targetSessionId;
     const runtime = useSessionStore.getState().getRuntime(targetSessionId);
-    void request<{ scheduled?: boolean; outcome?: string }>('session.kvc.prepare', {
+    void request<{ scheduled?: boolean; outcome?: string }>('session.input.intent', {
       session_id: targetSessionId,
       intent_id: generateUuidV4(),
-      view_id: kvcViewIdRef.current,
+      view_id: sessionViewIdRef.current,
       mode: resolvePlanWireMode(
         runtime?.mode ?? mode,
         usePlanStore.getState().isActive(targetSessionId),
@@ -2417,26 +2739,26 @@ function AppContent({
       ),
     }).then((response) => {
       if (response?.outcome === 'failed'
-          && kvcPreparedInputSessionRef.current === targetSessionId) {
-        kvcPreparedInputSessionRef.current = null;
+          && inputIntentSessionRef.current === targetSessionId) {
+        inputIntentSessionRef.current = null;
       }
     }).catch((error) => {
       // Allow the next editor event to retry when the control request itself
-      // could not reach AgentServer. KVC remains an optional optimization.
-      if (kvcPreparedInputSessionRef.current === targetSessionId) {
-        kvcPreparedInputSessionRef.current = null;
+      // could not reach AgentServer. Lifecycle extensions remain optional.
+      if (inputIntentSessionRef.current === targetSessionId) {
+        inputIntentSessionRef.current = null;
       }
-      console.debug('session.kvc.prepare skipped:', error);
+      console.debug('session.input.intent skipped:', error);
     });
-  }, [kvCacheAffinityEnabled, mode, request]);
+  }, [mode, request]);
 
   const handleUseAgent = useCallback((agentId: string) => {
-    enterNewConversation('agent');
+    enterNewConversation('agent', { forceMode: 'agent' });
     useSessionStore.getState().setAgentSelectionIntent(NEW_CONVERSATION_ID, { kind: 'select', id: agentId });
   }, [enterNewConversation]);
 
   const handleUseAgentPrompt = useCallback((agentId: string, prompt: string) => {
-    enterNewConversation('agent', { initialInputValue: prompt });
+    enterNewConversation('agent', { initialInputValue: prompt, forceMode: 'agent' });
     useSessionStore.getState().setAgentSelectionIntent(NEW_CONVERSATION_ID, { kind: 'select', id: agentId });
   }, [enterNewConversation]);
 
@@ -2475,7 +2797,7 @@ function AppContent({
         is_swarm: runtimeSettings.mode === 'team',
         title: createConversationTitle(initialTitle).slice(0, 100),
         work_mode: workContext.work_mode,
-        view_id: kvcViewIdRef.current,
+        view_id: sessionViewIdRef.current,
         persist_session: false,
       };
       const previousSession = newConversationPreviousSessionRef.current;
@@ -2546,9 +2868,23 @@ function AppContent({
     }
   }, [mode, navigate, request, t]);
 
-  const handleSendMessage = useCallback(async (content: string, mediaItems?: MediaItem[]) => {
+  const handleUseAgentGroup = useCallback((groupId: string) => {
+    enterNewConversation('team', { forceMode: 'team' });
+    useSessionStore.getState().setAgentGroupSelectionIntent(NEW_CONVERSATION_ID, { kind: 'select', id: groupId });
+  }, [enterNewConversation]);
+
+  const handleUseGroupPrompt = useCallback((groupId: string, prompt: string) => {
+    enterNewConversation('team', { initialInputValue: prompt, forceMode: 'team' });
+    useSessionStore.getState().setAgentGroupSelectionIntent(NEW_CONVERSATION_ID, { kind: 'select', id: groupId });
+  }, [enterNewConversation]);
+
+  const handleSendMessage = useCallback(async (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => {
     const currentSessionId = sessionIdRef.current;
     if (!currentSessionId) return;
+    if (options?.queuedTaskId) {
+      await sendMessage(content, currentSessionId, mediaItems, options);
+      return;
+    }
     if (currentSessionId === NEW_CONVERSATION_ID) {
       const persistCommand = parsePersistSessionCommand(content);
       if (persistCommand.persistSession && !persistCommand.content) {
@@ -2566,6 +2902,18 @@ function AppContent({
         projectDir: newRuntime?.projectDirectory ?? null,
         persistSession: persistCommand.persistSession,
       };
+      const pendingNewAgentGroupBinding = runtimeSettings.mode === 'team'
+        && newRuntime?.agentGroupSelectionIntent.kind === 'select'
+        ? newRuntime.agentGroupSelectionIntent.id
+        : null;
+      if (pendingNewAgentGroupBinding) {
+        // 欢迎页创建真实会话前也要立即锁住已选专家团；否则 create conversation
+        // 的异步等待期间，用户仍能看到并操作未绑定的草稿标签。
+        useSessionStore.getState().setAgentGroupBindingPending(
+          NEW_CONVERSATION_ID,
+          pendingNewAgentGroupBinding,
+        );
+      }
       const baseWorkContext = getWorkContextForSession(NEW_CONVERSATION_ID);
       const preservedProject = newConversationProjectRef.current;
       const workContext = {
@@ -2584,7 +2932,7 @@ function AppContent({
           is_swarm: runtimeSettings.mode === 'team',
           title: createConversationTitle(messageContent).slice(0, 100),
           work_mode: workContext.work_mode,
-          view_id: kvcViewIdRef.current,
+          view_id: sessionViewIdRef.current,
           persist_session: runtimeSettings.persistSession,
         };
         const previousSession = newConversationPreviousSessionRef.current;
@@ -2638,6 +2986,13 @@ function AppContent({
         const pendingAgentSelection = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID)?.agentSelectionIntent ?? { kind: 'keep' as const };
         useSessionStore.getState().setAgentSelectionIntent(newSid, pendingAgentSelection);
         useSessionStore.getState().clearAgentSelectionIntent(NEW_CONVERSATION_ID);
+        const pendingAgentGroupSelection = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID)?.agentGroupSelectionIntent ?? { kind: 'keep' as const };
+        useSessionStore.getState().setAgentGroupSelectionIntent(newSid, pendingAgentGroupSelection);
+        const pendingAgentGroupBinding = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID)?.agentGroupBindingPending;
+        if (pendingAgentGroupBinding) {
+          useSessionStore.getState().setAgentGroupBindingPending(newSid, pendingAgentGroupBinding);
+        }
+        useSessionStore.getState().clearAgentGroupSelectionIntent(NEW_CONVERSATION_ID);
         // Swarmflow 开关同样按 session 存，必须在 removeRuntime('new') 之前搬到真实会话，
         // 否则 NEW_CONVERSATION_ID 的 runtime 被删后读到 undefined，chat.send 不带 enable_swarmflow=true。
         const newConvSwarmflow = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID);
@@ -2675,7 +3030,7 @@ function AppContent({
           queueOrAddGoalObjectiveMessage(newSid, messageContent);
           setGoalObjective(newSid, messageContent);
         } else {
-          const sent = await sendMessage(messageContent, newSid, mediaItems);
+          const sent = await sendMessage(content, newSid, mediaItems, options);
           if (!sent) {
             useChatStore.getState().setInputValue(newSid, messageContent);
           }
@@ -2683,6 +3038,9 @@ function AppContent({
         newConversationProjectRef.current = null;
         newConversationPreviousSessionRef.current = null;
       } catch (error) {
+        if (pendingNewAgentGroupBinding) {
+          useSessionStore.getState().setAgentGroupBindingPending(NEW_CONVERSATION_ID, null);
+        }
         useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
         useChatStore.getState().setThinking(NEW_CONVERSATION_ID, false);
         useChatStore.getState().setInputValue(NEW_CONVERSATION_ID, content);
@@ -2694,7 +3052,7 @@ function AppContent({
       return;
     }
     disposeInFlightHistoryHandles(currentSessionId);
-    const sent = await sendMessage(content, currentSessionId, mediaItems);
+    const sent = await sendMessage(content, currentSessionId, mediaItems, options);
     if (sent) {
       const sessionState = useSessionStore.getState();
       const session =
@@ -2707,6 +3065,86 @@ function AppContent({
     }
   }, [disposeInFlightHistoryHandles, mode, navigate, request, sendMessage, setGoalObjective, t]);
 
+  const handleEnsureVoiceSession = useCallback(async (): Promise<string> => {
+    const currentSessionId = sessionIdRef.current;
+    if (currentSessionId && currentSessionId !== NEW_CONVERSATION_ID) {
+      return currentSessionId;
+    }
+    if (creatingSessionRef.current) {
+      throw new Error(t('chat.realtimeVoiceSessionCreating'));
+    }
+
+    creatingSessionRef.current = true;
+    useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, true);
+    const newRuntime = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID);
+    const runtimeSettings = {
+      mode: newRuntime?.mode ?? mode,
+      selectedModelName: useSessionStore.getState().getEffectiveModelName(NEW_CONVERSATION_ID),
+      projectDir: newRuntime?.projectDirectory ?? null,
+    };
+    const baseWorkContext = getWorkContextForSession(NEW_CONVERSATION_ID);
+    const preservedProject = newConversationProjectRef.current;
+    const workContext = {
+      project_id: baseWorkContext.project_id || preservedProject?.project_id,
+      project_dir: baseWorkContext.project_dir || preservedProject?.project_dir,
+      work_mode: useWorkspaceStore.getState().workMode,
+    };
+
+    try {
+      const createParams: Record<string, unknown> = {
+        create_token: generateUuidV4(),
+        mode: runtimeSettings.mode,
+        is_swarm: runtimeSettings.mode === 'team',
+        title: t('chat.realtimeVoiceSessionTitle'),
+        work_mode: workContext.work_mode,
+      };
+      const previousSession = newConversationPreviousSessionRef.current;
+      if (previousSession) {
+        createParams.previous_session_id = previousSession.sessionId;
+        createParams.previous_mode = previousSession.mode;
+      }
+      if (runtimeSettings.selectedModelName) createParams.model_name = runtimeSettings.selectedModelName;
+      if (workContext.project_id) createParams.project_id = workContext.project_id;
+      if (workContext.project_dir) createParams.project_dir = workContext.project_dir;
+
+      const created = await createConversationSession(request, createParams);
+      const newSid = created.session_id;
+      const createdSession = registerCreatedConversation(
+        newSid,
+        runtimeSettings,
+        Date.now(),
+        t('chat.realtimeVoiceSessionTitle'),
+        {
+          project_id: created.project_id || workContext.project_id,
+          project_dir: created.project_dir || workContext.project_dir,
+          work_mode: created.work_mode || workContext.work_mode,
+        },
+      );
+      const pendingSkills = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID)?.selectedSkills ?? [];
+      pendingSkills.forEach(skill => useSessionStore.getState().addSelectedSkill(newSid, skill));
+      useSessionStore.getState().clearSelectedSkills(NEW_CONVERSATION_ID);
+      useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
+      useChatStore.getState().setProcessing(newSid, false);
+      useWorkspaceStore.getState().upsertSession(
+        { ...createdSession, is_processing: false },
+        { isNew: true },
+      );
+      sessionIdsCreatedInThisPageRef.current.add(newSid);
+      sessionIdRef.current = newSid;
+      setSessionId(newSid);
+      navigate({ kind: 'chat-session', sessionId: newSid }, { replace: true });
+      newConversationProjectRef.current = null;
+      newConversationPreviousSessionRef.current = null;
+      return newSid;
+    } catch (error) {
+      useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
+      useChatStore.getState().setThinking(NEW_CONVERSATION_ID, false);
+      throw error;
+    } finally {
+      creatingSessionRef.current = false;
+    }
+  }, [mode, navigate, request, t]);
+
   const handlePersistMedia = useCallback((content: string, mediaItems: MediaItem[]) => {
     const currentSessionId = sessionIdRef.current;
     if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID) {
@@ -2714,6 +3152,13 @@ function AppContent({
     }
     return persistMedia(content, currentSessionId, mediaItems);
   }, [persistMedia]);
+
+  const handleDiscardMedia = useCallback((sessionId: string, path: string) => {
+    if (!sessionId || sessionId === NEW_CONVERSATION_ID || !path) {
+      return Promise.resolve();
+    }
+    return discardMedia(sessionId, path);
+  }, [discardMedia]);
 
   const handlePersistDocuments = useCallback((content: string, mediaItems: MediaItem[]) => {
     const currentSessionId = sessionIdRef.current;
@@ -2734,12 +3179,15 @@ function AppContent({
     });
   }, [sendStructuredChatContent]);
 
-  const handleInterrupt = useCallback((newInput?: string) => {
+  const handleInterrupt = useCallback(async (
+    newInput?: string,
+    options?: { addUserMessage?: boolean; voiceDisplayText?: string },
+  ) => {
     const currentSessionId = sessionIdRef.current;
     if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID) return;
     const trimmed = newInput?.trim();
     if (!trimmed) return;
-    void supplement(currentSessionId, trimmed);
+    await supplement(currentSessionId, trimmed, options);
   }, [supplement]);
 
   const handleCancel = useCallback(() => {
@@ -2763,6 +3211,19 @@ function AppContent({
     void cancel(currentSessionId);
     if (isGoalActive) void pauseGoal(currentSessionId);
   }, [cancel, mode, pause, pauseGoal]);
+
+  const handleVoiceControl = useCallback(async (
+    command: 'pause_task' | 'resume_task',
+    options?: { waitForCompletion?: boolean; voiceDisplayText?: string; voice?: boolean }
+  ) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID) return;
+    if (command === 'pause_task') {
+      await pause(currentSessionId, options);
+    } else if (command === 'resume_task') {
+      await resume(currentSessionId, { voiceDisplayText: options?.voiceDisplayText });
+    }
+  }, [pause, resume]);
 
   /**
    * 删除目标：active 时除了清目标，还要顺带结束当前会话输出——复用停止按钮同一套中断调用
@@ -2793,56 +3254,41 @@ function AppContent({
   }, [sendUserAnswer]);
 
   const handleLoadMoreHistory = useCallback(async () => {
-    if (!historyPagerMeta) return;
-    if (historyLoadingSessionsRef.current.has(sessionId) || historyPagerMeta.loadedPages >= historyPagerMeta.totalPages) return;
-
     const sid = sessionId;
-    const nextPage = historyPagerMeta.loadedPages + 1;
-    const fallbackTotal = historyPagerMeta.totalPages;
-    const prevToken = historyBackgroundPrefetchTokensRef.current.get(sid) ?? 0;
-    const token = prevToken + 1;
-    historyBackgroundPrefetchTokensRef.current.set(sid, token);
-    historyLoadingSessionsRef.current.add(sid);
+    const current = useChatStore.getState().runtimes[sid]?.historyPagerMeta;
+    if (!current || historyPrepending) return;
     setHistoryRetryAvailable(sid, false);
+    if (current.publishedBatchSeq < current.loadedBatchSeq) {
+      setHistoryPrepending(true);
+      setHistoryPagerMeta(sid, {
+        ...current,
+        publishedBatchSeq: current.publishedBatchSeq + 1,
+      });
+      await waitForNextPaint();
+      if (sessionIdRef.current === sid) setHistoryPrepending(false);
+      return;
+    }
+    if (!current.hasMore) return;
+
+    historyRevealTargetRef.current.set(sid, current.publishedBatchSeq + 1);
+    if (historyLoadingMore) return;
     setHistoryLoadingMore(true);
-    setLoadingHistory(sid, true);
-    let page: LoadedHistoryPage | null = null;
-    try {
-      page = await fetchHistoryPageResult(sid, nextPage, fallbackTotal);
-      if (
-        page &&
-        token === historyBackgroundPrefetchTokensRef.current.get(sid)
-      ) {
-        applyLoadedHistoryPage(sid, page);
-      }
-    } finally {
-      historyLoadingSessionsRef.current.delete(sid);
-      setHistoryLoadingMore(false);
-      setLoadingHistory(sid, false);
-    }
-    if (token !== historyBackgroundPrefetchTokensRef.current.get(sid)) {
-      return;
-    }
-    if (!page) {
-      setHistoryRetryAvailable(sid, true);
-      return;
-    }
-    startBackgroundHistoryPrefetch(sid, page.pageIdx, page.totalPages);
+    startBackgroundHistoryPrefetch(sid);
   }, [
-    applyLoadedHistoryPage,
-    fetchHistoryPageResult,
-    historyPagerMeta,
+    historyLoadingMore,
+    historyPrepending,
     sessionId,
     setHistoryRetryAvailable,
-    setLoadingHistory,
+    setHistoryPagerMeta,
     startBackgroundHistoryPrefetch,
   ]);
 
   const chatHistoryPager = useMemo(() => {
     if (!historyPagerMeta) return null;
     return {
-      loadedPages: historyPagerMeta.loadedPages,
-      totalPages: historyPagerMeta.totalPages,
+      loadedBatchSeq: historyPagerMeta.loadedBatchSeq,
+      publishedBatchSeq: historyPagerMeta.publishedBatchSeq,
+      hasMore: historyPagerMeta.hasMore,
       loadingMore: historyLoadingMore,
       prepending: historyPrepending,
       retryAvailable: historyRetrySessions.has(sessionId),
@@ -2859,11 +3305,15 @@ function AppContent({
 
   const performSessionRestore = useCallback(
     async (targetSessionId: string, targetMode?: string, targetSession?: Session, options?: { skipHistoryLoad?: boolean }) => {
+      setChatWelcomeVariant(null);
       const previousSessionId = sessionIdRef.current;
       const previousMode =
         useSessionStore.getState().getRuntime(previousSessionId)?.mode ?? mode;
       const resolvedMode = targetMode ?? targetSession?.mode ?? previousMode;
-      disposeInFlightHistoryHandles(targetSessionId);
+      const targetHistory = useChatStore.getState().runtimes[targetSessionId]?.historyPagerMeta;
+      if (!targetHistory) {
+        disposeInFlightHistoryHandles(targetSessionId);
+      }
       if (previousSessionId && previousSessionId !== targetSessionId) {
         try {
           await request('session.switch', {
@@ -2871,7 +3321,7 @@ function AppContent({
             previous_session_id: previousSessionId,
             previous_mode: previousMode,
             mode: resolvedMode,
-            view_id: kvcViewIdRef.current,
+            view_id: sessionViewIdRef.current,
           });
         } catch (error) {
           if (isTeamAgentMode(resolvedMode)) {
@@ -2895,6 +3345,12 @@ function AppContent({
         clearTodos(targetSessionId);
         resetHarnessStore(targetSessionId);
         historyRestoreFromPanelHintRef.current = true;
+      }
+      if (options?.skipHistoryLoad) {
+        // The session returned by cron.run_now can precede its first persisted
+        // message. The sessionId effect must skip its initial history request too.
+        useChatStore.getState().setNewSession(targetSessionId, true);
+        historyRestoreFromPanelHintRef.current = false;
       }
       // 确保 session runtime 存在；否则 useSessionStore.setMode 会因找不到 runtime 而直接跳过，
       // 导致从会话页签恢复后前端 mode 不会切换到目标会话对应的 mode。
@@ -2982,54 +3438,84 @@ function AppContent({
     [performSessionRestore],
   );
 
+  const handleOpenContinuedFromSession = useCallback(
+    (sourceSessionId: string): void => {
+      const sessionStore = useSessionStore.getState();
+      const sourceSession = sessionStore.sessions.find((session) => session.session_id === sourceSessionId);
+      void handleRestoreSession(sourceSessionId, sourceSession?.mode, sourceSession);
+    },
+    [handleRestoreSession],
+  );
+
+  const handleForkSession = useCallback(
+    async (
+      sourceSessionId: string,
+      forkPoint?: MessageForkPoint,
+    ): Promise<void> => {
+      if (!sourceSessionId || sourceSessionId === NEW_CONVERSATION_ID) {
+        throw new Error('A persisted session is required to fork');
+      }
+
+      const sourceSessionStore = useSessionStore.getState();
+      const sourceSession = sourceSessionStore.sessions.find((session) => session.session_id === sourceSessionId);
+      const sourceRuntime = sourceSessionStore.getRuntime(sourceSessionId);
+      const sourceMode = sourceSession?.mode ?? sourceRuntime?.mode ?? mode;
+      const equipmentOverride: { agent_template_name?: string; plugin_names?: string[]; mcp?: string[] } = {};
+      if (sourceRuntime?.agentSelectionIntent.kind === 'select') {
+        equipmentOverride.agent_template_name = sourceRuntime.agentSelectionIntent.id;
+      } else if (sourceRuntime?.agentSelectionIntent.kind === 'clear') {
+        equipmentOverride.agent_template_name = '';
+      }
+      if (sourceRuntime?.extensionsHydrated) {
+        equipmentOverride.plugin_names = sourceRuntime.enabledPlugins;
+        equipmentOverride.mcp = sourceRuntime.enabledMcps;
+      }
+      const result = await request<{ session_id?: string }>(
+        'session.fork',
+        {
+          session_id: sourceSessionId,
+          source_session_id: sourceSessionId,
+          mode: sourceMode,
+          ...(Object.keys(equipmentOverride).length > 0
+            ? { session_equipment_override: equipmentOverride }
+            : {}),
+          ...(forkPoint
+            ? {
+                fork_point: {
+                  message_id: forkPoint.messageId,
+                  role: forkPoint.role,
+                  content: forkPoint.content,
+                  timestamp: forkPoint.timestamp,
+                },
+              }
+            : {}),
+        },
+        { timeoutMs: 60_000 },
+      );
+      const forkSessionId = typeof result.session_id === 'string' ? result.session_id.trim() : '';
+      if (!forkSessionId) {
+        throw new Error('session.fork did not return a session id');
+      }
+      if (useGoalStore.getState().getRuntime(sourceSessionId)?.armed) {
+        useGoalStore.getState().setArmed(forkSessionId, true);
+      }
+      await handleRestoreSession(forkSessionId, sourceMode);
+    },
+    [handleRestoreSession, mode, request],
+  );
+
   const requestSessionNavigation = useCallback((target: Session | 'new', options?: NewConversationOptions) => {
-    if (target === 'new') { enterNewConversation(mode, options); return; }
-    if (isMobile) {
+    if (target === 'new') {
+      enterNewConversation(mode, options, { clearPreviousSession: options?.clearPreviousSession });
+      return;
+    }
+    if (isToolPanelAutoHideViewport) {
       setTeamAreaExpanded(false);
       setSingleAgentPanelExpanded(false);
       setToolPanelHidden(true);
     }
     void handleRestoreSession(target.session_id, target.mode, target);
-  }, [enterNewConversation, handleRestoreSession, isMobile, mode, setSingleAgentPanelExpanded, setTeamAreaExpanded, setToolPanelHidden]);
-
-  const handleDeleteConversation = useCallback(async () => {
-    if (!deleteTarget) return;
-    const runtime = useChatStore.getState().getRuntime(deleteTarget.session_id);
-    if (runtime?.isProcessing || runtime?.pendingQuestions[0]) {
-      setDialogError(t('multiSession.deleteRunningDisabled'));
-      return;
-    }
-    setDialogBusy(true); setDialogError(null);
-    try {
-      const deletedSession = deleteTarget;
-      await request('session.delete', { session_id: deleteTarget.session_id });
-      forgetCreatedConversation(deleteTarget.session_id);
-      useSessionStore.getState().removeSession(deleteTarget.session_id);
-      useSessionStore.getState().removeRuntime(deleteTarget.session_id);
-      useChatStore.getState().removeRuntime(deleteTarget.session_id);
-      useSubagentStore.getState().removeRuntime(deleteTarget.session_id);
-      useTodoStore.getState().removeRuntime(deleteTarget.session_id);
-      useHarnessStore.getState().removeRuntime(deleteTarget.session_id);
-      useGoalStore.getState().removeRuntime(deleteTarget.session_id);
-      const deletingCurrent = sessionIdRef.current === deleteTarget.session_id;
-      setDeleteTarget(null);
-      await useWorkspaceStore.getState().refreshSessionWorkspace(deletedSession);
-      // 删除 session 后刷新所属定时任务的触发会话列表
-      const cronStore = useCronStore.getState();
-      for (const [jobId, sessions] of Object.entries(cronStore.cronSessions)) {
-        if (sessions.some((s) => s.session_id === deletedSession.session_id)) {
-          const job = cronStore.jobs.find((j) => j.id === jobId);
-          void cronStore.loadCronSessions(job?.project_id || 'default', jobId);
-        }
-      }
-      if (deletingCurrent) {
-        // session.delete already owns B's KVC eviction. Do not carry the
-        // deleted Session into C's session.create as previous_session_id.
-        enterNewConversation(mode, {}, { clearPreviousSession: true });
-      }
-    } catch { setDialogError(t('multiSession.errors.delete')); }
-    finally { setDialogBusy(false); }
-  }, [deleteTarget, enterNewConversation, mode, request, t]);
+  }, [enterNewConversation, handleRestoreSession, isToolPanelAutoHideViewport, mode, setSingleAgentPanelExpanded, setTeamAreaExpanded, setToolPanelHidden]);
 
   const handleNavigate = useCallback(
     (nav: MainNavKey) => {
@@ -3062,6 +3548,17 @@ function AppContent({
     [activeNav, isMobile, modelSetupGuideStep, setSingleAgentPanelExpanded, setHasVisitedPersonalContext, setRequestedSettingsModuleId, setTeamAreaExpanded, setToolPanelHidden, t],
   );
 
+  const handleNavigateToAgentManagement = useCallback(
+    (target: 'agent' | 'group' = 'agent') => {
+      setAgentManagementNavigationRequest((current) => ({
+        target,
+        requestId: (current?.requestId ?? 0) + 1,
+      }));
+      handleNavigate('agents');
+    },
+    [handleNavigate],
+  );
+
   const skipModelSetupGuide = useCallback(() => {
     setModelSetupGuideStep(null);
 
@@ -3092,82 +3589,114 @@ function AppContent({
       });
   }, [request]);
 
-  const handleExportShare = useCallback(async () => {
-    const currentSessionId = sessionIdRef.current;
-    if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID || (isProcessing && !isPaused) || isExportingShare) {
-      return;
+  const setShareExportSessionActive = useCallback((targetSessionId: string, active: boolean) => {
+    setExportingShareSessionIds(current => {
+      const next = new Set(current);
+      if (active) next.add(targetSessionId);
+      else next.delete(targetSessionId);
+      return next;
+    });
+  }, []);
+
+  const monitorAndSaveShareImageJob = useCallback(async (
+    initialStatus: ShareImageExportJobStatus,
+    targetSessionId: string,
+    token: symbol,
+  ) => {
+    const status = await waitForShareImageJob(
+      initialStatus,
+      () => shareExportMonitorTokensRef.current.get(targetSessionId) === token,
+    );
+    if (status === null) return;
+    if (status.state === 'failed') {
+      forgetPendingShareImageJob(window.sessionStorage, targetSessionId, status.job_id);
+      throw new Error(status.error || 'share_export_job_failed');
     }
-    setIsExportingShare(true);
-    try {
-      const params = new URLSearchParams({
-        session_id: currentSessionId,
-      });
-      const response = await fetch(`/share-api/snapshot?${params.toString()}`, {
-        cache: 'no-store',
-      });
-      const contentType = response.headers.get('content-type') || '';
-      if (!response.ok) {
-        let detail = '';
-        try {
-          const payload = await response.json();
-          detail = typeof payload?.error === 'string' ? payload.error : '';
-        } catch {
-          detail = await response.text().catch(() => '');
-        }
-        throw new Error(detail || `HTTP ${response.status}`);
-      }
-      if (!contentType.includes('application/json')) {
-        throw new Error('share_snapshot_not_json');
-      }
-      const payload = await response.json() as {
-        filename?: string;
-        snapshot?: ShareImageSnapshot;
-      };
-      if (!payload.snapshot) {
-        throw new Error('missing_snapshot');
-      }
-      shareExportFilenameRef.current = payload.filename || payload.snapshot.metadata?.filename || 'jiuwenswarm-share.png';
-      setShareExportSnapshot(payload.snapshot);
-    } catch (error) {
-      console.error('Failed to export share image:', error);
-      window.alert(t('share.exportFailed'));
-      setIsExportingShare(false);
-      setShareExportSnapshot(null);
-    }
-  }, [isExportingShare, isPaused, isProcessing, t]);
+
+    const saved = await saveShareImageJob(status.job_id, status.filename.trim());
+    forgetPendingShareImageJob(window.sessionStorage, targetSessionId, status.job_id);
+    if (saved) showSaveToast();
+  }, [showSaveToast]);
 
   useEffect(() => {
-    if (!shareExportSnapshot) {
-      return;
-    }
-    const token = shareExportTokenRef.current + 1;
-    shareExportTokenRef.current = token;
+    const targetSessionId = sessionId;
+    if (!targetSessionId || targetSessionId === NEW_CONVERSATION_ID) return;
+    if (shareExportMonitorTokensRef.current.has(targetSessionId)) return;
 
     void (async () => {
+      const pendingJobId = readPendingShareImageJobId(window.sessionStorage, targetSessionId);
+      let status: ShareImageExportJobStatus | null;
       try {
-        const node = shareExportRef.current;
-        if (!node) {
-          throw new Error('share_image_node_missing');
-        }
-        const imageBlob = await exportShareImageNode(node);
-        if (shareExportTokenRef.current !== token) {
-          return;
-        }
-        const saved = await saveShareImage(imageBlob, shareExportFilenameRef.current);
-        if (saved) {
-          showSaveToast();
-        }
+        status = await findShareImageJobForSession(targetSessionId, window.sessionStorage);
       } catch (error) {
-        console.error('Failed to render share image:', error);
-        window.alert(t('share.exportFailed'));
+        console.error('Failed to query active share image export:', error);
+        if (pendingJobId !== null) window.alert(tRef.current('share.exportFailed'));
+        return;
+      }
+      if (status === null) return;
+      if (shareExportMonitorTokensRef.current.has(targetSessionId)) return;
+
+      const token = Symbol(targetSessionId);
+      shareExportMonitorTokensRef.current.set(targetSessionId, token);
+      setShareExportSessionActive(targetSessionId, true);
+      try {
+        await monitorAndSaveShareImageJob(
+          status,
+          targetSessionId,
+          token,
+        );
+      } catch (error) {
+        console.error('Failed to monitor share image export:', error);
+        window.alert(tRef.current('share.exportFailed'));
       } finally {
-        if (shareExportTokenRef.current === token) {
-          setIsExportingShare(false);
-          setShareExportSnapshot(null);
+        if (shareExportMonitorTokensRef.current.get(targetSessionId) === token) {
+          shareExportMonitorTokensRef.current.delete(targetSessionId);
+          setShareExportSessionActive(targetSessionId, false);
         }
       }
     })();
-  }, [shareExportSnapshot, showSaveToast, t]);
+  }, [monitorAndSaveShareImageJob, sessionId, setShareExportSessionActive]);
+
+  const handleExportShare = useCallback(async () => {
+    const currentSessionId = sessionIdRef.current;
+    if (
+      !currentSessionId
+      || currentSessionId === NEW_CONVERSATION_ID
+      || (isProcessing && !isPaused)
+      || shareExportMonitorTokensRef.current.has(currentSessionId)
+    ) {
+      return;
+    }
+    const token = Symbol(currentSessionId);
+    shareExportMonitorTokensRef.current.set(currentSessionId, token);
+    setShareExportSessionActive(currentSessionId, true);
+    try {
+      const createResponse = await fetch('/share-api/jobs', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          locale: i18n.resolvedLanguage ?? i18n.language,
+        }),
+      });
+      const created = await readShareImageJobResponse(createResponse);
+      rememberPendingShareImageJob(window.sessionStorage, currentSessionId, created.job_id);
+      await monitorAndSaveShareImageJob(
+        created,
+        currentSessionId,
+        token,
+      );
+    } catch (error) {
+      console.error('Failed to export share image:', error);
+      window.alert(t('share.exportFailed'));
+    } finally {
+      if (shareExportMonitorTokensRef.current.get(currentSessionId) === token) {
+        shareExportMonitorTokensRef.current.delete(currentSessionId);
+        setShareExportSessionActive(currentSessionId, false);
+      }
+    }
+  }, [i18n.language, i18n.resolvedLanguage, isPaused, isProcessing, monitorAndSaveShareImageJob, setShareExportSessionActive, t]);
 
   const routeSessionMissing = routeSessionId !== null
     && initialDataLoaded
@@ -3180,6 +3709,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
   const activeApplicationPlugin = visibleApplicationPlugins.find(
     (plugin) => plugin.nav_key === activeNav,
   );
+  const isExportingShare = exportingShareSessionIds.has(sessionId);
 
   useEffect(() => {
     if (!showWorkspaceDivider) clearChatPanelResize();
@@ -3233,7 +3763,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 activeSessionId={sessionId === NEW_CONVERSATION_ID ? null : sessionId}
                 onNew={(options) => requestSessionNavigation('new', options)}
                 onSelect={requestSessionNavigation}
-                onDelete={(session) => { setDialogError(null); setDeleteTarget(session); }}
                 onOpenCron={() => handleNavigate('cron')}
                 isCronActive={false}
                 collapsed={conversationSidebarCollapsed}
@@ -3256,20 +3785,33 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 {/* Chat Panel - 在展开时可拖拽调整宽度 */}
                 <div
                   className={`${showConversationNotFound || shouldFullscreen ? 'hidden' : 'flex'} chat-layout__surface  pt-0 flex-col ${effectiveTeamAreaExpanded ? '' : 'min-w-0'} min-h-0 ${effectiveTeamAreaExpanded ? '' : 'flex-1'}`}
-                  style={effectiveTeamAreaExpanded ? { width: `${chatPanelWidthPct}%` } : undefined}
+                  style={{
+                    ...(effectiveTeamAreaExpanded ? { width: `${chatPanelWidthPct}%` } : {}),
+                    '--trajectory-composer-clearance': `${trajectoryComposerClearance(
+                      composerDocked,
+                      composerCollapsed,
+                      trajectoryComposerHeight,
+                    )}px`,
+                  } as CSSProperties}
                   data-testid="app-chat-surface"
                 >
-<SingleAgentSurface
+                  <SingleAgentSurface
                     activeView={chatSurfaceView}
                     chat={(
                       <ChatPanel
                         onSendMessage={handleSendMessage}
                         onEnsureSession={ensureApplicationPluginSession}
-                        onInputIntent={kvCacheAffinityEnabled ? handleKVCInputIntent : undefined}
+                        onForkSession={handleForkSession}
+                        continuedFromSessionId={continuedFromSessionId}
+                        onOpenContinuedFromSession={handleOpenContinuedFromSession}
+                        onInputIntent={handleSessionInputIntent}
+                        onEnsureVoiceSession={handleEnsureVoiceSession}
                         onPersistMedia={handlePersistMedia}
                         onPersistDocuments={handlePersistDocuments}
+                        onDiscardMedia={handleDiscardMedia}
                         onInterrupt={handleInterrupt}
                         onCancel={handleCancel}
+                        onVoiceControl={handleVoiceControl}
                         onSwitchMode={handleSwitchMode}
                         isProcessing={isProcessing}
                         onUserAnswer={handleUserAnswer}
@@ -3279,13 +3821,20 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                         sessionTitle={sessionTitle}
                         sessionProjectName={sessionProjectName}
                         sessionProject={sessionProject}
+                        welcomeVariant={sessionId === NEW_CONVERSATION_ID ? chatWelcomeVariant : null}
                         teamAreaExpanded={toolPanelHidden ? null : isTeamAreaExpanded}
                         autoFocusKey={composerFocusKey}
                         onNavigateToSkills={() => handleNavigate('skills')}
-                        onNavigateToAgents={() => handleNavigate('agents')}
+                        onNavigateToAgents={handleNavigateToAgentManagement}
                         onToggleTeamArea={handleToggleDetailPanel}
                         onOpenCodeReview={handleOpenCodeReview}
-                        permissionsEnabled={serverConfig?.permissions_enabled !== 'false'}
+                        permissionProfile={
+                          serverConfig?.permissions_profile === 'automatic'
+                            ? 'automatic'
+                            : serverConfig?.permissions_enabled === 'false'
+                              ? 'full_access'
+                              : 'default'
+                        }
                         heartbeatPanelOpen={heartbeatPanelOpen}
                         onToggleHeartbeatPanel={handleToggleHeartbeatPanel}
                         onSavePermission={savePermissionSilent}
@@ -3294,8 +3843,14 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                         onSetGoal={setGoalObjective}
                         onPauseGoal={pauseGoal}
                         onResumeGoal={resumeGoal}
+                        onRefreshGoal={refreshGoal}
                         onClearGoal={handleClearGoal}
                         onDrainTaskQueueIfIdle={drainTaskQueueIfIdle}
+                        composerDocked={composerDocked}
+                        composerCollapsed={composerCollapsed}
+                        onToggleComposerCollapsed={toggleTrajectoryComposer}
+                        onComposerHeightChange={setTrajectoryComposerHeight}
+                        onContinueQueuedSessionMessages={handleContinueQueuedSessionMessages}
                       />
                     )}
                     chatLabel={t('nav.chat')}
@@ -3391,10 +3946,18 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               isActive={activeNav === 'agents'}
               onUseAgent={handleUseAgent}
               onUsePrompt={handleUseAgentPrompt}
+              onUseAgentGroup={handleUseAgentGroup}
+              onUseGroupPrompt={handleUseGroupPrompt}
               onCreateViaChat={() => requestSessionNavigation('new', {
                 initialInputValue: t('agentManagement.actions.createViaChatPrompt'),
                 initialSelectedSkills: ['agent-creator'],
               })}
+              onCreateGroupViaChat={() => requestSessionNavigation('new', {
+                initialInputValue: t('agentManagement.group.actions.createViaChatPrompt'),
+                initialSelectedSkills: ['agent-group-creator'],
+                forceMode: 'agent',
+              })}
+              navigationRequest={agentManagementNavigationRequest}
             />
           </div>
         )}
@@ -3418,7 +3981,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               activeSessionId={null}
               onNew={(options) => requestSessionNavigation('new', options)}
               onSelect={requestSessionNavigation}
-              onDelete={(session) => { setDialogError(null); setDeleteTarget(session); }}
               onOpenCron={() => handleNavigate('cron')}
               isCronActive
               collapsed={conversationSidebarCollapsed}
@@ -3513,10 +4075,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
           <div className="app-page-body">
             <div className="page-content">
               <ConnectorMarketPanel
-                applicationPlugins={applicationPlugins}
-                applicationPluginsLoading={applicationPluginState.loading}
-                applicationPluginsError={applicationPluginState.error}
-                onRefreshApplicationPlugins={applicationPluginState.refresh}
                 onCreateViaChat={() => window.dispatchEvent(new CustomEvent('jiuwen:new-conversation', {
                   detail: {
                     skillName: 'plugin-creator',
@@ -3549,15 +4107,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
         )}
       </main>
 
-      {deleteTarget && (
-        <DeleteDialog
-          title={deleteTarget.title || t('multiSession.untitled')}
-          deleting={dialogBusy}
-          error={dialogError}
-          onCancel={() => setDeleteTarget(null)}
-          onDelete={() => { void handleDeleteConversation(); }}
-        />
-      )}
+      {/* 全局命令式 toast 渲染出口（toast.open） */}
+      <ToastStack />
 
       {/* 连接状态提示 */}
       {!isConnected && (
@@ -3572,6 +4123,14 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
         <div className="app-toast-wrapper app-toast-wrapper--top-center" data-testid="app-save-toast">
           <div className="app-session-toast animate-rise" data-testid="app-save-toast-message">
             {t('common.saveSuccess')}
+          </div>
+        </div>
+      )}
+
+      {authToastVisible && (
+        <div className="app-toast-wrapper app-toast-wrapper--top-center" data-testid="app-auth-toast">
+          <div className="app-session-toast animate-rise" data-testid="app-auth-toast-message">
+            {t('auth.huawei.loginSuccessToast')}
           </div>
         </div>
       )}
@@ -3672,9 +4231,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
         onStatusChange={updateExternalCliInstallStatus}
       />
 
-      <div className="share-image-stage" aria-hidden="true" data-testid="app-share-image-stage">
-        <ShareImageDocument ref={shareExportRef} snapshot={shareExportSnapshot} />
-      </div>
+      {/* 登录弹窗：默认不显示，由 requestLogin() 等事件唤起 */}
+      <LoginDialog />
     </div>
   );
 }
@@ -3688,97 +4246,14 @@ function App({
 }) {
   return (
     <ErrorBoundary>
+      <DesktopTextEditContextMenu />
       <AppContent
         settingsPageDefinition={settingsPageDefinition}
         resolveSettingsRequest={resolveSettingsRequest}
       />
+      <AssetPublishHost />
     </ErrorBoundary>
   );
 }
 
-/**
- * 鉴权外壳: 进入前探测 cookie 是否携带有效 access_token + 是否一体机模式。
- * - GET /api/web-config: 本地端点, 拿 {remote: bool, iam_enabled: bool}
- *   - iam_enabled=false: 未配置 IAM, 无鉴权, 直接渲染主 App
- *   - iam_enabled=true: 配置了 IAM, 继续探测登录态
- * - GET /auth-api/v1/auth/permissions (同源, 浏览器自动带 HttpOnly cookie)
- *   - 200 -> 已登录, 渲染主 App (+ 一体机模式时浮 LogoutButton)
- *   - 401/其他 -> 未登录, 渲染 LoginPage
- * control-panel 只认 Authorization: Bearer, app_web.py 的 _proxy_auth_http
- * 会从 jw_token cookie 取 token 注入头, 故前端只需同源请求。
- */
-function AppWithAuth({
-  settingsPageDefinition,
-  resolveSettingsRequest,
-}: {
-  settingsPageDefinition: SettingsPageDefinition;
-  resolveSettingsRequest: (openSourceRequest: SettingsRequest) => SettingsRequest;
-}) {
-  const [authStatus, setAuthStatus] = useState<'checking' | 'loggedOut' | 'loggedIn' | 'noIam'>('checking');
-  const [remote, setRemote] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    // 先拿 web-config: 如果 iam_enabled=false, 直接跳过鉴权探测
-    fetch('/api/web-config', { credentials: 'same-origin' })
-      .then((r) => r.json())
-      .then((cfg) => {
-        if (cancelled) return;
-        if (cfg && typeof cfg.remote === 'boolean') setRemote(cfg.remote);
-        if (cfg && cfg.iam_enabled === false) {
-          setAuthStatus('noIam');
-          return;
-        }
-        // IAM 已配置, 探测登录态
-        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
-          .then((resp) => {
-            if (cancelled) return;
-            if (resp.ok) {
-              setAuthStatus('loggedIn');
-            } else {
-              setAuthStatus('loggedOut');
-            }
-          })
-          .catch(() => {
-            if (!cancelled) setAuthStatus('loggedOut');
-          });
-      })
-      .catch(() => {
-        // web-config 获取失败, 回退到探测登录态
-        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
-          .then((resp) => {
-            if (cancelled) return;
-            if (resp.ok) {
-              setAuthStatus('loggedIn');
-            } else {
-              setAuthStatus('loggedOut');
-            }
-          })
-          .catch(() => {
-            if (!cancelled) setAuthStatus('loggedOut');
-          });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (authStatus === 'checking') {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-900">
-        <div className="text-slate-400 text-sm">Loading…</div>
-      </div>
-    );
-  }
-  if (authStatus === 'loggedOut') {
-    return <LoginPage />;
-  }
-  return (
-    <>
-      {remote && <LogoutButton />}
-      <App settingsPageDefinition={settingsPageDefinition} resolveSettingsRequest={resolveSettingsRequest} />
-    </>
-  );
-}
-
-export default AppWithAuth;
+export default App;

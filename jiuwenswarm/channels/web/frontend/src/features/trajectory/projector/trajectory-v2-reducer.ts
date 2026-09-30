@@ -4,11 +4,9 @@
 
 import { OPENJIUWEN_ATTRIBUTES, STANDARD_ATTRIBUTES } from '../semconv/constants.ts'
 import { attributeMap } from '../shared/otlp.ts'
-import type { OtlpExportTraceServiceRequest, OtlpSpan } from '../shared/otlp.ts'
+import type { OtlpExportTraceServiceRequest, OtlpKeyValue, OtlpSpan } from '../shared/otlp.ts'
 import type { TrajectoryDiagnostic, TrajectoryPromptSnapshot } from '../trajectory/model.ts'
 import type { TrajectoryCell, TrajectoryCellKind } from '../trajectory/record.ts'
-
-export const TRAJECTORY_V2_SCHEMA_VERSION = '2'
 
 interface ContextMessage {
   message_id: string
@@ -47,6 +45,15 @@ interface ContextCommitPayload {
   output_window_id?: string
 }
 
+// What a compaction put into the context window, held for the model request
+// that first reads the rewritten window.
+interface HeldCompactionContext {
+  // The window the last model request read, before any held compaction.
+  base: readonly ContextMessage[]
+  // Insertions and replacements the compactions made, oldest first.
+  operations: readonly ContextDelta[]
+}
+
 interface ParsedEvent {
   eventId: string
   eventKind: string
@@ -83,6 +90,12 @@ export interface TrajectoryV2SubjectProjection {
   diagnostics: readonly TrajectoryDiagnostic[]
   events: readonly TrajectoryV2EventProjection[]
   handledInferenceIds: ReadonlySet<string>
+  /**
+   * The tool message content the model first read for each tool call, by
+   * tool call id. This is the result as the harness rendered it for the
+   * model, which can differ from what the tool invocation returned.
+   */
+  modelToolResults: ReadonlyMap<string, string>
   subjectId: string
 }
 
@@ -91,15 +104,39 @@ export interface TrajectoryV2Reduction {
   subjects: ReadonlyMap<string, TrajectoryV2SubjectProjection>
 }
 
+/**
+ * Where one subject's event chain stood when retention removed the turns
+ * before it, so the events that remain replay as they did with those turns
+ * still loaded.
+ */
+export interface TrajectoryV2SubjectSeed {
+  /** Events already ordered, which later events are numbered after. */
+  eventCount: number
+  /** Epoch the removed events ended in, and the sequence expected next in it. */
+  sequenceEpoch?: string
+  nextSequence?: number
+  /** Whether that epoch was blocked by a sequence gap. */
+  blocked: boolean
+  /** The last committed window, which the next delta may be based on. */
+  window?: { id: string, messages: readonly ContextMessage[] }
+  /** The window the active epoch's baseline is diffed against. */
+  epochBaselineBase?: readonly ContextMessage[]
+  /** Compaction context held for the next model request. */
+  held?: HeldCompactionContext
+}
+
 export interface TrajectoryV2Reducer {
   apply(records: readonly OtlpExportTraceServiceRequest[]): TrajectoryV2Reduction
   clear(): void
+  /** Replace the checkpoint seeds subjects start from; every subject replays again. */
+  seed(seeds: ReadonlyMap<string, TrajectoryV2SubjectSeed>): void
 }
 
 interface SubjectAccumulator {
   diagnostics: TrajectoryDiagnostic[]
   events: TrajectoryV2EventProjection[]
   handledInferenceIds: Set<string>
+  modelToolResults: Map<string, string>
   windows: Map<string, ContextMessage[]>
 }
 
@@ -161,13 +198,23 @@ function physicalInferenceIds(
   payload: Readonly<Record<string, unknown>>,
   span: OtlpSpan,
 ): string[] {
-  if (eventKind === 'context.window.commit') {
+  // A commit normally states the input of the model call it hangs off, so
+  // that call is its physical request. The commit a compaction makes states
+  // the window the compaction produced: its model call has ended by then, so
+  // the commit hangs off the live agent span and names the call the way the
+  // compaction.completed event does, through model_requests.
+  const compactionCommit = eventKind === 'context.window.commit'
+    && (payload.transition_kind === 'compaction' || payload.correlation_kind === 'compaction')
+    && Array.isArray(payload.model_requests)
+  if (eventKind === 'context.window.commit' && !compactionCommit) {
     return typeof span.parentSpanId === 'string' && span.parentSpanId.trim() !== ''
       ? [span.parentSpanId.trim()]
       : []
   }
-  if (eventKind !== 'compaction.completed' || !Array.isArray(payload.model_requests)
-    || payload.model_requests.length === 0) return []
+  if (!compactionCommit
+    && (eventKind !== 'compaction.completed' || !Array.isArray(payload.model_requests)
+      || payload.model_requests.length === 0)) return []
+  if (!Array.isArray(payload.model_requests) || payload.model_requests.length === 0) return []
   const inferenceIds = payload.model_requests.flatMap((value): string[] => {
     const request = object(value)
     return request === undefined || typeof request.inference_id !== 'string'
@@ -181,16 +228,20 @@ function physicalInferenceIds(
     : []
 }
 
+/**
+ * A v2 event is whatever states an event kind. Every canonical span states
+ * the trajectory schema version, so the version alone marks nothing.
+ */
+export function isTrajectoryV2Event(attributes: readonly OtlpKeyValue[] | undefined): boolean {
+  return textAttribute(attributeMap(attributes), OPENJIUWEN_ATTRIBUTES.trajectoryEventKind) !== undefined
+}
+
 /** Detect schema v2 without consulting any compatibility or LangFuse attribute. */
 export function isTrajectoryV2Record(record: OtlpExportTraceServiceRequest): boolean {
   const span = soleSpan(record)
   if (span === undefined) return false
-  if (textAttribute(attributeMap(span.attributes), OPENJIUWEN_ATTRIBUTES.trajectorySchemaVersion)
-    === TRAJECTORY_V2_SCHEMA_VERSION) return true
-  return (span.events ?? []).some(event => (
-    textAttribute(attributeMap(event.attributes), OPENJIUWEN_ATTRIBUTES.trajectorySchemaVersion)
-      === TRAJECTORY_V2_SCHEMA_VERSION
-  ))
+  if (isTrajectoryV2Event(span.attributes)) return true
+  return (span.events ?? []).some(event => isTrajectoryV2Event(event.attributes))
 }
 
 export function trajectoryV2SubjectIds(record: OtlpExportTraceServiceRequest): string[] {
@@ -211,11 +262,9 @@ function trajectoryV2EventRecords(
   const span = soleSpan(record)
   if (span === undefined) return []
   const records: OtlpExportTraceServiceRequest[] = []
-  if (textAttribute(attributeMap(span.attributes), OPENJIUWEN_ATTRIBUTES.trajectorySchemaVersion)
-    === TRAJECTORY_V2_SCHEMA_VERSION) records.push(record)
+  if (isTrajectoryV2Event(span.attributes)) records.push(record)
   for (const event of span.events ?? []) {
-    if (textAttribute(attributeMap(event.attributes), OPENJIUWEN_ATTRIBUTES.trajectorySchemaVersion)
-      !== TRAJECTORY_V2_SCHEMA_VERSION) continue
+    if (!isTrajectoryV2Event(event.attributes)) continue
     const syntheticSpan: OtlpSpan = {
       ...span,
       name: event.name,
@@ -426,6 +475,25 @@ function displayContent(message: ContextMessage | undefined): string {
   return ''
 }
 
+/**
+ * Record the tool messages a window carries that no earlier window did.
+ *
+ * The first window holding a tool message is the model request that first
+ * read the result, so its content there is what the model was given. A later
+ * rewrite of the same message, such as a compaction trimming it, does not
+ * change what the model read when it acted on the result.
+ */
+function recordModelToolResults(
+  results: Map<string, string>,
+  window: readonly ContextMessage[],
+): void {
+  for (const message of window) {
+    const callId = message.tool_call_id?.trim()
+    if (message.role !== 'tool' || !callId || results.has(callId)) continue
+    results.set(callId, displayContent(message))
+  }
+}
+
 function cellKind(message: ContextMessage | undefined): TrajectoryCellKind {
   if (message?.role === 'system') return 'system'
   if (message?.role === 'user' && message.origin === 'external_user') return 'user'
@@ -488,12 +556,73 @@ function systemSlotFingerprint(message: ContextMessage): string {
 
 const EPOCH_INPUT_SOURCE_KINDS = new Set(['query', 'resume', 'steering'])
 
+/**
+ * Hold what a compaction commit put into the window.
+ *
+ * A compaction rewrites the window between model requests, and a reader sees
+ * that rewrite where the model does: in the input of the next request, the
+ * way a checkpoint message shows at the start of the turn that follows the
+ * compaction. What the compaction removed is never shown; the COMPACTED cell
+ * of its compaction.completed event stands for it.
+ */
+function holdCompactionContext(
+  held: HeldCompactionContext | undefined,
+  payload: ContextCommitPayload,
+  window: readonly ContextMessage[],
+  base: readonly ContextMessage[],
+): HeldCompactionContext {
+  const stated = payload.delta.length > 0 || payload.base_window_id !== null
+    ? payload.delta
+    : window.map((message, index): ContextDelta => ({
+        op: 'insert',
+        message_id: message.message_id,
+        index,
+        message,
+      }))
+  const operations = stated.filter(operation => (
+    operation.op === 'insert' || operation.op === 'replace'
+  ))
+  const restated = new Set(operations.map(operation => operation.message_id))
+  const earlier = (held?.operations ?? []).filter(operation => !restated.has(operation.message_id))
+  return {
+    base: held?.base ?? base,
+    operations: [...earlier, ...operations],
+  }
+}
+
+/**
+ * Put held compaction context ahead of what a model request itself changed.
+ *
+ * Held messages are restated as the request reads them, and one the request
+ * no longer carries (a later compaction replaced it) is dropped. The request's
+ * own operations on a held message are dropped too: the reader never saw that
+ * message before, so it is shown once, as it now reads.
+ */
+function withHeldCompactionContext(
+  held: HeldCompactionContext | undefined,
+  operations: readonly ContextDelta[],
+  window: readonly ContextMessage[],
+): ContextDelta[] {
+  if (held === undefined) return [...operations]
+  const current = new Map(window.map(message => [message.message_id, message]))
+  const restated = held.operations.flatMap((operation): ContextDelta[] => {
+    const message = current.get(operation.message_id)
+    return message === undefined ? [] : [{ ...operation, message }]
+  })
+  const heldIds = new Set(restated.map(operation => operation.message_id))
+  return [
+    ...restated,
+    ...operations.filter(operation => !heldIds.has(operation.message_id)),
+  ]
+}
+
 function epochBaselineCells(
   event: ParsedEvent,
   payload: ContextCommitPayload,
   messages: readonly ContextMessage[],
   previous: readonly ContextMessage[],
   behaviorOrder: number,
+  held: HeldCompactionContext | undefined,
 ): TrajectoryCell[] {
   const previousSlots = new Map(logicalSystemSlots(previous).map(slot => [slot.key, slot]))
   // What the epoch before this one already carried. A baseline restates its
@@ -530,9 +659,9 @@ function epochBaselineCells(
   })
   return contextCells(
     event,
-    { ...payload, delta: operations },
+    { ...payload, delta: withHeldCompactionContext(held, operations, messages) },
     messages,
-    previous,
+    held?.base ?? previous,
     undefined,
     behaviorOrder,
   )
@@ -1015,11 +1144,64 @@ function askUserEventProjection(
   }
 }
 
-function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): TrajectoryV2SubjectProjection {
+function messagesFromUnknown(value: unknown): ContextMessage[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const messages = value.map(contextMessage)
+  return messages.every(message => message !== undefined) ? messages as ContextMessage[] : undefined
+}
+
+/**
+ * Read one subject's seed from a retention checkpoint whose message lists are
+ * already resolved, normalizing messages exactly as commits are normalized.
+ *
+ * @returns The seed, or undefined when the checkpoint does not describe one.
+ */
+export function parseTrajectoryV2SubjectSeed(value: unknown): TrajectoryV2SubjectSeed | undefined {
+  const candidate = object(value)
+  if (candidate === undefined
+    || !Number.isSafeInteger(candidate.eventCount) || Number(candidate.eventCount) < 0
+    || typeof candidate.blocked !== 'boolean') return undefined
+  const window = object(candidate.window)
+  const windowMessages = window === undefined ? undefined : messagesFromUnknown(window.messages)
+  if (window !== undefined && (typeof window.id !== 'string' || windowMessages === undefined)) {
+    return undefined
+  }
+  const epochBaselineBase = candidate.epochBaselineBase === undefined
+    ? undefined
+    : messagesFromUnknown(candidate.epochBaselineBase)
+  if (candidate.epochBaselineBase !== undefined && epochBaselineBase === undefined) return undefined
+  const held = object(candidate.held)
+  const heldBase = held === undefined ? undefined : messagesFromUnknown(held.base)
+  const heldOperations = held === undefined || !Array.isArray(held.operations)
+    ? undefined
+    : held.operations.map(contextDelta)
+  if (held !== undefined && (heldBase === undefined || heldOperations === undefined
+    || heldOperations.some(operation => operation === undefined))) return undefined
+  return {
+    eventCount: Number(candidate.eventCount),
+    blocked: candidate.blocked,
+    ...(typeof candidate.sequenceEpoch === 'string' ? { sequenceEpoch: candidate.sequenceEpoch } : {}),
+    ...(Number.isSafeInteger(candidate.nextSequence) ? { nextSequence: Number(candidate.nextSequence) } : {}),
+    ...(window === undefined || windowMessages === undefined
+      ? {}
+      : { window: { id: String(window.id), messages: windowMessages } }),
+    ...(epochBaselineBase === undefined ? {} : { epochBaselineBase }),
+    ...(heldBase === undefined || heldOperations === undefined
+      ? {}
+      : { held: { base: heldBase, operations: heldOperations as ContextDelta[] } }),
+  }
+}
+
+function rebuildSubject(
+  subjectId: string,
+  events: readonly ParsedEvent[],
+  seed: TrajectoryV2SubjectSeed | undefined,
+): TrajectoryV2SubjectProjection {
   const accumulator: SubjectAccumulator = {
     diagnostics: [],
     events: [],
     handledInferenceIds: new Set(),
+    modelToolResults: new Map(),
     windows: new Map(),
   }
   const bySequenceByEpoch = new Map<string, Map<number, ParsedEvent>>()
@@ -1029,10 +1211,18 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
   const askUserRequested = new Map<string, ParsedEvent>()
   const askUserResolved = new Map<string, ParsedEvent>()
   const referencedCompactionOperationIds = new Set<string>()
-  let activeEpoch: string | undefined
-  let epochBaselineBase: readonly ContextMessage[] | undefined
-  let lastWindow: readonly ContextMessage[] | undefined
-  let subjectOrder = 0
+  // A checkpoint stands in for the events retention removed: the chain resumes
+  // where they left it, so the first remaining delta finds its base window.
+  let activeEpoch: string | undefined = seed?.sequenceEpoch
+  let epochBaselineBase: readonly ContextMessage[] | undefined = seed?.epochBaselineBase
+  let lastWindow: readonly ContextMessage[] | undefined = seed?.window?.messages
+  let heldCompactionContext: HeldCompactionContext | undefined = seed?.held
+  let subjectOrder = seed?.eventCount ?? 0
+  if (seed?.window !== undefined) accumulator.windows.set(seed.window.id, [...seed.window.messages])
+  if (seed?.sequenceEpoch !== undefined) {
+    if (seed.nextSequence !== undefined) expectedByEpoch.set(seed.sequenceEpoch, seed.nextSequence)
+    if (seed.blocked) blockedEpochs.add(seed.sequenceEpoch)
+  }
   for (const event of orderedEpochEvents(events)) {
     subjectOrder += 1
     if (activeEpoch !== event.sequenceEpoch) {
@@ -1099,7 +1289,12 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
     }
     expectedByEpoch.set(event.sequenceEpoch, event.sequence + 1)
     if (event.eventKind === 'context.window.commit') {
-      if (event.inferenceIds.length !== 1) {
+      // A compaction's commit is anchored by its compaction event rather than
+      // by a model call of its own: a model-free compaction states none.
+      const compactionCommit = (event.payload.transition_kind === 'compaction'
+        || event.payload.correlation_kind === 'compaction')
+        && Array.isArray(event.payload.model_requests)
+      if (!compactionCommit && event.inferenceIds.length !== 1) {
         accumulator.diagnostics.push(diagnostic(
           'v2.missing_physical_request',
           'Context commit is missing its physical inference parent.',
@@ -1167,7 +1362,10 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
       }
       accumulator.windows.set(payload.window_id, window)
       lastWindow = window
-      accumulator.handledInferenceIds.add(event.inferenceIds[0])
+      for (const inferenceId of event.inferenceIds) {
+        accumulator.handledInferenceIds.add(inferenceId)
+      }
+      recordModelToolResults(accumulator.modelToolResults, window)
       const referencedOperationId = payload.caused_by_operation_id?.trim()
       if (referencedOperationId) {
         referencedCompactionOperationIds.add(referencedOperationId)
@@ -1186,6 +1384,38 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
           event.sequence,
         ))
       }
+      let cells: TrajectoryCell[]
+      if (compactionCommit) {
+        heldCompactionContext = holdCompactionContext(
+          heldCompactionContext,
+          payload,
+          window,
+          base ?? [],
+        )
+        cells = []
+      } else {
+        cells = epochBaseline && epochBaselineBase !== undefined
+          ? epochBaselineCells(
+              event,
+              payload,
+              window,
+              epochBaselineBase,
+              subjectOrder,
+              heldCompactionContext,
+            )
+          : contextCells(
+              event,
+              {
+                ...payload,
+                delta: withHeldCompactionContext(heldCompactionContext, payload.delta, window),
+              },
+              window,
+              heldCompactionContext?.base ?? base,
+              correlation.operationId,
+              subjectOrder,
+            )
+        heldCompactionContext = undefined
+      }
       accumulator.events.push({
         eventId: event.eventId,
         eventKind: event.eventKind,
@@ -1196,22 +1426,7 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
         stepId: event.stepId,
         traceId: event.traceId,
         turnId: event.turnId,
-        cells: epochBaseline && epochBaselineBase !== undefined
-          ? epochBaselineCells(
-              event,
-              payload,
-              window,
-              epochBaselineBase,
-              subjectOrder,
-            )
-          : contextCells(
-              event,
-              payload,
-              window,
-              base,
-              correlation.operationId,
-              subjectOrder,
-            ),
+        cells,
       })
       continue
     }
@@ -1321,6 +1536,7 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
     diagnostics: accumulator.diagnostics,
     events: accumulator.events,
     handledInferenceIds: accumulator.handledInferenceIds,
+    modelToolResults: accumulator.modelToolResults,
   }
 }
 
@@ -1328,6 +1544,12 @@ function rebuildSubject(subjectId: string, events: readonly ParsedEvent[]): Traj
 export function createTrajectoryV2Reducer(): TrajectoryV2Reducer {
   const eventsBySubject = new Map<string, Map<string, ParsedEvent>>()
   const globalDiagnostics: TrajectoryDiagnostic[] = []
+  // Each publish applies the whole window again, but a live update touches one
+  // or two subjects. A subject's projection is a pure function of its events,
+  // so it is rebuilt only when one of them was added or replaced.
+  const projections = new Map<string, TrajectoryV2SubjectProjection>()
+  const dirtySubjects = new Set<string>()
+  let seeds: ReadonlyMap<string, TrajectoryV2SubjectSeed> = new Map()
   return {
     apply(records) {
       for (const record of records) {
@@ -1342,9 +1564,11 @@ export function createTrajectoryV2Reducer(): TrajectoryV2Reducer {
           if (existing === undefined) {
             subjectEvents.set(parsed.eventId, parsed)
             eventsBySubject.set(parsed.subjectId, subjectEvents)
+            dirtySubjects.add(parsed.subjectId)
           } else if (eventFingerprint(existing) !== eventFingerprint(parsed)) {
             if (existing.traceId === parsed.traceId && existing.span.spanId === parsed.span.spanId) {
               subjectEvents.set(parsed.eventId, parsed)
+              dirtySubjects.add(parsed.subjectId)
             } else {
               appendUniqueDiagnostic(globalDiagnostics, diagnostic(
                 'v2.event_id_conflict',
@@ -1357,14 +1581,23 @@ export function createTrajectoryV2Reducer(): TrajectoryV2Reducer {
           }
         }
       }
-      const subjects = new Map([...eventsBySubject].map(([subjectId, events]) => (
-        [subjectId, rebuildSubject(subjectId, [...events.values()])] as const
-      )))
-      return { diagnostics: globalDiagnostics, subjects }
+      for (const [subjectId, events] of eventsBySubject) {
+        if (!dirtySubjects.has(subjectId) && projections.has(subjectId)) continue
+        projections.set(subjectId, rebuildSubject(subjectId, [...events.values()], seeds.get(subjectId)))
+      }
+      dirtySubjects.clear()
+      return { diagnostics: globalDiagnostics, subjects: new Map(projections) }
     },
     clear() {
       eventsBySubject.clear()
       globalDiagnostics.length = 0
+      projections.clear()
+      dirtySubjects.clear()
+      seeds = new Map()
+    },
+    seed(nextSeeds) {
+      seeds = nextSeeds
+      projections.clear()
     },
   }
 }

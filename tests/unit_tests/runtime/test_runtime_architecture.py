@@ -185,9 +185,13 @@ def test_agentserver_injects_runtime_manager_into_teammate_daemon() -> None:
     assert len(daemon_calls) == 1
     keywords = {keyword.arg: keyword.value for keyword in daemon_calls[0].keywords}
     manager = keywords.get("agent_manager")
-    assert isinstance(manager, ast.Call)
-    assert isinstance(manager.func, ast.Attribute)
-    assert manager.func.attr == "get_agent_manager"
+    call = manager.body if isinstance(manager, ast.IfExp) else manager
+    assert isinstance(call, ast.Call)
+    if isinstance(call.func, ast.Attribute):
+        assert call.func.attr == "get_agent_manager"
+        return
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "get_agent_manager"
 
 
 def test_agentserver_session_lifecycle_uses_runtime_public_api() -> None:
@@ -361,3 +365,77 @@ def test_agentserver_session_switch_is_runtime_adapter_only() -> None:
     }.isdisjoint(called_names)
     assert "get_team_manager" not in called_names
     assert "resolve_session_switch_context" not in called_names
+
+
+def test_runtime_lifecycle_has_no_kvc_product_dependency() -> None:
+    for relative in (
+        "jiuwenswarm/runtime/service.py",
+        "jiuwenswarm/runtime/session_provisioner.py",
+        "jiuwenswarm/runtime/session_delete.py",
+        "jiuwenswarm/runtime/session_lifecycle.py",
+    ):
+        source = (PROJECT_ROOT / relative).read_text(encoding="utf-8")
+        assert "server.runtime.session.kv_cache" not in source, relative
+
+
+def test_legacy_kvc_delete_orchestration_modules_are_removed() -> None:
+    legacy_paths = (
+        "jiuwenswarm/server/runtime/session/kv_cache/kv_cache_product_hooks.py",
+        "jiuwenswarm/agents/harness/team/kv_cache_team_delete_guard.py",
+    )
+    assert [path for path in legacy_paths if (PROJECT_ROOT / path).exists()] == []
+
+
+def test_agentserver_team_delete_is_transport_only() -> None:
+    source = PROJECT_ROOT / "jiuwenswarm" / "server" / "agent_ws_server.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    handlers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_handle_team_delete"
+    ]
+    assert len(handlers) == 1
+    handler_text = ast.unparse(handlers[0])
+    assert ".delete_team(" in handler_text
+    for forbidden in (
+        "Runner",
+        "release_session_kvc",
+        "delete_agent_team",
+        "rmtree",
+        "get_team_binding_store",
+    ):
+        assert forbidden not in handler_text
+
+
+def test_team_manager_delete_controller_does_not_own_kvc_or_runner_delete() -> None:
+    source = PROJECT_ROOT / "jiuwenswarm" / "agents" / "harness" / "team" / "team_manager.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    methods = {
+        node.name: ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name
+        in {
+            "quiesce_for_delete",
+            "dispose_after_resource_release",
+            "delete_aborted",
+            "delete_committed",
+        }
+    }
+    assert set(methods) == {
+        "quiesce_for_delete",
+        "dispose_after_resource_release",
+        "delete_aborted",
+        "delete_committed",
+    }
+    combined = "\n".join(methods.values())
+    for forbidden in (
+        "release_kvc",
+        "prepare_kvc",
+        "suspend_kvc",
+        "Runner.delete_agent_team",
+        "Runner.release",
+        "rmtree",
+    ):
+        assert forbidden not in combined

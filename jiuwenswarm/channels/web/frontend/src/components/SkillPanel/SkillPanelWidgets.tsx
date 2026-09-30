@@ -3,14 +3,13 @@
  *
  * 从 index.tsx 抽取，内容保持不变。
  */
-import { useCallback, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronRight } from 'lucide-react';
 import NewConversationIcon from '../../assets/new_conversation.svg?react';
 import ExpandIcon from '../../assets/work-mode/expand.svg?react';
 import { PageCard, type PageCardActionProps } from '../ui';
-import { getSkillAvatar } from '../../utils/skillAvatar';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
 import type { MarketplacePluginItem } from './types';
 
@@ -92,23 +91,6 @@ export function TopAnchorTooltip({ pos, text }: { pos: { left: number; top: numb
   );
 }
 
-/** 弹窗右上角关闭按钮 */
-export function ModalCloseButton({ onClick, label, testId }: { onClick: () => void; label: string; testId?: string }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={label}
-      data-testid={testId}
-      className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-secondary text-text-muted hover:text-text"
-    >
-      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-      </svg>
-    </button>
-  );
-}
-
 /** 技能类型徽标（团队技能 / 多模态） */
 /** 我的技能卡片右上角的"去试试"按钮，内置 tooltip，复用 useAdaptiveTooltip 保持与其他按钮一致。 */
 export function MySkillGoTryButton({
@@ -154,7 +136,6 @@ export function HubSkillCard({
   action: PageCardActionProps;
 }) {
   const { t } = useTranslation();
-  const avatar = getSkillAvatar(skill.name);
   const displayName = skill.display_name || skill.name;
   const tags = skill.tags && skill.tags.length > 0 ? skill.tags : undefined;
 
@@ -163,7 +144,7 @@ export function HubSkillCard({
       onClick={onSelect}
       testId="skill-panel-hub-card"
       variant={skill.asset_id}
-      avatar={avatar}
+      avatar={{ name: displayName, iconUrl: skill.icon_uri, testId: 'skill-panel-hub-avatar' }}
       title={displayName}
       label={tags}
       action={action}
@@ -238,7 +219,6 @@ export function FilterDropdown<T extends string>({
   value,
   onChange,
   options,
-  style,
   testId,
 }: {
   open: boolean;
@@ -247,16 +227,15 @@ export function FilterDropdown<T extends string>({
   value: T;
   onChange: (value: T) => void;
   options: { value: T; label: string }[];
-  style?: CSSProperties;
   testId?: string;
 }) {
   const selected = options.find((o) => o.value === value);
   return (
-    <div className="relative" style={style}>
+    <div className="relative">
       <button
         type="button"
         onClick={() => onToggle(!open)}
-        className="flex items-center justify-between w-full h-[32px] text-xs text-text bg-transparent"
+        className="flex items-center gap-1 h-[32px] text-xs text-text bg-transparent"
         data-testid={testId}
       >
         <span className="truncate">{selected ? selected.label : ''}</span>

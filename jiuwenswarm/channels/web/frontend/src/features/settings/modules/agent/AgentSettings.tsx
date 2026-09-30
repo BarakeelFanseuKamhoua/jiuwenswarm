@@ -2,7 +2,14 @@ import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { settingsActionIcons } from '../../../../assets/settings';
 import { Button, Switch } from '../../../../components/ui';
-import { Form, FormDialog, useForm } from '../../../../components/form';
+import {
+  Form,
+  FormDialog,
+  useForm,
+  useFormState,
+  type FormItem,
+  type FormRules,
+} from '../../../../components/form';
 import { SettingRow, SettingsConfirmDialog } from '../../components';
 import type { SettingsCustomItemProps } from '../../registry/types';
 import { parseConfigBoolean, toConfigBoolean } from '../../services/settingsContract';
@@ -16,6 +23,7 @@ import {
   wasConfigAppliedWithoutRestart,
   type MediaCapabilityModality,
 } from './mediaCapabilities';
+import { GenerationModelConfigDialog } from './GenerationModelConfigDialog';
 import { MediaModelConfigDialog } from './MediaModelConfigDialog';
 import './AgentSettings.css';
 
@@ -28,6 +36,7 @@ const videoGenFields = [
   'video_gen_api_key',
   'video_gen_model',
 ] as const;
+const videoGenContextWindowField = 'video_gen_context_window_tokens';
 const visualGenFields = [
   'visual_gen_provider',
   'visual_gen_protocol',
@@ -35,6 +44,7 @@ const visualGenFields = [
   'visual_gen_api_key',
   'visual_gen_model',
 ] as const;
+const visualGenContextWindowField = 'visual_gen_context_window_tokens';
 
 type SaveConfig = (updates: Record<string, string>, operation: string) => Promise<unknown>;
 
@@ -53,9 +63,10 @@ function AgentConfigDialog({
 }) {
   const { t } = useTranslation();
   const { isConnected } = useSettingsServices();
-  const form = useForm({
+  const form = useForm<Record<string, unknown>>({
     initialValues: Object.fromEntries(fields.map((name) => [name, String(config[name] ?? '')])),
   });
+  useFormState(form);
   const [submitting, setSubmitting] = useState(false);
   const [saveError, setSaveError] = useState('');
   const closeBlocked = submitting;
@@ -65,52 +76,45 @@ function AgentConfigDialog({
     closeBlocked,
     onClose,
   });
-  const items = useMemo(
-    () =>
-      fields.map((name) => {
-        const key = name.includes('key');
-        return {
-          name,
-          label: t(`settingsPanel.fields.${name}.title`),
-          component: 'input' as const,
-          type: key ? ('password' as const) : ('text' as const),
-          required: true,
-          passwordVisibilityLabels: key
-            ? { show: t('settingsPanel.common.showValue'), hide: t('settingsPanel.common.hideValue') }
-            : undefined,
-          placeholder: t('config.enterValue'),
-        };
-      }),
-    [fields, t],
-  );
-  const rules = useMemo(
-    () =>
-      Object.fromEntries(
-        fields.map((name) => [
-          name,
-          [
-            {
-              trigger: 'blur' as const,
-              validator: (value: unknown) =>
-                typeof value === 'string' && value.trim().length > 0
-                  ? undefined
-                  : t('settingsPanel.validation.required'),
-            },
-          ],
-        ]),
-      ),
-    [fields, t],
-  );
+  const items = useMemo(() => {
+    const nextItems: FormItem<Record<string, unknown>>[] = fields.map((name) => {
+      const key = name.includes('key');
+      return {
+        name,
+        label: t(`settingsPanel.fields.${name}.title`),
+        component: 'input' as const,
+        type: key ? ('password' as const) : ('text' as const),
+        required: true,
+        passwordVisibilityLabels: key
+          ? { show: t('settingsPanel.common.showValue'), hide: t('settingsPanel.common.hideValue') }
+          : undefined,
+        placeholder: t('config.enterValue'),
+      };
+    });
+    return nextItems;
+  }, [fields, form, t]);
+  const rules = useMemo(() => {
+    const nextRules: FormRules<Record<string, unknown>> = Object.fromEntries(
+      fields.map((name) => [
+        name,
+        [
+          {
+            trigger: 'blur' as const,
+            validator: (value: unknown) =>
+              typeof value === 'string' && value.trim().length > 0 ? undefined : t('settingsPanel.validation.required'),
+          },
+        ],
+      ]),
+    );
+    return nextRules;
+  }, [fields, t]);
   const confirm = async () => {
     const result = form.validate();
     if (!result.valid) return;
     setSubmitting(true);
     setSaveError('');
     try {
-      await save(
-        Object.fromEntries(fields.map((name) => [name, String(result.values[name] ?? '').trim()])),
-        titleKey,
-      );
+      await save(Object.fromEntries(fields.map((name) => [name, String(result.values[name] ?? '').trim()])), titleKey);
       onClose();
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : t('settingsPanel.feedback.saveFailed'));
@@ -385,7 +389,7 @@ export function VideoGenSettings({ disabled }: SettingsCustomItemProps) {
 
   const configured = videoGenFields.every((name) => String(values[name] ?? '').trim());
   const enabled = configured && parseConfigBoolean(values.video_gen_enabled);
-  const busy = [...videoGenFields, 'video_gen_enabled'].some((field) => savingKeys.has(field));
+  const busy = [...videoGenFields, videoGenContextWindowField, 'video_gen_enabled'].some((field) => savingKeys.has(field));
   const name = t('settingsPanel.fields.video_gen_enabled.title');
 
   const toggle = async (nextEnabled: boolean) => {
@@ -401,7 +405,10 @@ export function VideoGenSettings({ disabled }: SettingsCustomItemProps) {
   };
 
   const confirmDelete = async () => {
-    const updates: Record<string, string> = Object.fromEntries(videoGenFields.map((field) => [field, '']));
+    const updates: Record<string, string> = Object.fromEntries([
+      ...videoGenFields.map((field) => [field, '']),
+      [videoGenContextWindowField, ''],
+    ]);
     if (parseConfigBoolean(values.video_gen_enabled)) {
       updates.video_gen_enabled = toConfigBoolean(false);
     }
@@ -462,9 +469,10 @@ export function VideoGenSettings({ disabled }: SettingsCustomItemProps) {
         />
       </SettingRow>
       {dialog ? (
-        <AgentConfigDialog
+        <GenerationModelConfigDialog
+          slot="video_gen"
           titleKey="settingsPanel.agent.videoGenConfigTitle"
-          fields={videoGenFields}
+          enableOnSave={dialog.enableOnSave}
           config={values}
           save={
             dialog.enableOnSave
@@ -501,7 +509,7 @@ export function VisualGenSettings({ disabled }: SettingsCustomItemProps) {
 
   const configured = visualGenFields.every((name) => String(values[name] ?? '').trim());
   const enabled = configured && parseConfigBoolean(values.visual_gen_enabled);
-  const busy = [...visualGenFields, 'visual_gen_enabled'].some((field) => savingKeys.has(field));
+  const busy = [...visualGenFields, visualGenContextWindowField, 'visual_gen_enabled'].some((field) => savingKeys.has(field));
   const name = t('settingsPanel.fields.visual_gen_enabled.title');
 
   const toggle = async (nextEnabled: boolean) => {
@@ -517,7 +525,10 @@ export function VisualGenSettings({ disabled }: SettingsCustomItemProps) {
   };
 
   const confirmDelete = async () => {
-    const updates: Record<string, string> = Object.fromEntries(visualGenFields.map((field) => [field, '']));
+    const updates: Record<string, string> = Object.fromEntries([
+      ...visualGenFields.map((field) => [field, '']),
+      [visualGenContextWindowField, ''],
+    ]);
     if (parseConfigBoolean(values.visual_gen_enabled)) {
       updates.visual_gen_enabled = toConfigBoolean(false);
     }
@@ -578,9 +589,10 @@ export function VisualGenSettings({ disabled }: SettingsCustomItemProps) {
         />
       </SettingRow>
       {dialog ? (
-        <AgentConfigDialog
+        <GenerationModelConfigDialog
+          slot="visual_gen"
           titleKey="settingsPanel.agent.visualGenConfigTitle"
-          fields={visualGenFields}
+          enableOnSave={dialog.enableOnSave}
           config={values}
           save={
             dialog.enableOnSave

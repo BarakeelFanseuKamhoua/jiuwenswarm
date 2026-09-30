@@ -18,6 +18,7 @@ from jiuwenswarm.common.config import _parse_custom_headers
 from jiuwenswarm.common.reasoning_injector import build_reasoning_model_request_kwargs
 from jiuwenswarm.gateway.routing.interaction_context import PendingInteraction
 from jiuwenswarm.common.schema.message import Message, ReqMethod
+from jiuwenswarm.gateway.im_pipeline.im_session_input import prepare_im_session_input
 from jiuwenswarm.gateway.message_handler.command_parser.slash_command import CONTROL_MESSAGE_TEXTS
 from jiuwenswarm.common.utils import get_deepagent_user_md_path, logger
 SYSTEM_PROMPT_TEMPLATE = """
@@ -550,7 +551,22 @@ class IMInboundPipeline:
         metadata["agent_sender_identity_injected"] = True
         msg.metadata = metadata
 
+    def _keep_explicit_input_sender(self, msg: Message) -> None:
+        if not msg.group_digital_avatar:
+            return
+        adapter = self._adapters.get(msg.channel_id)
+        if adapter is None:
+            return
+        self._inject_agent_visible_sender_identity(msg, adapter)
+
     async def apply(self, msg: Message) -> bool:
+        if prepare_im_session_input(msg):
+            # Identified steer/follow_up uses the public Session input path.
+            # Keep the connector's sender visible, and do not rewrite the text
+            # or consume a pending question as this message's answer.
+            self._keep_explicit_input_sender(msg)
+            return True
+
         if not msg.group_digital_avatar:
             return True
 

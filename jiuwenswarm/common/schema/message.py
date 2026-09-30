@@ -48,14 +48,23 @@ class ReqMethod(Enum):
     CONFIG_SAVE_ALL = "config.save_all"
     CONFIG_VALIDATE_MODEL = "config.validate_model"
     MODELS_LIST = "models.list"
+    MODELS_GET = "models.get"
     MODELS_REPLACE_ALL = "models.replace_all"
     MODELS_VALIDATE = "models.validate"
+    MODELS_UPSERT = "models.upsert"
+    MODELS_DELETE = "models.delete"
+    MODELS_REFERENCES = "models.references"
+    MODEL_GROUPS_LIST = "model_groups.list"
+    MODEL_GROUPS_UPSERT = "model_groups.upsert"
+    MODEL_GROUPS_DELETE = "model_groups.delete"
+    SESSION_SELECTION_SET = "session.selection.set"
     LOCALE_GET_CONF = "locale.get_conf"
     LOCALE_SET_CONF = "locale.set_conf"
     CHANNEL_GET = "channel.get"
 
     SESSION_LIST = "session.list"
     SESSION_GET_METADATA = "session.get_metadata"
+    SESSION_MESSAGE_CONTINUE_QUEUED = "session.message.continue_queued"
     SESSION_PLAN_STATUS = "session.plan_status"
     SESSION_PIN = "session.pin"
     SESSION_COLOR_SET = "session.color_set"
@@ -63,7 +72,7 @@ class ReqMethod(Enum):
     SESSION_CREATE = "session.create"
     SESSION_SWITCH = "session.switch"
     SESSION_DELETE = "session.delete"
-    SESSION_KVC_PREPARE = "session.kvc.prepare"
+    SESSION_INPUT_INTENT = "session.input.intent"
     SESSION_RENAME = "session.rename"
     SESSION_FORK = "session.fork"
     SESSION_REBIND_PROJECT = "session.rebind_project"
@@ -91,6 +100,8 @@ class ReqMethod(Enum):
     CONFIG_CACHE_CLEAR = "config.cache_clear"
     AGENT_RELOAD_CONFIG = "agent.reload_config"
     AGENT_PREWARM_SYNC = "agent.prewarm.sync"
+    # Gateway → AgentServer：登录模型凭据续期后的新 token / 会话注销后的撤销
+    AUTH_CREDENTIALS_UPDATE = "auth.credentials.update"
 
     MEMORY_COMPUTE = "memory.compute"
     # TUI memory management (Phase 3: execute in the target AgentServer's
@@ -117,11 +128,12 @@ class ReqMethod(Enum):
     SESSION_ARCHIVE = "session.archive"
     SESSION_UNARCHIVE = "session.unarchive"
     SESSION_ARCHIVED_LIST = "session.archived.list"
-    PROJECT_ARCHIVED_LIST = "project.archived.list"
-    PROJECT_DELETE = "project.delete"
+    CRON_SESSIONS_DELETE = "cron.sessions.delete"
+    PROJECT_REMOVE = "project.remove"
+    PROJECT_RESTORE = "project.restore"
     PROJECT_LIFECYCLE = "project.lifecycle"
-    PROJECT_ARCHIVE = "project.archive"
-    PROJECT_UNARCHIVE = "project.unarchive"
+    PROJECT_SESSIONS_ARCHIVE = "project.sessions.archive"
+    PROJECT_SESSIONS_DELETE_ARCHIVED = "project.sessions.delete_archived"
     PROJECT_GIT_STATUS = "project.git.status"
     PROJECT_GIT_PROBE = "project.git.probe"
     PROJECT_GIT_INIT = "project.git.init"
@@ -145,6 +157,8 @@ class ReqMethod(Enum):
 
     # 媒体/文档附件（Phase 2 WorkspaceFileAdapter）
     MEDIA_PERSIST = "media.persist"
+    # 丢弃尚未发送的会话 uploads 副本。只删当前会话 uploads 内的普通文件。
+    MEDIA_DISCARD = "media.discard"
     DOCUMENT_PERSIST = "document.persist"
     DOCUMENT_FORMATS = "document.formats"
     # chat.send 上行外部 url 文件导入（Phase 2：AgentServer 下载落盘注入目录，Gateway 不落盘）
@@ -165,6 +179,10 @@ class ReqMethod(Enum):
     CRON_COMMAND_ACK = "cron.command.ack"
     CRON_RUN_NOW_ACK = "cron.run_now.ack"
 
+    # Gateway owns voice task records; AgentServer returns execution facts/files.
+    VOICE_TASK_CHECKPOINT_ACK = "voice.task.checkpoint.ack"
+    VOICE_TASK_FILES = "voice.task.files"
+
     # HarmonyOS TUI DevEco bootstrap（Phase 3：用户态在目标 AgentServer 注入目录执行）
     HARMONYOS_PROJECT_INIT = "harmonyos.project_init"
     HARMONYOS_DEV_INIT = "harmonyos.dev_init"
@@ -182,6 +200,14 @@ class ReqMethod(Enum):
     AGENT_SWITCH = "3rdagent.switch"
     AGENT_LIST = "3rdagent.list"
 
+    # Unified asset publishing; dispatched by AgentServer independently of chats.
+    ASSETS_PUBLISH_DESCRIBE = "assets.publish.describe"
+    ASSETS_PUBLISH_PREPARE = "assets.publish.prepare"
+    ASSETS_PUBLISH_COMMIT = "assets.publish.commit"
+    ASSETS_PUBLISH_STATUS = "assets.publish.status"
+    ASSETS_PUBLISH_RECORDS = "assets.publish.records"
+    ASSETS_PUBLISH_LOCAL_STATUS = "assets.publish.local_status"
+
     # mcp management.
     MCP_LIST = "mcp.list"
     MCP_SHOW = "mcp.show"
@@ -189,6 +215,7 @@ class ReqMethod(Enum):
     MCP_UNINSTALL = "mcp.uninstall"
     MCP_CONNECT = "mcp.connect"
     MCP_WAIT_AUTH = "mcp.wait_auth"
+    MCP_CANCEL_CONNECT = "mcp.cancel_connect"
     MCP_DISCONNECT = "mcp.disconnect"
     MCP_REGISTER_CUSTOM = "mcp.register_custom"
     MCP_DELETE_CUSTOM = "mcp.delete_custom"
@@ -210,6 +237,7 @@ class ReqMethod(Enum):
     SKILLS_VISIBILITY_SET = "skills.visibility.set"
     SKILLS_VISIBILITY_UPDATE = "skills.visibility.update"
     SKILLS_INSTALL = "skills.install"
+    SKILLS_PACK_MEMBER_INSTALL = "skills.pack_member.install"
     SKILLS_IMPORT_LOCAL = "skills.import_local"
     SKILLS_IMPORT_UPLOAD = "skills.import_upload"
     SKILLS_CREATE_FROM_KNOWLEDGE = "skills.create_from_knowledge"
@@ -252,6 +280,8 @@ class ReqMethod(Enum):
     SKILLS_GRAPH_STATUS = "skills.graph.status"
     SKILLS_GRAPH_GET = "skills.graph.get"
     SKILLS_GRAPH_CANCEL = "skills.graph.cancel"
+    SKILLS_EXPERIENCE_LIST = "skills.experience.list"
+    SKILLS_EXPERIENCE_REQUEST = "skills.experience.request"
 
     PERSONAL_CONTEXT_RUNTIME_STATUS = "personal_context.runtime.status"
     PERSONAL_CONTEXT_RUNTIME_START_COLLECTION = (
@@ -264,6 +294,9 @@ class ReqMethod(Enum):
         "personal_context.runtime.start_agent_use"
     )
     PERSONAL_CONTEXT_RUNTIME_STOP_AGENT_USE = "personal_context.runtime.stop_agent_use"
+    PERSONAL_CONTEXT_RUNTIME_SET_MASTER_ENABLED = (
+        "personal_context.runtime.set_master_enabled"
+    )
     PERSONAL_CONTEXT_RUNTIME_GET_CONFIG = "personal_context.runtime.get_config"
     PERSONAL_CONTEXT_RUNTIME_PATCH_CONFIG = "personal_context.runtime.patch_config"
     PERSONAL_CONTEXT_RUNTIME_SELECT_MODEL = "personal_context.runtime.select_model"
@@ -316,6 +349,8 @@ class ReqMethod(Enum):
     AGENT_TEMPLATES_FILE_LIST = "agent_templates.file.list"
     AGENT_TEMPLATES_FILE_READ = "agent_templates.file.read"
     AGENT_TEMPLATES_CREATE = "agent_templates.create"
+    AGENT_TEMPLATES_UPDATE = "agent_templates.update"
+    AGENT_TEMPLATES_DELETE = "agent_templates.delete"
     AGENT_TEMPLATES_IMPORT_LOCAL = "agent_templates.import_local"
     AGENT_TEMPLATES_INSTALL = "agent_templates.install"
     AGENT_TEMPLATES_UNINSTALL = "agent_templates.uninstall"
@@ -435,11 +470,12 @@ class EventType(Enum):
     SESSION_ARCHIVED = "session.archived"
     SESSION_UNARCHIVED = "session.unarchived"
     SESSION_DELETED = "session.deleted"
-    PROJECT_ARCHIVED = "project.archived"
-    PROJECT_UNARCHIVED = "project.unarchived"
-    PROJECT_DELETED = "project.deleted"
     SESSION_LIFECYCLE_UPDATED = "session.lifecycle.updated"
     PROJECT_LIFECYCLE_UPDATED = "project.lifecycle.updated"
+    # 项目移除(软删除)/恢复：其会话与定时任务的可见性随之变化，
+    # 其他端必须据此刷新工作区、归档页与定时任务列表。
+    PROJECT_REMOVED = "project.removed"
+    PROJECT_RESTORED = "project.restored"
     CONNECTION_ACK = "connection.ack"
     HELLO = "hello"
     CHAT_DELTA = "chat.delta"
@@ -454,6 +490,7 @@ class EventType(Enum):
     CHAT_TOOL_UPDATE = "chat.tool_update"
     CHAT_TOOL_RESULT = "chat.tool_result"
     CHAT_SYMPHONY_STATUS = "chat.symphony_status"
+    CHAT_MESSAGE_UPDATED = "chat.message_updated"
     CONTEXT_USAGE = "context.usage"
     TODO_UPDATED = "todo.updated"
     CHAT_PROCESSING_STATUS = "chat.processing_status"

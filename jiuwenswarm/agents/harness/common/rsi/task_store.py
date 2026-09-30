@@ -3,7 +3,7 @@
 - JSON 文件存储：``.jiuwenswarm/rsi/tasks/<task_id>/task.json``（内部 v3 §1 边界：不新增 DB）。
 - 状态机唯一入口 ``update_status(from_states, to, cause)``；非法迁移抛 ``TASK_STATE_CONFLICT``。
 - P1 钩子：成功迁移后触发 ``on_status_changed(task_id, old_status, new_status)``（服务侧权威，不依赖引擎事件）。
-- ``delete`` 按 guard 校验运行中/排队/暂停/在用产物不可删。
+- ``delete`` 按 guard 校验运行中/暂停/在用产物不可删；排队任务由服务层先完成状态迁移。
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ _STATUS_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.TERMINATED: frozenset(),
 }
 
-#: 不可删除的状态（一致性规则 §8.2）
-_NON_DELETABLE_STATES = frozenset({TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.PAUSED})
+#: 不可删除的状态（一致性规则 §8.2）；排队/暂停任务由服务层先转为 TERMINATED。
+_NON_DELETABLE_STATES = frozenset({TaskStatus.RUNNING, TaskStatus.PAUSED})
 
 _LOCK = threading.RLock()
 
@@ -95,7 +95,12 @@ class RsiTaskStore:
         return tasks
 
     def delete(self, task_id: str, *, forbid_running: bool = True, forbid_active_artifact: bool = True) -> None:
-        """删除任务（一致性规则 §8.2：运行中/排队/暂停/在用产物不可删）。"""
+        """删除任务：先移除列表索引，再尽力清理物理目录。
+
+        一致性规则 §8.2 仍禁止删除运行中/暂停/在用产物；排队/暂停任务由服务层先
+        通过状态机转为 TERMINATED；索引删除失败
+        会继续向上抛出，索引成功后的物理清理失败则直接忽略。
+        """
         task = self.get(task_id)
         state = TaskStatus(task.status)
         if forbid_running and state in _NON_DELETABLE_STATES:
@@ -109,10 +114,15 @@ class RsiTaskStore:
                     raise RsiTaskStateConflict(f"任务 {task_id} 产物仍在生效，不可删除")
         task_dir = self.task_dir(self.tasks_root, task_id)
         with _LOCK:
+            task_file = task_dir / "task.json"
             try:
-                shutil.rmtree(task_dir)
+                task_file.unlink()
             except FileNotFoundError:
-                pass  # 目录已不存在视为删除成功（幂等）
+                pass  # 索引已不存在视为删除成功（幂等）
+            try:
+                shutil.rmtree(task_dir, ignore_errors=True)
+            except Exception:
+                return
 
     # -- 状态机 --
 

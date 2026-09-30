@@ -24,6 +24,11 @@ test('consumes the canonical v1 fields and all four returned categories', () => 
   assert.equal(result.session_kv_cache_hit_rate, 0.6);
 });
 
+test('accepts a manual compact snapshot without treating it as a provider call', () => {
+  const result = parseContextUsageSnapshot(snapshot({ phase: 'post_compact' }));
+  assert.equal(result.phase, 'post_compact');
+});
+
 test('uses only the top-level session KV rate without per-call or nested-session fallbacks', () => {
   const payload = snapshot({ session_kv_cache_hit_rate: 0.8829792874980116 });
   payload.kv_cache.request.hit_rate = 0.9976856905811974;
@@ -148,7 +153,9 @@ test('uses backend ratios even when they differ from locally calculated token sh
   assert.equal(formatContextPercent(0.2584), '25.8%');
   assert.equal(formatContextTokens(999), '999');
   assert.equal(formatContextTokens(1250), '1.3K');
-  assert.equal(formatContextLimitTokens(1_000_000), '1000.0K');
+  assert.equal(formatContextLimitTokens(50 * 1024), '50K');
+  assert.equal(formatContextLimitTokens(256 * 1024), '256K');
+  assert.equal(formatContextLimitTokens(1024 * 1024), '1M');
 });
 
 test('routes single-agent root snapshots by product session, never the currently visible session', () => {

@@ -7,7 +7,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import TipIcon from '../../assets/tip.svg?react';
 import UpFileIcon from '../../assets/upFile.svg?react';
-import { ModalCloseButton } from './SkillPanelWidgets';
+import { CloseButton } from '../ui';
 
 interface UploadSkillModalProps {
   actionTarget: string | null;
@@ -33,20 +33,16 @@ export function UploadSkillModal({ actionTarget, onUpload, onClose }: UploadSkil
         data-testid="skill-panel-upload-skill-modal"
       >
         {/* 头部 */}
-        <div className="flex items-center justify-between gap-3 px-5 py-3 bg-panel">
+        <div className="flex items-center justify-between gap-3 px-6 pt-6 bg-panel">
           <span data-testid="skill-panel-upload-skill-modal-title" className="text-lg font-semibold text-text-strong">
             {t('skills.uploadSkillModal.title')}
           </span>
-          <ModalCloseButton
-            onClick={onClose}
-            label={t('skills.uploadSkillModal.cancel')}
-            testId="skill-panel-upload-skill-modal-close-btn"
-          />
+          <CloseButton onClick={onClose} />
         </div>
         {/* 提示行 */}
-        <div className="px-5 pt-3">
+        <div className="px-6 pt-4">
           <div
-            className="flex items-start gap-1.5 rounded-[8px] px-3 py-2 text-xs text-text bg-[var(--color-skill-notice-surface)]"
+            className="flex items-start gap-1.5 rounded-[8px] px-4 py-2 text-xs text-text bg-[var(--color-skill-notice-surface)]"
             style={{ width: '502px' }}
           >
             <TipIcon className="w-3.5 h-3.5 shrink-0 mt-0.5" />
@@ -54,7 +50,7 @@ export function UploadSkillModal({ actionTarget, onUpload, onClose }: UploadSkil
           </div>
         </div>
         {/* 文件上传拖动框 */}
-        <div className="px-5 pt-3 pb-5">
+        <div className="px-6 pt-4 pb-4">
           <label
             onDragOver={(e) => {
               e.preventDefault();
@@ -89,7 +85,7 @@ export function UploadSkillModal({ actionTarget, onUpload, onClose }: UploadSkil
           </label>
         </div>
         {/* 底部按钮 */}
-        <div className="flex items-center justify-end gap-3 px-5 py-3 bg-panel">
+        <div className="flex items-center justify-end gap-3 px-5 pb-6 bg-panel">
           <button
             type="button"
             onClick={onClose}
@@ -108,7 +104,7 @@ export function UploadSkillModal({ actionTarget, onUpload, onClose }: UploadSkil
             }}
             className={`flex items-center justify-center rounded-[16px] text-sm whitespace-nowrap transition-colors ${
               !uploadSkillFile || actionTarget === 'import_local'
-                ? 'bg-secondary text-text-muted cursor-not-allowed'
+                ? 'bg-bg-muted border border-text-divider text-text-disabled cursor-not-allowed'
                 : 'text-text-inverse bg-control-emphasis hover:opacity-80'
             }`}
             style={{ height: '32px', padding: '0 32px' }}

@@ -32,6 +32,7 @@ import type {
 import type {
   TrajectoryPromptSnapshot,
   TrajectoryDiagnostic,
+  TrajectoryGroupModel,
   TrajectoryRecordedFacts,
   TrajectoryRequest,
   TrajectoryRequestConfig,
@@ -50,7 +51,6 @@ interface ProjectedSpan {
   endTimeUnixNano: bigint | undefined
   parentSpanId: string | undefined
   request: OtlpExportTraceServiceRequest
-  sourceSequence: number | undefined
   identityRequestNumber: number | undefined
   requestNumber: number | undefined
   streamEvents: readonly NormalizedTrajectoryStreamEvent[]
@@ -64,7 +64,35 @@ interface ProjectedSpan {
   owningRequestRecordId?: string
 }
 
+/**
+ * What retention left behind for one execution subject: the state the
+ * session-wide derivations had reached over the turns it removed. Projecting
+ * the remaining records from it renders every remaining turn exactly as it
+ * rendered with the removed turns still loaded.
+ */
+export interface TrajectoryProjectionCheckpoint {
+  turns: {
+    /** Highest turn number a removed turn stated. */
+    maxNumber: number
+    /** Removed turns that were numbered after every stated number. */
+    unnumbered: number
+    /** Turn ids removed turns stated, by trace still holding records. */
+    traceTurnIds: ReadonlyMap<string, readonly string[]>
+  }
+  /** Model requests removed, by `conversation\u0000subject`. */
+  requestOffsets: ReadonlyMap<string, number>
+  /** Removed requests later schema-v1 requests are still compared against, oldest first. */
+  lineage: readonly TrajectoryLineageSeed[]
+}
+
+export interface TrajectoryLineageSeed {
+  record: OtlpExportTraceServiceRequest
+  /** Whether a schema-v2 commit handled the request, so only its output carries on. */
+  handledByV2: boolean
+}
+
 export interface TrajectoryProjectionOptions {
+  checkpoint?: TrajectoryProjectionCheckpoint
   lifecycleByRecordId?: ReadonlyMap<string, 'running' | 'completed' | 'error'>
   sessionCumulativeUsageByRequestIdentity?: ReadonlyMap<string, TrajectoryUsage>
   /**
@@ -118,6 +146,28 @@ interface MutableTurn {
 interface TurnFact {
   key: string
   number: number
+  // Whether the turn's traces named it by id or number. A trace naming
+  // neither ran outside every turn, such as a manual /compact.
+  stated: boolean
+  // When the earliest record of the turn began.
+  startedAt: bigint
+}
+
+// The turns every record of one projection belongs to, resolved once so legacy
+// spans and schema-v2 events land on one axis.
+interface TurnIndex {
+  byKey: ReadonlyMap<string, TurnFact>
+  // The turn one record belongs to, by its own span identity.
+  forRecord(traceId: string, spanId: string): TurnFact | undefined
+  // The turn a record states by id, or its trace's turn when it states none.
+  forTurn(traceId: string, turnId: string | undefined): TurnFact | undefined
+}
+
+// One rendered turn entry and when its turn began, so a run outside every
+// turn can be placed between the turns it happened between.
+interface TimedTurnEntry {
+  model: TrajectoryTurnModel
+  startedAt: bigint
 }
 
 interface InferenceInputProjection {
@@ -193,9 +243,6 @@ function compareBigint(left: bigint, right: bigint): number {
 }
 
 function compareSpans(left: ProjectedSpan, right: ProjectedSpan): number {
-  if (left.sourceSequence !== undefined && right.sourceSequence !== undefined) {
-    return left.sourceSequence - right.sourceSequence
-  }
   return compareBigint(left.startTimeUnixNano, right.startTimeUnixNano)
     || left.traceId.localeCompare(right.traceId)
     || left.span.spanId.localeCompare(right.span.spanId)
@@ -233,6 +280,11 @@ function startedAt(span: ProjectedSpan): number {
   return Number(span.startTimeUnixNano / NANOSECONDS_PER_MILLISECOND)
 }
 
+function endedAt(span: ProjectedSpan): number | undefined {
+  if (span.endTimeUnixNano === undefined) return undefined
+  return Number(span.endTimeUnixNano / NANOSECONDS_PER_MILLISECOND)
+}
+
 function durationSeconds(span: ProjectedSpan): number | null {
   if (span.endTimeUnixNano === undefined) return null
   return Number(span.endTimeUnixNano - span.startTimeUnixNano) / Number(NANOSECONDS_PER_SECOND)
@@ -241,6 +293,44 @@ function durationSeconds(span: ProjectedSpan): number | null {
 function formatted(value: unknown): string {
   if (typeof value === 'string') return value
   return JSON.stringify(value, null, 2) ?? String(value)
+}
+
+// Keyword arguments the runner injects into every tool invocation. They are
+// call context, not model output, so a recorded invocation that carries only
+// these beside the arguments unwraps to the arguments themselves.
+const INJECTED_TOOL_KWARGS = new Set(['session', '_tool_callback_context'])
+
+/**
+ * The recorded arguments of one tool call, as the model sent them.
+ *
+ * Older runs recorded the invocation signature the harness captured — the
+ * runner's ``(args, kwargs)`` call — so their spans carry the arguments
+ * buried in ``[args, kwargs]`` beside injected call context. Unwrap that one
+ * shape; anything else stays as recorded.
+ */
+/**
+ * The recorded arguments of one tool call, as the model sent them.
+ *
+ * Older runs recorded the invocation signature the harness captured — the
+ * runner's ``(args, kwargs)`` call — so their spans carry the arguments
+ * buried in ``[args, kwargs]`` beside injected call context. Unwrap that one
+ * shape; anything else stays as recorded.
+ */
+function toolArgumentsDetail(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  const positional = Array.isArray(value) && value.length === 2 && Array.isArray(value[0])
+    ? value[0]
+    : undefined
+  const kwargs = Array.isArray(value) && value.length === 2 ? object(value[1]) : undefined
+  if (
+    positional !== undefined
+    && kwargs !== undefined
+    && positional.length === 1
+    && Object.keys(kwargs).every(key => INJECTED_TOOL_KWARGS.has(key))
+  ) {
+    return formatted(positional[0])
+  }
+  return formatted(value)
 }
 
 function structuralIdentity(value: unknown): string {
@@ -457,9 +547,11 @@ function recordedFacts(
   })
   const trace = nonEmpty({
     ...(root.traceRoot === undefined ? {} : { root: root.traceRoot }),
-    ...(root.traceSchemaVersion === undefined
-      ? attributes.traceSchemaVersion === undefined ? {} : { schemaVersion: attributes.traceSchemaVersion }
-      : { schemaVersion: root.traceSchemaVersion }),
+    ...(root.trajectorySchemaVersion === undefined
+      ? attributes.trajectorySchemaVersion === undefined
+        ? {}
+        : { schemaVersion: attributes.trajectorySchemaVersion }
+      : { schemaVersion: root.trajectorySchemaVersion }),
     ...(root.traceComplete === undefined ? {} : { complete: root.traceComplete }),
     ...(root.traceForcedClose === undefined ? {} : { forcedClose: root.traceForcedClose }),
   })
@@ -605,7 +697,6 @@ function statusError(projected: ProjectedSpan): string | undefined {
   const forcedClose = projected.attributes.spanForcedClose === true
   if (!statusIsError && !forcedClose && projected.lifecycle !== 'error') return undefined
   return validErrorText(statusIsError ? projected.span.status?.message : undefined)
-    ?? validErrorText(statusIsError ? projected.attributes.errorMessage : undefined)
     ?? firstExceptionReason(projected.span.events)
     ?? validErrorText(statusIsError ? projected.attributes.errorType : undefined)
     ?? (forcedClose
@@ -689,10 +780,6 @@ function isRoutedAskUserResult(
     && sameRootOwner
 }
 
-function isCompaction(span: ProjectedSpan): boolean {
-  return recordKind(span) === 'compaction'
-}
-
 function spanCellBase(span: ProjectedSpan, suffix: string): Pick<
   TrajectoryCell,
   'index' | 'recordId' | 'sourceSeq' | 'startedAt' | 'status' | 'timeSeconds' | 'traceDetail'
@@ -700,7 +787,6 @@ function spanCellBase(span: ProjectedSpan, suffix: string): Pick<
   return {
     index: cellIndex(span, suffix),
     recordId: recordIdentity(span, suffix),
-    ...(span.sourceSequence === undefined ? {} : { sourceSeq: span.sourceSequence }),
     startedAt: startedAt(span),
     timeSeconds: durationSeconds(span),
     status: status(span),
@@ -709,6 +795,62 @@ function spanCellBase(span: ProjectedSpan, suffix: string): Pick<
       ? {}
       : { requestRecordId: requestRecordIdentity(span) }),
   }
+}
+
+// How a turn that ended in failure is shown. A native run records the failure
+// on the record that hit it — the inference or tool whose span carries the
+// error — and the row for that record is drawn in error. An external CLI has
+// no such record: the call the gateway throttled produced no response body, so
+// nothing was ever reported for it, and the only place the failure is stated
+// is the span the turn itself ran on. That span is therefore shown too, at the
+// end of the turn it closes.
+//
+// `withInput` is for the turn that failed before its first model call: it has
+// no rows at all, and a turn without rows is not drawn, so the numbers around
+// it appear to skip with no sign that a turn ran. Its input is stated only on
+// that same span; a turn that did reach a model call already shows what it was
+// handed, on the call that read it.
+function failedTurnCells(root: ProjectedSpan | undefined, withInput: boolean): TrajectoryCell[] {
+  if (root === undefined) return []
+  const reason = statusError(root)
+  if (reason === undefined) return []
+  const cells: TrajectoryCell[] = []
+  const input = root.attributes.spanInput
+  if (withInput && input !== undefined && input.trim() !== '') {
+    cells.push({
+      ...spanCellBase(root, 'turn:input'),
+      timeSeconds: null,
+      status: 'complete',
+      kind: 'user',
+      text: input,
+      inputDetail: input,
+    })
+  }
+  cells.push({
+    ...spanCellBase(root, 'turn:error'),
+    // The span opened with the turn, so its own start would sort this row
+    // ahead of everything the turn went on to do; it belongs where the turn
+    // ended.
+    startedAt: endedAt(root) ?? startedAt(root),
+    kind: 'message',
+    status: 'error',
+    text: reason,
+    outputDetail: reason,
+    isError: true,
+  })
+  return cells
+}
+
+// Place a turn's own failure at the end of the turn, in the last group it
+// reached, or in a group of its own when the turn never opened one.
+function withTurnFailure(
+  groups: readonly TrajectoryGroupModel[],
+  cells: readonly TrajectoryCell[],
+): TrajectoryGroupModel[] {
+  if (cells.length === 0) return [...groups]
+  if (groups.length === 0) return [{ title: 'Step 1', cells: [...cells] }]
+  const last = groups[groups.length - 1]
+  return [...groups.slice(0, -1), { ...last, cells: [...last.cells, ...cells] }]
 }
 
 function inputCells(
@@ -752,10 +894,7 @@ function inputCells(
       sourceBlocks: blocks,
       messageSource: {
         role: message.role,
-        kind: attachment
-          ? 'prompt_attachment'
-          : span.attributes.messageSourceKind ?? message.role,
-        plugin: span.attributes.messageSourcePlugin,
+        kind: attachment ? 'prompt_attachment' : message.role,
         inputIndex: message.inputIndex ?? index,
         ...(attachment ? { scope: 'request' } : {}),
       },
@@ -825,20 +964,36 @@ function assistantCell(span: ProjectedSpan): TrajectoryCell {
   }
 }
 
+/**
+ * Project one tool call.
+ *
+ * A tool call has two results. What the invocation returned is recorded on
+ * the tool span; what the model was given is the tool message the harness
+ * rendered from it, which can drop or reshape fields. The model's view is the
+ * call's Result, since that is what the next step acted on, and the raw return
+ * is kept beside it. A call whose tool message was never recorded has only
+ * its raw return.
+ *
+ * Args:
+ *   span: The tool span.
+ *   toolSpanIds: Span ids of every tool span, to tell a nested call.
+ *   schemaDetail: The tool's definition from its request, when recorded.
+ *   modelResult: The tool message content the model read for this call.
+ */
 function toolCell(
   span: ProjectedSpan,
   toolSpanIds: ReadonlySet<string>,
   schemaDetail: string | undefined,
-  correlatedResult: ToolResultFact | undefined,
+  modelResult: unknown,
 ): TrajectoryCell {
   const name = span.attributes.toolName ?? span.span.name
   const callId = span.attributes.toolCallId ?? `${span.traceId}:${span.span.spanId}`
   const input = span.attributes.toolCallArguments
-  const result = span.attributes.toolCallResult === undefined
-    ? correlatedResult?.response
-    : span.attributes.toolCallResult
-  const inputText = input === undefined ? undefined : formatted(input)
-  const resultText = result === undefined ? undefined : formatted(result)
+  const rawResult = span.attributes.toolCallResult
+  const inputText = toolArgumentsDetail(input)
+  const modelResultText = modelResult === undefined ? undefined : formatted(modelResult)
+  const rawResultText = rawResult === undefined ? undefined : formatted(rawResult)
+  const resultText = modelResultText ?? rawResultText
   const nested = span.parentSpanId !== undefined && toolSpanIds.has(span.parentSpanId)
   const error = statusError(span)
   const description = span.attributes.toolDescription
@@ -870,7 +1025,11 @@ function toolCell(
     text: inputText === undefined ? name : `${name} · ${inputText.replace(/\s+/g, ' ').slice(0, 160)}`,
     callId,
     ...(inputText === undefined ? {} : { inputDetail: inputText }),
-    ...(resultText === undefined ? {} : { outputDetail: resultText, result: resultText }),
+    ...(modelResultText === undefined ? {} : { outputDetail: modelResultText }),
+    ...(rawResultText === undefined ? {} : { rawOutputDetail: rawResultText }),
+    // The row's preview prefers what the model read and falls back to the
+    // raw return, so a call whose tool message was not recorded still shows.
+    ...(resultText === undefined ? {} : { result: resultText }),
     ...(error === undefined ? {} : { isError: true, result: error }),
     ...(detail === undefined ? {} : { schemaDetail: detail }),
   }
@@ -1000,7 +1159,10 @@ function behaviorLineage(
   return lineage.reverse()
 }
 
-function behaviorSessionKey(span: ProjectedSpan, lineage: readonly string[]): string {
+function behaviorSessionKey(
+  span: Pick<ProjectedSpan, 'attributes' | 'traceId'>,
+  lineage: readonly string[],
+): string {
   const conversation = span.attributes.conversationId ?? `trace:${span.traceId}`
   const subject = span.attributes.executionSubjectId ?? 'legacy-main'
   return `${conversation}\u0000${subject}\u0000${lineage.join('/')}`
@@ -1009,7 +1171,6 @@ function behaviorSessionKey(span: ProjectedSpan, lineage: readonly string[]): st
 function compareInferenceBehavior(left: ProjectedSpan, right: ProjectedSpan): number {
   return compareBigint(left.startTimeUnixNano, right.startTimeUnixNano)
     || (left.requestNumber ?? 0) - (right.requestNumber ?? 0)
-    || (left.sourceSequence ?? 0) - (right.sourceSequence ?? 0)
     || left.traceId.localeCompare(right.traceId)
     || left.span.spanId.localeCompare(right.span.spanId)
 }
@@ -1026,7 +1187,10 @@ function executionSubjectKey(span: ProjectedSpan): string {
   return `${session}\u0000${subject}`
 }
 
-function assignSubjectRequestNumbers(spans: readonly ProjectedSpan[]): ProjectedSpan[] {
+function assignSubjectRequestNumbers(
+  spans: readonly ProjectedSpan[],
+  requestOffsets: ReadonlyMap<string, number>,
+): ProjectedSpan[] {
   const inferenceGroups = new Map<string, ProjectedSpan[]>()
   for (const span of spans) {
     if (!isInference(span)) continue
@@ -1036,13 +1200,15 @@ function assignSubjectRequestNumbers(spans: readonly ProjectedSpan[]): Projected
     inferenceGroups.set(key, group)
   }
   const displayNumberByIdentity = new Map<string, number>()
-  for (const group of inferenceGroups.values()) {
+  for (const [key, group] of inferenceGroups) {
+    // Requests retention removed still count: numbering continues after them.
+    const offset = requestOffsets.get(key) ?? 0
     const ordered = [...group].sort(comparePhysicalInference)
     const explicitNumbers = ordered.map(span => (
       positiveSafeInteger(span.attributes.executionSubjectRequestNumber)
     ))
     const hasCompleteMonotonicSequence = explicitNumbers.every((number, index) => (
-      number === index + 1
+      number === offset + index + 1
     ))
     for (const [index, span] of ordered.entries()) {
       // A partially upgraded or malformed subject must be rebuilt as one
@@ -1050,7 +1216,7 @@ function assignSubjectRequestNumbers(spans: readonly ProjectedSpan[]): Projected
       // otherwise create duplicates or gaps while a live archive is loading.
       const number = hasCompleteMonotonicSequence
         ? explicitNumbers[index] as number
-        : index + 1
+        : offset + index + 1
       displayNumberByIdentity.set(spanIdentity(span), number)
     }
   }
@@ -1205,9 +1371,34 @@ function promptCellProjections(
   return changed
 }
 
+interface InferenceInputMessages {
+  /** Every input message the request states. */
+  currentInputs: readonly StructuredMessage[]
+  /** Indexes of the request-scoped prompt attachments among them. */
+  attachmentIndexSet: ReadonlySet<number>
+  /** The ordinary messages a later request of the lineage is compared against. */
+  currentOrdinary: readonly IndexedMessage[]
+}
+
+function inferenceInputMessages(attributes: NormalizedTrajectoryAttributes): InferenceInputMessages {
+  const currentInputs = structuredMessages(attributes.inputMessages)
+  const attachmentIndexes = provenanceAttachmentIndexes(attributes.inputMessageProvenance)
+  const attachmentIndexSet = new Set(currentInputs.flatMap((message, index): number[] => {
+    const attachment = attachmentIndexes === undefined
+      ? legacyRequestScopedAttachment(message)
+      : attachmentIndexes.has(index)
+    return attachment ? [index] : []
+  }))
+  const currentOrdinary = currentInputs.flatMap((message, inputIndex): IndexedMessage[] => (
+    attachmentIndexSet.has(inputIndex) ? [] : [{ inputIndex, message }]
+  ))
+  return { currentInputs, attachmentIndexSet, currentOrdinary }
+}
+
 function projectInferenceInputs(
   spans: readonly ProjectedSpan[],
   v2InferenceIds: ReadonlySet<string>,
+  lineageSeeds: readonly TrajectoryLineageSeed[],
 ): {
   inputsBySpanId: ReadonlyMap<string, InferenceInputProjection>
   toolResultById: ReadonlyMap<string, ToolResultFact>
@@ -1222,13 +1413,26 @@ function projectInferenceInputs(
   const diagnostics: TrajectoryDiagnostic[] = []
   const spanByIdentity = new Map(spans.map(span => [spanIdentity(span), span]))
 
+  // Requests retention removed leave what the next request of their root
+  // lineage is compared against, and nothing else: they render no cell and
+  // lend no tool result.
+  for (const seed of lineageSeeds) {
+    const span = soleSpan(seed.record)
+    const attributes = normalizeTrajectoryAttributes(span.attributes)
+    const sessionKey = behaviorSessionKey({ attributes, traceId: span.traceId }, [])
+    previousOutputsBySession.set(sessionKey, structuredMessages(attributes.outputMessages))
+    if (seed.handledByV2) continue
+    const prompt = promptSnapshot(attributes)
+    if (prompt !== undefined) previousPromptBySession.set(sessionKey, prompt)
+    previousInputsBySession.set(sessionKey, inferenceInputMessages(attributes).currentOrdinary)
+  }
+
   for (const span of spans.filter(isInference).sort(compareInferenceBehavior)) {
     const lineage = behaviorLineage(span, spanByIdentity)
     const sessionKey = behaviorSessionKey(span, lineage)
     const parentSessionKey = lineage.length === 0
       ? undefined
       : behaviorSessionKey(span, lineage.slice(0, -1))
-    const currentInputs = structuredMessages(span.attributes.inputMessages)
     const handledByV2 = v2InferenceIds.has(span.span.spanId)
       || (span.attributes.inferenceId !== undefined
         && v2InferenceIds.has(span.attributes.inferenceId))
@@ -1239,16 +1443,7 @@ function projectInferenceInputs(
     }
     const previousInputs = previousInputsBySession.get(sessionKey)
       ?? (parentSessionKey === undefined ? [] : previousInputsBySession.get(parentSessionKey) ?? [])
-    const attachmentIndexes = provenanceAttachmentIndexes(span.attributes.inputMessageProvenance)
-    const attachmentIndexSet = new Set(currentInputs.flatMap((message, index): number[] => {
-      const attachment = attachmentIndexes === undefined
-        ? legacyRequestScopedAttachment(message)
-        : attachmentIndexes.has(index)
-      return attachment ? [index] : []
-    }))
-    const currentOrdinary = currentInputs.flatMap((message, inputIndex): IndexedMessage[] => (
-      attachmentIndexSet.has(inputIndex) ? [] : [{ inputIndex, message }]
-    ))
+    const { currentInputs, attachmentIndexSet, currentOrdinary } = inferenceInputMessages(span.attributes)
     const insertedIndexes = lcsInsertedInputIndexes(previousInputs, currentOrdinary)
     const replayableOutputs = [...(
       previousOutputsBySession.get(sessionKey)
@@ -1323,51 +1518,61 @@ function projectInferenceInputs(
   return { inputsBySpanId, toolResultById, toolResultBySpanId, diagnostics }
 }
 
-/** One model call a compaction spent, stated as its own cell. */
-function compactionAttemptCell(span: ProjectedSpan, attempt: number): TrajectoryCell {
+/**
+ * Mark one model call a compaction spent that no compaction event accounts for.
+ *
+ * The call is not a reply, so it takes no assistant row. It marks its request
+ * instead, and the request detail holds what the call recorded. A call that a
+ * compaction.completed event names needs no marker of its own: the event's
+ * COMPACTED cell already marks that request.
+ */
+function compactionRequestCell(span: ProjectedSpan): TrajectoryCell {
   const error = statusError(span)
-  const usageValue = usage(span.attributes)
-  const label = `Attempt ${attempt}`
   return {
-    ...spanCellBase(span, `compaction-attempt-${attempt}`),
-    kind: 'message',
-    text: error === undefined ? `${label} · summarized` : `${label} · failed`,
-    ...(error === undefined ? {} : { isError: true, result: error }),
-    assistantMetrics: {
-      timingRecorded: true,
-      streaming: span.attributes.requestStream ?? null,
-      stepStartTime: startedAt(span),
-      ...(usageValue === undefined ? {} : { usage: usageValue }),
+    ...spanCellBase(span, 'compaction-request'),
+    kind: 'compacted',
+    text: '',
+    requestOnly: true,
+    messageSource: {
+      kind: 'trajectory_compaction_request',
+      ...(span.attributes.contextOperationId === undefined
+        ? {}
+        : { operationId: span.attributes.contextOperationId }),
+      ...(span.attributes.inferenceId === undefined
+        ? {}
+        : { inferenceId: span.attributes.inferenceId }),
     },
+    ...(error === undefined ? {} : { isError: true, result: error }),
   } as TrajectoryCell
 }
 
-/** Title one compaction by its number, so a reader can place it in the run. */
-function compactionGroupTitle(attempts: readonly ProjectedSpan[]): string {
-  const numbered = attempts
-    .map(span => positiveSafeInteger(span.attributes.compactionNumber))
-    .find(value => value !== undefined)
-  return numbered === undefined ? 'Compaction' : `Compaction #${numbered}`
-}
-
-function compactionCell(span: ProjectedSpan, inference: ProjectedSpan | undefined): TrajectoryCell {
-  const summary = span.attributes.compactionSummary
-    ?? (inference === undefined
-      ? undefined
-      : structuredMessages(inference.attributes.outputMessages).flatMap(message => message.parts)
-        .flatMap(part => part.type === 'compaction' && part.content !== undefined ? [part.content] : [])
-        .join('\n\n'))
-    ?? ''
-  const inputTokens = nonNegativeSafeInteger(span.attributes.compactionInputTokens)
-  const error = statusError(span)
-  return {
-    ...spanCellBase(span, 'compaction'),
-    kind: 'compacted',
-    text: summary === '' ? 'Context compaction' : summary,
-    outputDetail: summary,
-    ...(inputTokens === undefined ? {} : { input: inputTokens }),
-    ...(error === undefined ? {} : { isError: true, result: error }),
+/**
+ * Split compaction cells into one group per compaction operation.
+ *
+ * One run can compact more than once: a manual /compact runs every processor
+ * that applies, and each one is a compaction of its own with its own model
+ * calls and outcome. Each becomes a group titled by its number, its request
+ * markers ahead of its outcome.
+ */
+function compactionGroups(
+  cells: readonly TrajectoryCell[],
+  numberByOperationId: ReadonlyMap<string, number>,
+): TrajectoryGroupModel[] {
+  const cellsByOperationId = new Map<string, TrajectoryCell[]>()
+  for (const cell of [...cells].sort(compareTrajectoryCells)) {
+    const source = object(cell.messageSource)
+    const operationId = typeof source?.operationId === 'string' ? source.operationId : ''
+    const operationCells = cellsByOperationId.get(operationId) ?? []
+    operationCells.push(cell)
+    cellsByOperationId.set(operationId, operationCells)
   }
+  return [...cellsByOperationId].map(([operationId, operationCells]) => {
+    const number = numberByOperationId.get(operationId)
+    return {
+      title: number === undefined ? 'Compaction' : `Compaction #${number}`,
+      cells: operationCells,
+    }
+  })
 }
 
 function requestFor(
@@ -1382,7 +1587,9 @@ function requestFor(
   const facts = recordedFacts(span.attributes, rootAttributes)
   const base = {
     recordId: requestRecordIdentity(span),
-    seq: span.sourceSequence,
+    // The request's own record, so its raw data stays reachable from the
+    // request detail even when no row in the trajectory carries it.
+    traceDetail: span.request,
     group: purpose === 'compaction' ? 'Compaction' : `Step ${step}`,
     number: requestNumber,
     status: status(span),
@@ -1391,8 +1598,6 @@ function requestFor(
       ? null
       : Number(span.endTimeUnixNano / NANOSECONDS_PER_MILLISECOND),
     ...(statusError(span) === undefined ? {} : { error: statusError(span) }),
-    retry: nonNegativeSafeInteger(span.attributes.requestRetryCount),
-    maxRetries: nonNegativeSafeInteger(span.attributes.requestMaxRetries),
     provider: span.attributes.providerName,
     model: knownModel(span.attributes.requestModel, span.attributes.responseModel),
     requestConfig: requestConfig(span.attributes),
@@ -1413,53 +1618,87 @@ function requestFor(
 // A turn is one complete ReAct loop, and it can span several traces: when the
 // agent stops to ask (ask_user / permission / confirm), the answer arrives as
 // its own request and runs in its own trace while continuing the same loop.
+// It can also share a trace with other turns: a Team run keeps one trace for
+// every member, and each member takes on several turns inside it.
 //
 // Everything here is read from what the spans state. `openjiuwen.turn.id` is
-// the identity — traces sharing one are one turn however they are numbered, and
-// traces with different ids stay apart even if they claim the same number.
-// `openjiuwen.turn.number` is only what the turn is shown as. Traces predating
-// turn ids fall back to the number as identity, and a trace stating neither
-// belongs to no turn at all (a span opened outside any loop, such as a manual
-// /compact) and stands alone.
+// the identity, and it is read per span — spans sharing one are one turn
+// whichever traces they sit in and however they are numbered, and spans with
+// different ids stay apart even inside one trace or when they claim the same
+// number. `openjiuwen.turn.number` is only what the turn is shown as. A span
+// that states no id takes its nearest ancestor's, then the id its trace states
+// when the trace states exactly one. Traces predating turn ids fall back to the
+// number as identity, and a trace stating neither belongs to no turn at all (a
+// span opened outside any loop, such as a manual /compact) and stands alone.
 //
 // Schema-v2 events and legacy spans are projected down separate paths but share
 // one turn axis, so this is resolved once over every record and handed to both.
-function turnFactByTrace(
+function resolveTurns(
   records: readonly OtlpExportTraceServiceRequest[],
-): Map<string, TurnFact> {
-  const turnIdByTrace = new Map<string, string>()
+  checkpoint: TrajectoryProjectionCheckpoint['turns'] | undefined,
+): TurnIndex {
+  const statedById = new Map<string, { parentSpanId?: string, turnId?: string }>()
+  // Turn ids of removed turns still count for the traces they were stated in,
+  // so a span naming no turn stays apart from the turns its trace kept.
+  const turnIdsByTrace = new Map<string, Set<string>>(
+    [...checkpoint?.traceTurnIds ?? []].map(([traceId, turnIds]) => [traceId, new Set(turnIds)]),
+  )
   const numberByTrace = new Map<string, number>()
-  const traceStarts = new Map<string, bigint>()
-  for (const record of records) {
+  const spans = records.map((record) => {
     const span = soleSpan(record)
     const attributes = normalizeTrajectoryAttributes(span.attributes)
-    if (attributes.turnId !== undefined && !turnIdByTrace.has(span.traceId)) {
-      turnIdByTrace.set(span.traceId, attributes.turnId)
+    const recordId = `${span.traceId}:${span.spanId}`
+    statedById.set(recordId, { parentSpanId: span.parentSpanId, turnId: attributes.turnId })
+    if (attributes.turnId !== undefined) {
+      const turnIds = turnIdsByTrace.get(span.traceId) ?? new Set<string>()
+      turnIds.add(attributes.turnId)
+      turnIdsByTrace.set(span.traceId, turnIds)
     }
     const stated = positiveSafeInteger(attributes.turnNumber)
     if (stated !== undefined) numberByTrace.set(span.traceId, stated)
-    const startedAt = BigInt(span.startTimeUnixNano)
-    const prior = traceStarts.get(span.traceId)
-    if (prior === undefined || startedAt < prior) traceStarts.set(span.traceId, startedAt)
-  }
-  const keyByTrace = new Map([...traceStarts.keys()].map((traceId): [string, string] => {
-    const turnId = turnIdByTrace.get(traceId)
-    if (turnId !== undefined) return [traceId, `id:${turnId}`]
+    return { recordId, span, stated, startedAt: BigInt(span.startTimeUnixNano) }
+  })
+  const traceKey = (traceId: string): string => {
+    const turnIds = [...turnIdsByTrace.get(traceId) ?? []]
+    if (turnIds.length === 1) return `id:${turnIds[0]}`
+    // A trace holding several turns cannot vouch for a span that names none.
+    if (turnIds.length > 1) return `trace:${traceId}`
     const stated = numberByTrace.get(traceId)
-    return [traceId, stated === undefined ? `trace:${traceId}` : `number:${stated}`]
-  }))
+    return stated === undefined ? `trace:${traceId}` : `number:${stated}`
+  }
+  const ancestorTurnId = (traceId: string, parentSpanId: string | undefined): string | undefined => {
+    const visited = new Set<string>()
+    let current = parentSpanId
+    while (current !== undefined && !visited.has(current)) {
+      visited.add(current)
+      const stated = statedById.get(`${traceId}:${current}`)
+      if (stated === undefined) return undefined
+      if (stated.turnId !== undefined) return stated.turnId
+      current = stated.parentSpanId
+    }
+    return undefined
+  }
+  const keyByRecord = new Map<string, string>()
   const numberByKey = new Map<string, number>()
   const startByKey = new Map<string, bigint>()
-  for (const [traceId, startedAt] of traceStarts) {
-    const key = keyByTrace.get(traceId) ?? `trace:${traceId}`
+  for (const { recordId, span, stated, startedAt } of spans) {
+    const turnId = statedById.get(recordId)?.turnId ?? ancestorTurnId(span.traceId, span.parentSpanId)
+    const key = turnId === undefined ? traceKey(span.traceId) : `id:${turnId}`
+    keyByRecord.set(recordId, key)
     const prior = startByKey.get(key)
     if (prior === undefined || startedAt < prior) startByKey.set(key, startedAt)
-    const stated = numberByTrace.get(traceId)
-    if (stated !== undefined) numberByKey.set(key, stated)
+    if (key.startsWith('number:')) {
+      numberByKey.set(key, numberByTrace.get(span.traceId) ?? 1)
+    } else if (key.startsWith('id:') && stated !== undefined) {
+      numberByKey.set(key, stated)
+    }
   }
   // Only a turn that states no number of its own gets one here, and it is
   // placed after every stated number so it can never take one of theirs.
-  let unnumbered = Math.max(0, ...numberByKey.values())
+  // Removed turns keep their numbers: stated ones raise the floor, and the
+  // unnumbered ones were counted before any that remain.
+  let unnumbered = Math.max(0, checkpoint?.maxNumber ?? 0, ...numberByKey.values())
+    + (checkpoint?.unnumbered ?? 0)
   for (const [key] of [...startByKey].sort((left, right) =>
     compareBigint(left[1], right[1]) || left[0].localeCompare(right[0]))) {
     if (!numberByKey.has(key)) {
@@ -1467,18 +1706,29 @@ function turnFactByTrace(
       numberByKey.set(key, unnumbered)
     }
   }
-  return new Map([...traceStarts.keys()].map((traceId): [string, TurnFact] => {
-    const key = keyByTrace.get(traceId) ?? `trace:${traceId}`
-    return [traceId, { key, number: numberByKey.get(key) ?? 1 }]
-  }))
+  const byKey = new Map([...startByKey].map(([key, startedAt]): [string, TurnFact] => [key, {
+    key,
+    number: numberByKey.get(key) ?? 1,
+    stated: !key.startsWith('trace:'),
+    startedAt,
+  }]))
+  const factFor = (key: string): TurnFact | undefined => byKey.get(key)
+  return {
+    byKey,
+    forRecord: (traceId, spanId) => {
+      const key = keyByRecord.get(`${traceId}:${spanId}`)
+      return key === undefined ? undefined : factFor(key)
+    },
+    forTurn: (traceId, turnId) => factFor(turnId === undefined ? traceKey(traceId) : `id:${turnId}`),
+  }
 }
 
 function assignTurns(
   spans: readonly Omit<ProjectedSpan, 'turn' | 'turnKey'>[],
-  turnByTrace: ReadonlyMap<string, TurnFact>,
+  turns: TurnIndex,
 ): ProjectedSpan[] {
   return spans.map(span => {
-    const fact = turnByTrace.get(span.traceId)
+    const fact = turns.forRecord(span.traceId, span.span.spanId)
     return {
       ...span,
       turn: fact?.number ?? 1,
@@ -1490,7 +1740,7 @@ function assignTurns(
 function normalize(
   records: readonly OtlpExportTraceServiceRequest[],
   options: TrajectoryProjectionOptions,
-  turnByTrace: ReadonlyMap<string, TurnFact>,
+  turns: TurnIndex,
 ): ProjectedSpan[] {
   const spans = assignTurns(records.map((record): Omit<ProjectedSpan, 'turn' | 'turnKey'> => {
     const span = soleSpan(record)
@@ -1507,7 +1757,6 @@ function normalize(
       endTimeUnixNano: lifecycle === 'running' || span.endTimeUnixNano === undefined
         ? undefined
         : BigInt(span.endTimeUnixNano),
-      sourceSequence: nonNegativeSafeInteger(attributes.sourceSequence),
       identityRequestNumber: positiveSafeInteger(attributes.requestNumber),
       requestNumber: undefined,
       streamEvents: normalizeTrajectoryStreamEvents(span.events),
@@ -1516,8 +1765,8 @@ function normalize(
         ?? NO_UNRESOLVED_ATTRIBUTES,
       lifecycle,
     }
-  }), turnByTrace).sort(compareSpans)
-  const numbered = assignSubjectRequestNumbers(spans)
+  }), turns).sort(compareSpans)
+  const numbered = assignSubjectRequestNumbers(spans, options.checkpoint?.requestOffsets ?? new Map())
   return assignRequestOwnership(numbered)
 }
 
@@ -1725,11 +1974,14 @@ export function projectOtelTrajectory(
   const v2InferenceIds = new Set(v2Subjects.flatMap(subject => (
     [...subject.handledInferenceIds]
   )))
-  const turnByTrace = turnFactByTrace(records)
-  const spans = normalize(legacyRecords, options, turnByTrace)
+  const turnIndex = resolveTurns(records, options.checkpoint?.turns)
+  const spans = normalize(legacyRecords, options, turnIndex)
   const mutableTurns = new Map<string, MutableTurn>()
   const requests: TrajectoryRequest[] = []
-  const inputProjection = projectInferenceInputs(spans, v2InferenceIds)
+  const inputProjection = projectInferenceInputs(spans, v2InferenceIds, options.checkpoint?.lineage ?? [])
+  const modelToolResultByCallId = new Map(v2Subjects.flatMap(subject => (
+    [...subject.modelToolResults]
+  )))
   const toolSpanIds = new Set(spans.filter(isTool).map(span => span.span.spanId))
   const toolBySpanId = new Map(spans.filter(isTool).map(span => [span.span.spanId, span]))
   const authoritativeToolCallIds = new Set(spans
@@ -1750,8 +2002,22 @@ export function projectOtelTrajectory(
       )
     ) rootByTrace.set(span.traceId, span)
   }
+  // The span each turn ran on. A turn that failed before its first model call
+  // recorded nothing else, and this is what states why it ended.
+  const turnRootByKey = new Map<string, ProjectedSpan>()
+  for (const span of spans) {
+    if (recordKind(span) !== 'turn') continue
+    const existing = turnRootByKey.get(span.turnKey)
+    if (existing === undefined || span.startTimeUnixNano < existing.startTimeUnixNano) {
+      turnRootByKey.set(span.turnKey, span)
+    }
+  }
   const compactionInferences = new Map<string, ProjectedSpan[]>()
-  const compactions = new Map<string, ProjectedSpan>()
+  // The number each compaction operation was given, read from its model calls.
+  const compactionNumberByOperationId = new Map<string, number>()
+  // Turns that made a conversational model call. A run that names no turn and
+  // made none of these ran outside every turn.
+  const conversationTurnKeys = new Set<string>()
   const toolSchemaByTurnAndName = new Map<string, string>()
   const inferenceById = new Map(spans.filter(isInference).flatMap((span): Array<[
     string,
@@ -1786,6 +2052,10 @@ export function projectOtelTrajectory(
         const attempts = compactionInferences.get(span.turnKey) ?? []
         attempts.push(span)
         compactionInferences.set(span.turnKey, attempts)
+        const compactionNumber = positiveSafeInteger(span.attributes.compactionNumber)
+        if (span.attributes.contextOperationId !== undefined && compactionNumber !== undefined) {
+          compactionNumberByOperationId.set(span.attributes.contextOperationId, compactionNumber)
+        }
         requests.push(requestFor(
           span,
           'compaction',
@@ -1794,6 +2064,7 @@ export function projectOtelTrajectory(
         ))
         continue
       }
+      conversationTurnKeys.add(span.turnKey)
       const target = group(turn, step, span.attributes.stepId, startedAt(span))
       const inputs = inputProjection.inputsBySpanId.get(span.span.spanId)
         ?? { messages: [], prompts: [] }
@@ -1837,22 +2108,32 @@ export function projectOtelTrajectory(
         && authoritativeToolCallIds.has(`${span.traceId}\u0000${span.attributes.toolCallId}`)
       ) continue
       const name = span.attributes.toolName ?? span.span.name
-      const correlatedResult = span.attributes.toolCallId === undefined
-        ? inputProjection.toolResultBySpanId.get(span.span.spanId)
-        : inputProjection.toolResultById.get(`${span.traceId}\u0000${span.attributes.toolCallId}`)
+      // What the model was given for this call: the tool message of the first
+      // request that read it. Joined by tool call id; a call with no id has
+      // only the legacy input projection's positional match.
+      const modelResult = span.attributes.toolCallId === undefined
+        ? inputProjection.toolResultBySpanId.get(span.span.spanId)?.response
+        : modelToolResultByCallId.get(span.attributes.toolCallId)
+          ?? inputProjection.toolResultById.get(`${span.traceId}\u0000${span.attributes.toolCallId}`)?.response
       group(turn, step, span.attributes.stepId, startedAt(span)).cells.push(toolCell(
         span,
         toolSpanIds,
         toolSchemaByTurnAndName.get(`${span.turnKey}\u0000${name}`),
-        correlatedResult,
+        modelResult,
       ))
       continue
     }
-    if (isCompaction(span)) compactions.set(span.turnKey, span)
   }
 
   const v2CompactionEvents: TrajectoryV2EventProjection[] = []
+  // Model calls a schema-v2 cell already marks, by trace and inference id.
+  const markedInferenceKeys = new Set<string>()
   for (const event of v2Subjects.flatMap(subject => [...subject.events])) {
+    for (const cell of event.cells) {
+      if (cell.physicalInferenceId !== undefined) {
+        markedInferenceKeys.add(`${event.traceId}\u0000${cell.physicalInferenceId}`)
+      }
+    }
     if (event.turn === null) {
       v2CompactionEvents.push(event)
       continue
@@ -1868,10 +2149,10 @@ export function projectOtelTrajectory(
         ? undefined
         : inferenceByToolCallId.get(`${event.traceId}\u0000${askUserCallId}`)
       : inferenceById.get(`${event.traceId}\u0000${anchorInferenceId}`)
-    // The turn this event's own trace states, so v2 events and legacy spans
-    // land on one axis. An anchoring inference already carries the resolved
+    // The turn this event states (its trace's, when it states none), so v2
+    // events and legacy spans land on one axis. An anchoring inference already carries the resolved
     // turn, so prefer it and keep the event beside the request it belongs to.
-    const eventFact = turnByTrace.get(event.traceId)
+    const eventFact = turnIndex.forTurn(event.traceId, event.turnId)
     const eventTurnKey = inference?.turnKey ?? eventFact?.key ?? `trace:${event.traceId}`
     const eventTurnNumber = inference?.turn ?? eventFact?.number ?? event.turn
     const eventStep = inference === undefined
@@ -1925,9 +2206,13 @@ export function projectOtelTrajectory(
   }
 
   const turns: TrajectoryTurnModel[] = []
+  const turnEntries: TimedTurnEntry[] = []
+  const betweenTurnEntries: TimedTurnEntry[] = []
   const orderedTurns = [...mutableTurns.entries()]
     .sort((left, right) => left[1].turn - right[1].turn || left[0].localeCompare(right[0]))
   for (const [turnKey, turn] of orderedTurns) {
+    const fact = turnIndex.byKey.get(turnKey)
+    const startedAt = fact?.startedAt ?? 0n
     const groups = [...turn.groups.entries()]
       .sort((left, right) => left[1].order - right[1].order
         || left[1].step - right[1].step
@@ -1938,25 +2223,55 @@ export function projectOtelTrajectory(
         cells: [...value.cells].sort(compareTrajectoryCells),
       }))
       .filter(value => value.cells.length > 0)
-    if (groups.length > 0) turns.push({ turn: turn.turn, groups })
-    const compaction = compactions.get(turnKey)
-    const attempts = compactionInferences.get(turnKey) ?? []
-    if (compaction !== undefined || attempts.length > 0) {
-      const ordered = [...attempts].sort(comparePhysicalInference)
-      // The attempts come first and the outcome last, so the group reads as
-      // what the compaction actually did rather than only how it ended.
-      const cells = [
-        ...ordered.map((span, index) => compactionAttemptCell(span, index + 1)),
-        ...(compaction === undefined
-          ? []
-          : [compactionCell(compaction, ordered[ordered.length - 1])]),
-      ]
-      turns.push({
-        turn: null,
-        groups: [{ title: compactionGroupTitle(ordered), cells }],
+    // Every attempt is kept, as a marker on its request, unless a compaction
+    // event already marks that request.
+    const requestCells = (compactionInferences.get(turnKey) ?? [])
+      .filter(span => !markedInferenceKeys.has(`${span.traceId}\u0000${span.attributes.inferenceId}`))
+      .sort(comparePhysicalInference)
+      .map(compactionRequestCell)
+    if (fact?.stated === false && !conversationTurnKeys.has(turnKey)) {
+      // A run that names no turn and made no conversational model call ran
+      // outside every turn, such as a manual /compact. It takes no turn
+      // number of its own: it shows between the turns it happened between,
+      // and the context it rewrote shows at the next request that reads it.
+      const runCells = [...requestCells, ...groups.flatMap(value => value.cells)]
+      const betweenGroups = runCells.some(cell => cell.kind === 'compacted')
+        ? compactionGroups(runCells, compactionNumberByOperationId)
+        : groups
+      if (betweenGroups.length > 0) {
+        betweenTurnEntries.push({ startedAt, model: { turn: null, groups: betweenGroups } })
+      }
+      continue
+    }
+    // A turn that ended in failure shows it, whether it failed on its first
+    // call or after several that answered.
+    const turnGroups = withTurnFailure(
+      groups,
+      failedTurnCells(turnRootByKey.get(turnKey), groups.length === 0),
+    )
+    if (turnGroups.length > 0) {
+      turnEntries.push({ startedAt, model: { turn: turn.turn, groups: turnGroups } })
+    }
+    if (requestCells.length > 0) {
+      turnEntries.push({
+        startedAt,
+        model: { turn: null, groups: compactionGroups(requestCells, compactionNumberByOperationId) },
       })
     }
   }
+  // Turns keep their numbered order. A run outside every turn goes ahead of
+  // the first turn that began after it.
+  betweenTurnEntries.sort((left, right) => compareBigint(left.startedAt, right.startedAt))
+  let nextBetweenTurnEntry = 0
+  for (const entry of turnEntries) {
+    while (nextBetweenTurnEntry < betweenTurnEntries.length
+      && betweenTurnEntries[nextBetweenTurnEntry].startedAt < entry.startedAt) {
+      turns.push(betweenTurnEntries[nextBetweenTurnEntry].model)
+      nextBetweenTurnEntry += 1
+    }
+    turns.push(entry.model)
+  }
+  turns.push(...betweenTurnEntries.slice(nextBetweenTurnEntry).map(entry => entry.model))
   for (const event of v2CompactionEvents) {
     if (event.cells.length === 0) continue
     turns.push({

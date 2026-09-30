@@ -6,7 +6,8 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { HelpCircle, Upload } from 'lucide-react';
-import { ModalCloseButton, TopAnchorTooltip } from './SkillPanelWidgets';
+import { TopAnchorTooltip } from './SkillPanelWidgets';
+import { CloseButton } from '../ui';
 
 interface DocToSkillModalProps {
   onCreateFromKnowledge: (params: { file?: File | null; link?: string; skillDescription?: string }) => void;
@@ -37,16 +38,16 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
           style={{ width: '550px' }}
         >
           {/* 头部 */}
-          <div className="flex items-center justify-between gap-3 px-5 pt-3 pb-0 bg-panel">
+          <div className="flex items-center justify-between gap-3 px-6 pt-6 bg-panel">
             <span className="text-lg font-semibold text-text-strong">{t('skills.docToSkillModal.title')}</span>
-            <ModalCloseButton onClick={onClose} label={t('skills.docToSkillModal.cancel')} />
+            <CloseButton onClick={onClose} />
           </div>
           {/* 副标题 */}
-          <div className="px-5">
+          <div className="px-6">
             <span className="text-xs text-text-muted">{t('skills.docToSkillModal.subtitle')}</span>
           </div>
           {/* 来源 */}
-          <div className="px-5 pt-4">
+          <div className="px-6 pt-4">
             <span className="block text-sm font-medium text-text mb-2">{t('skills.docToSkillModal.sourceLabel')}</span>
             <div className="flex items-center gap-4">
               <label className="flex items-center gap-1.5 cursor-pointer">
@@ -71,7 +72,7 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
           </div>
           {/* 本地上传 */}
           {docToSkillSource === 'local' && (
-            <div className="px-5 pt-3">
+            <div className="px-6 pt-4">
               <label
                 onDragOver={(e) => {
                   e.preventDefault();
@@ -84,7 +85,7 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
                     setDocToSkillFile(file);
                   }
                 }}
-                className="flex flex-col items-center justify-center gap-2 rounded-[12px] border border-dashed border-border cursor-pointer bg-[var(--color-skill-dropzone-surface)] hover:bg-[var(--color-skill-dropzone-hover-surface)]"
+                className="flex flex-col items-center justify-center gap-2 rounded-[12px] border-[1.25px] border-dashed border-[var(--color-text-divider)] cursor-pointer bg-[var(--color-skill-dropzone-surface)] hover:bg-[var(--color-skill-dropzone-hover-surface)]"
                 style={{ width: '502px', height: '160px' }}
               >
                 <Upload className="w-6 h-6 text-text-muted" />
@@ -107,7 +108,7 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
           )}
           {/* 链接 */}
           {docToSkillSource === 'link' && (
-            <div className="px-5 pt-3">
+            <div className="px-6 pt-4">
               <div className="flex items-center gap-1.5 mb-2">
                 <span className="text-sm font-medium text-text">{t('skills.docToSkillModal.linkLabel')}</span>
                 <span
@@ -116,7 +117,7 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
                     setDocToSkillTooltip({ left: rect.left + rect.width / 2, top: rect.top });
                   }}
                   onMouseLeave={() => setDocToSkillTooltip(null)}
-                  className="w-4 h-4 flex items-center justify-center text-text-muted cursor-help"
+                  className="w-4 h-4 flex items-center justify-center text-text-muted cursor-default"
                 >
                   <HelpCircle className="h-4 w-4" />
                 </span>
@@ -126,28 +127,31 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
                 value={docToSkillLink}
                 onChange={(e) => setDocToSkillLink(e.target.value)}
                 placeholder={t('skills.docToSkillModal.linkPlaceholder')}
-                className="w-full px-3 py-2 rounded-[6px] border border-border bg-panel text-sm text-text"
+                data-testid="skill-panel-doc-link-input"
+                className="w-full px-3 py-2 rounded-[6px] border border-input-strong bg-panel text-sm text-text"
                 style={{ maxWidth: '502px' }}
               />
             </div>
           )}
           {/* 技能描述 */}
-          <div className="px-5 pt-4">
+          <div className="px-6 pt-4">
             <span className="block text-sm font-medium text-text mb-1.5">{t('skills.docToSkillModal.descLabel')}</span>
             <input
               type="text"
               value={docToSkillDesc}
               onChange={(e) => setDocToSkillDesc(e.target.value)}
               placeholder={t('skills.docToSkillModal.descPlaceholder')}
-              className="w-full px-3 py-2 rounded-[6px] border border-border bg-panel text-sm text-text"
+              data-testid="skill-panel-doc-desc-input"
+              className="w-full px-3 py-2 rounded-[6px] border border-input-strong bg-panel text-sm text-text"
               style={{ maxWidth: '502px' }}
             />
           </div>
           {/* 底部按钮 */}
-          <div className="flex items-center justify-end gap-3 px-5 pt-4 pb-4 bg-panel">
+          <div className="flex items-center justify-end gap-3 px-6 pt-4 pb-4 bg-panel">
             <button
               type="button"
               onClick={onClose}
+              data-testid="skill-panel-doc-cancel-btn"
               className="flex items-center justify-center rounded-[16px] text-sm text-control-emphasis bg-card border border-control-emphasis hover:bg-secondary/30 whitespace-nowrap"
               style={{ height: '32px', padding: '0 32px' }}
             >
@@ -156,6 +160,7 @@ export function DocToSkillModal({ onCreateFromKnowledge, onClose }: DocToSkillMo
             <button
               type="button"
               disabled={isDocConfirmDisabled}
+              data-testid="skill-panel-doc-confirm-btn"
               onClick={() => {
                 const file = docToSkillFile;
                 const link = docToSkillLink;

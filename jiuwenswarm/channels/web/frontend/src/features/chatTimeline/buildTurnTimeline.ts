@@ -1,7 +1,7 @@
 /**
  * 对话轮次时间线纯函数：live / history / FileViewer 共用同一套排序与折叠分组逻辑。
  */
-import type { Message, ToolExecution } from '../../types';
+import type { Message, OutputOrder, ToolExecution } from '../../types';
 import type { ReasoningSegment } from '../../stores/chatStore';
 import { getMessageActor } from '../../components/ChatPanel/MessageItem';
 import {
@@ -83,6 +83,7 @@ export type RenderItem =
       type: 'turnSummary';
       key: string;
       turnId: number;
+      executionTurnId?: number;
       startMs: number;
       endMs: number;
       /** 工作活动跨度（工具/思考/助手气泡），不含用户消息，供「已完成」耗时 */
@@ -101,7 +102,23 @@ export function toTimestampMs(value: string | undefined): number {
   return parseTimestampToMs(value);
 }
 
+function getTimelineOutputOrder(item: TimelineItem): OutputOrder | undefined {
+  switch (item.type) {
+    case 'message':
+      return item.message.outputOrder;
+    case 'reasoning':
+      return item.segment.outputOrder;
+    case 'toolExecution':
+      return item.execution.outputOrder;
+  }
+}
+
 function compareTimelineItems(a: TimelineItem, b: TimelineItem): number {
+  const aOrder = getTimelineOutputOrder(a);
+  const bOrder = getTimelineOutputOrder(b);
+  if (aOrder && bOrder && aOrder.requestId === bOrder.requestId && aOrder.sequence !== bOrder.sequence) {
+    return aOrder.sequence - bOrder.sequence;
+  }
   const aTsValid = Number.isFinite(a.timestampMs);
   const bTsValid = Number.isFinite(b.timestampMs);
   if (aTsValid && bTsValid && a.timestampMs !== b.timestampMs) {
@@ -148,6 +165,8 @@ export function buildTimelineItems(
     segment,
   }));
 
+  // Every user message is a chronological boundary. Never move a supplement
+  // ahead of assistant text that was already visible when it was sent.
   return [...messageItems, ...executionItems, ...reasoningItems].sort(compareTimelineItems);
 }
 
@@ -461,7 +480,11 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
   let hasActivity = false;
   let hasWork = false;
   let turnId = 0;
-  let seq = 0;
+  let executionTurnId = 0;
+  // 已完成轮次锚定该轮最后一个业务项：历史页从半轮开始时，后续只会在它前面
+  // 补数据，末项不会变化。进行中轮次仍锚定 user，避免流式追加时反复换 key。
+  let summaryAnchorKey: string | null = null;
+  let runningTurnAnchorKey: string | null = null;
   // 时间行插入点：本轮首条 assistant 内容之前（视觉上位于头像下第一行）。
   let turnContentStart = 0;
   // 空窗轮（只有 user 消息、无任何活动）透传给下一轮的起点。
@@ -484,10 +507,17 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
     // 分支），否则那一轮从首次思考才开始算，耗时显示成 0s。
     const carryTimestamps = !hasActivity;
     if (shouldShow && Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      const anchorKey = isLastTurn && isProcessing
+        ? runningTurnAnchorKey ?? summaryAnchorKey
+        : summaryAnchorKey;
+      if (anchorKey === null) {
+        throw new Error('Turn summary is missing its stable timeline anchor');
+      }
       const summary: Extract<RenderItem, { type: 'turnSummary' }> = {
         type: 'turnSummary',
-        key: `turn-summary-${seq}`,
+        key: `turn-summary-${anchorKey}`,
         turnId,
+        executionTurnId,
         startMs,
         endMs,
         workStartMs: Number.isFinite(workStartMs) ? workStartMs : startMs,
@@ -496,7 +526,6 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
         hasWork,
         showAvatar: false,
       };
-      seq += 1;
       // 时间行统一挂到本轮内容顶部：接管首条 leader/助手内容的顶部头像（与折叠条同规则）；
       // 成员自己的头像不动，时间行不带头像直接排在成员消息上方。
       const firstContent = out[turnContentStart];
@@ -523,12 +552,15 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
     workEndMs = Number.NEGATIVE_INFINITY;
     hasActivity = false;
     hasWork = false;
+    summaryAnchorKey = null;
+    runningTurnAnchorKey = null;
   };
 
   for (const item of items) {
     if (item.type === 'message' && item.message.role === 'user') {
       flush(false);
       turnId += 1;
+      if (!item.message.supplementalInput) executionTurnId = turnId;
       // 空窗起点仅并入「设目标」消息开启的轮次：goal 插队时上一提问与设目标同属一次
       // 交互流程，本轮耗时从上一提问算起；普通新提问（哪怕只隔几分钟）与上一条空窗
       // 提问无关，不继承起点，避免把无关/跨会话等待算进本轮「已完成」耗时。
@@ -538,6 +570,8 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
       carriedStartMs = Number.POSITIVE_INFINITY;
       acc(toTimestampMs(item.message.timestamp), false);
       out.push(item);
+      summaryAnchorKey = item.key;
+      runningTurnAnchorKey = item.key;
       turnContentStart = out.length;
       continue;
     }
@@ -562,6 +596,8 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
       turnId += 1;
       startsOwnBlock = true;
     }
+    // 记录本轮当前末项。历史前插不会改变它，因此已完成轮次身份保持稳定。
+    summaryAnchorKey = item.key;
     if (item.type === 'toolGroup') {
       hasActivity = true;
       hasWork = true;
@@ -650,6 +686,7 @@ function accumulateToolOutcomes(
 export type TurnWorkMeta = {
   turnId: number;
   completed: boolean;
+  interrupted: boolean;
   hasWork: boolean;
   firstWorkKey: string | null;
   startMs: number;
@@ -700,6 +737,7 @@ function emptyTurnMeta(turnId: number, partial?: Partial<TurnWorkMeta>): TurnWor
   return {
     turnId,
     completed: false,
+    interrupted: false,
     hasWork: false,
     firstWorkKey: null,
     startMs: Number.NaN,
@@ -718,15 +756,18 @@ function emptyTurnMeta(turnId: number, partial?: Partial<TurnWorkMeta>): TurnWor
 
 export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): Map<number, TurnWorkMeta> {
   const map = new Map<number, TurnWorkMeta>();
+  const executionTurns = new Map<number, number>();
   let lastTurnId = Number.NEGATIVE_INFINITY;
   for (const item of items) {
     if (item.type === 'turnSummary') {
+      executionTurns.set(item.turnId, item.executionTurnId ?? item.turnId);
       lastTurnId = Math.max(lastTurnId, item.turnId);
       const prev = map.get(item.turnId);
       map.set(
         item.turnId,
         emptyTurnMeta(item.turnId, {
           completed: !(item.isLastTurn && isProcessing),
+          interrupted: Boolean(prev?.interrupted),
           hasWork: item.hasWork || Boolean(prev?.hasWork),
           firstWorkKey: prev?.firstWorkKey ?? null,
           startMs: item.startMs,
@@ -741,6 +782,27 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
           outcomeTone: prev?.outcomeTone ?? 'neutral',
         })
       );
+      continue;
+    }
+    if (item.type === 'message') {
+      if (item.message.finishReason === 'interrupted') {
+        const prev = map.get(item.turnId);
+        if (prev) {
+          prev.interrupted = true;
+          prev.hasWork = true;
+          if (!prev.firstWorkKey) {
+            prev.firstWorkKey = item.key;
+            prev.showAvatar = item.showAvatar;
+          }
+        } else {
+          map.set(item.turnId, emptyTurnMeta(item.turnId, {
+            interrupted: true,
+            hasWork: true,
+            firstWorkKey: item.key,
+            showAvatar: item.showAvatar,
+          }));
+        }
+      }
       continue;
     }
     if (item.type !== 'reasoning' && item.type !== 'toolGroup') {
@@ -791,8 +853,10 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
     if (proactiveTurnIds.has(meta.turnId)) {
       meta.hasWork = false;
     }
-    const isLast = Number.isFinite(lastTurnId) && meta.turnId === lastTurnId;
-    meta.completed = !(isProcessing && isLast);
+    const isCurrentExecution = executionTurns.has(meta.turnId)
+      ? executionTurns.get(meta.turnId) === executionTurns.get(lastTurnId)
+      : meta.turnId === lastTurnId;
+    meta.completed = !(isProcessing && isCurrentExecution);
     meta.outcomeTone = resolveWorkOutcomeTone(
       meta.toolSuccessCount,
       meta.toolFailedCount,
@@ -807,8 +871,7 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
 }
 
 /**
- * 「已完成」折叠条应挂在该轮第一个可折叠项上。
- * 若工具前还有 hideMeta 开场白，锚在那句上，避免展开后开场白跑到折叠条上面。
+ * 「已完成」折叠条只挂在该轮第一个思考或工具项上，正文不参与折叠。
  */
 export function buildTurnFoldAnchorKeys(
   items: RenderItem[],
@@ -823,10 +886,6 @@ export function buildTurnFoldAnchorKeys(
     if (!meta?.completed || !meta.hasWork) {
       continue;
     }
-    if (item.type === 'message' && item.hideMeta) {
-      anchors.set(item.turnId, item.key);
-      continue;
-    }
     if (item.type === 'reasoning' || item.type === 'toolGroup') {
       anchors.set(item.turnId, item.key);
     }
@@ -837,9 +896,10 @@ export function buildTurnFoldAnchorKeys(
 export type LiveWorkStreak = {
   id: string;
   turnId: number;
-  /** 轮次内稳定序号（不绑易变的 item.key），供展开态持久化 */
+  /** 轮次内顺序，仅用于识别顶部 streak；展开态由稳定末项 key 持久化。 */
   ordinal: number;
   firstKey: string;
+  lastKey: string;
   keys: Set<string>;
   thinkingCount: number;
   toolCount: number;
@@ -854,9 +914,9 @@ const REASONING_STREAK_MERGE_EXTRA_MS = 700;
 const TOOL_STREAK_SETTLE_MS = 1200;
 export const STREAK_FOLD_TRANSITION_DELAY_MS = 160;
 
-/** streak 展开态 key：绑 turnId + 轮次内 ordinal，避免 firstKey 变化导致展开态丢失 */
-export function streakExpandKey(turnId: number, ordinal: number): string {
-  return `streak-${turnId}-${ordinal}`;
+/** streak 展开态锚定末项；历史前插只会扩展 streak 头部，不会改变末项。 */
+export function streakExpandKey(lastKey: string): string {
+  return `streak-${lastKey}`;
 }
 
 /** 单轮耗时超过该阈值视为时间戳异常（历史脏数据/巡检污染），回退到更窄的 work 跨度。 */
@@ -1016,6 +1076,7 @@ export function buildLiveCompletedStreaks(
 
   const seal = () => {
     if (streak && streak.thinkingCount + streak.toolCount >= 2) {
+      streak.id = streakExpandKey(streak.lastKey);
       streak.outcomeTone = resolveWorkOutcomeTone(
         streak.toolSuccessCount,
         streak.toolFailedCount,
@@ -1029,10 +1090,11 @@ export function buildLiveCompletedStreaks(
   const startStreak = (item: Extract<RenderItem, { type: 'reasoning' | 'toolGroup' }>): LiveWorkStreak => {
     const ordinal = nextOrdinal(item.turnId);
     return {
-      id: streakExpandKey(item.turnId, ordinal),
+      id: '',
       turnId: item.turnId,
       ordinal,
       firstKey: item.key,
+      lastKey: item.key,
       keys: new Set(),
       thinkingCount: 0,
       toolCount: 0,
@@ -1061,6 +1123,7 @@ export function buildLiveCompletedStreaks(
         streak = startStreak(item);
       }
       streak.keys.add(item.key);
+      streak.lastKey = item.key;
       streak.thinkingCount += 1;
       continue;
     }
@@ -1079,6 +1142,7 @@ export function buildLiveCompletedStreaks(
       streak = startStreak(item);
     }
     streak.keys.add(item.key);
+    streak.lastKey = item.key;
     streak.toolCount += workToolCount;
     accumulateToolOutcomes(item.executions, streak);
   }

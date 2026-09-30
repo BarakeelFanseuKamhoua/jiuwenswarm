@@ -18,7 +18,6 @@ The current implementation adds a `work_mode` dimension to isolate regular work 
 | **Default projects** | Not persisted; dynamically injected by APIs. `default` is the work default project, `default_code` is the code default project. Rename/remove/pin are forbidden |
 | **`work_mode`** | Isolation dimension for projects, sessions, and scheduled tasks. Values: `work` / `code`. Web defaults to `work`; TUI defaults to `code` |
 | **Code project Git capabilities** | Real `code` projects expose Git status, init, branch, Diff, history, monitoring, and discard/redo APIs. Default projects and `work` projects do not expose Git operations |
-| **Archive** | `project.archive` rejects running sessions, disables cron jobs and marks `hidden:true`; all child sessions retain their project association and are hidden |
 | **Pinned sessions** | Detached from project groups and fetched via `project.pinned_sessions`, sorted by `pin_order` ascending |
 | **Pinned projects** | Pinned projects appear first, sorted by `pin_order` ascending |
 | **Immutability** | Once `project_id`, `project_dir`, and `work_mode` are bound to a session, they cannot be changed; no cross-project/cross-mode migration API is provided |
@@ -58,7 +57,6 @@ Returned by `project.list`.
 | `pinned` | boolean | Whether pinned |
 | `pin_order` | integer | Pin order; lower comes first; `0` when not pinned |
 | `is_default` | boolean | Whether this is a default project |
-| `hidden` | boolean | Whether archived; defaults are always false |
 | `session_count` | integer | Number of non-pinned sessions in this project |
 | `last_message_at` | number \| null | Latest message timestamp (UTC seconds) |
 | `last_user_message_at` | number \| null | Latest user message timestamp; falls back to `created_at` |
@@ -231,7 +229,6 @@ Returns sorted projects with statistics and injected default projects.
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
 | `filter` | string | no | `all` / `pinned` / `unpinned`, default `all` |
-| `include_hidden` | boolean | no | Whether to include archived projects |
 | `work_mode` | string | no | Filter by `work` / `code`; omitted returns all modes |
 
 **Response payload:** `projects` (`ProjectInfo[]`).
@@ -252,13 +249,13 @@ Returns non-pinned sessions for a project. `default` returns unbound/fallback wo
 
 ### project.create - Create project
 
-Creates a project with an optional directory. If a non-empty `project_dir` matches an archived project in the same `work_mode`, creation returns `PROJECT_ARCHIVED`; restore it explicitly first. Code projects automatically probe or initialize Git.
+Creates a project with an optional working directory. Duplicate directories or names within the same work mode return CONFLICT.
 
 **Request params:**
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | yes | Display name; unique within the same `work_mode`, including hidden projects |
+| `name` | string | yes | Display name; unique within the same `work_mode` |
 | `project_dir` | string | no | Absolute directory; empty path projects are allowed |
 | `work_mode` | string | no | `work` / `code`; inferred from channel when omitted |
 
@@ -268,7 +265,7 @@ Creates a project with an optional directory. If a non-empty `project_dir` match
 |-------|------|-------------|
 | `project_id` | string | New project ID |
 | `project_dir` | string | Project path |
-| `restored` | boolean | Always false; restoration uses project.unarchive |
+| `restored` | boolean | Always `false` (compatibility field) |
 | `project` | ProjectInfo | Full project object |
 | `work_mode` | string | Project work mode |
 | `git` | object | Git snapshot for code projects; disabled/empty for work projects |
@@ -279,7 +276,7 @@ Creates a project with an optional directory. If a non-empty `project_dir` match
 
 ### project.rename - Rename project
 
-Renames the display name only. Name conflicts are checked within the same `work_mode`, including hidden projects.
+Renames the display name only. Name conflicts are checked within the same `work_mode`.
 
 **Request params:** `project_id` (string, required), `name` (string, required)
 
@@ -301,31 +298,21 @@ Toggles project pin state and compacts pin order.
 
 ---
 
-### project.archive - Archive project
+### Session lifecycle and project removal
 
-Request: `{project_id:string}`. Checks all child sessions, including cron execution sessions. If any is running, returns `PROJECT_BUSY` without changing state or stopping work. Otherwise disables cron jobs, hides the project and all its sessions, and unpins the project. Sessions retain their project association and do not move into the default project or the explicit session archive. The check does not fence new executions; work may start between the check and the archive commit.
+- `session.archive` / `session.unarchive`: `{session_ids:string[]}`, 1–100 IDs; returns `{succeeded_count, failed_count, results}`. Running sessions return `SESSION_BUSY` without stopping work. Cron/heartbeat execution sessions cannot be archived individually.
+- `session.archived.list`: optional `project_id`, `work_mode`, `keyword`, `limit` (default 20, maximum 200), `offset`; returns `{sessions,total,limit,offset,has_more}`. Sorts by `archived_at DESC, session_id ASC`. Each item carries `project_hidden`, marking whether its project has been removed.
+- `session.delete`: accepts `session_id` or batch `session_ids`; both active and archived sessions can be permanently deleted. Running work is stopped before cleanup.
+- `project.remove`: `{project_id:string}`; hide the project without deleting sessions, cron jobs or the working directory. The Gateway first stops the project's cron jobs (disables them and cancels in-flight runs; the job records are kept) and aborts the removal if that fails, so a hidden project never has running or firing cron jobs. Returns `{project_id,hidden:true,affected_sessions}`, where `affected_sessions` counts the active conversations hidden with the project (pinned conversations included, cron execution sessions excluded).
+- `project.restore`: `{project_id:string}`; restore a hidden project. Returns `{project_id,restored:true,work_mode,affected_sessions}`. Stopped cron jobs stay stopped after the restore and must be re-enabled manually. `project.list` / `project.info` accept `include_hidden:true`.
+- `project.sessions.archive`: `{project_id:string}`; archives a snapshot of all eligible active sessions. Busy sessions fail individually; cron jobs stay unchanged.
+- `project.sessions.delete_archived`: `{project_id:string}`; permanently deletes only archived sessions in the project.
 
-Response: `{project_id, archived:true, hidden:true, archived_at, affected_sessions, stopped_cron_jobs, stop_pending}`. `affected_sessions` counts active-directory sessions newly hidden; `stopped_cron_jobs` counts jobs changed from enabled to disabled. Repeated requests finish pending cleanup without changing the archive timestamp.
+Both project session operations return `{project_id,succeeded_count,failed_count,results}`. Each result contains `session_id`, `ok`, and `code/error` on failure. An empty selection succeeds with zero counts. Default projects support these batch operations but cannot themselves be deleted.
 
-Errors: `BAD_REQUEST`, `NOT_FOUND`, `FORBIDDEN`, `PROJECT_BUSY`, `OPERATION_IN_PROGRESS`, `PARTIAL_PROJECT_ARCHIVE_FAILED`. Busy responses require the caller to finish work and retry. Other partial failures report the phase, completed resource IDs, failed items and retryability; archive does not create a pre-commit execution fence or retry in the background.
+Project removal sets `hidden=true` and clears its pin. The project's active sessions disappear from the workspace with it: they are listed under neither the project nor the default project (default project lists and session counts exclude them), and pinned conversations leave the pinned area as well. Stored project IDs are unchanged. Archived sessions are unaffected and stay in the archive page under the real project name, flagged with `project_hidden` so the page can explain that the project was removed. Restoring the project, or creating it again with the same directory and work mode, brings those sessions back, pinned ones included. The project's cron jobs are stopped when it is removed — disabled, with in-flight runs cancelled — and remain in the store invisible to the cron list; after a restore they stay stopped by default. The working directory is preserved.
 
-### project.unarchive - Restore project visibility
-
-Request: `{project_id:string}`. Restores visibility without enabling cron jobs, resuming tasks, or restoring explicitly archived sessions.
-
-Response: `{project_id, restored:boolean, work_mode, affected_sessions}`. An already active project returns `restored:false`. Pending archive cleanup blocks restoration.
-
-Errors: `BAD_REQUEST`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `OPERATION_IN_PROGRESS`, `RESTORE_FAILED`.
-
-### Archive queries and permanent deletion
-
-- `session.archive` / `session.unarchive`: `{session_ids:string[]}`, 1–100 IDs; response `{succeeded_count, failed_count, results}`. A running session returns `SESSION_BUSY` without stopping it or changing state. Idle sessions can be archived. Cron and heartbeat execution sessions cannot be archived individually.
-- `session.archived.list`: optional `project_id`, `work_mode`, `keyword`, `limit` (default 20, maximum 200), `offset`; returns `{sessions, total, limit, offset, has_more}`. Only explicitly archived sessions appear.
-- `project.archived.list`: optional `work_mode`, `keyword`, `limit` (default 20, maximum 100), `offset`; returns `{projects, total, limit, offset, has_more}` without nested sessions. Both archive lists sort by archive time descending, then ID ascending.
-- `session.delete`: accepts legacy `session_id` (success payload remains `{session_id}`) or batch `session_ids`; permanently deletes active or archived session data.
-- `project.delete`: `{project_id:string}`, archived projects only. Deletes cron jobs, sessions in both storage roots, then the project record. Returns `{project_id, deleted:true, deleted_sessions, deleted_cron_jobs}`. Never deletes the user's `project_dir`.
-
-List items expose `lifecycle_operation`, `execution_blocked`, and `stop_pending`. Lifecycle mutations require AgentServer; no file-only delete fallback is available. Archive does not cancel tasks, wait for shutdown or retry shutdown in the background; its `stop_pending` is false. Permanent deletion retains its stop, write-isolation and background-retry semantics. Archived resources remain blocked until restored.
+Archiving and pinning are independent: archiving keeps the session's pinned state, and unarchiving restores it and renumbers the pinned ordering. Undoing the archive of a session whose project was removed restores that project too; when another project already holds the name, the call fails with `PROJECT_NAME_CONFLICT` and the session stays archived until the user resolves the clash.
 
 ---
 ### project.pinned_sessions - List pinned sessions
@@ -602,8 +589,6 @@ Symmetric to `discard_turn_changes`: re-applies the file changes that were disca
 | `project.create` | Project | Create project; code projects auto probe/init Git |
 | `project.rename` | Project | Rename project |
 | `project.pin` | Project | Pin/unpin project |
-| `project.archive` | Project | Archive project |
-| `project.unarchive` | Project | Restore archived project |
 | `project.pinned_sessions` | Project | List pinned sessions |
 | `project.git.status` | Git | Live Git status, not persisted |
 | `project.git.probe` | Git | Re-probe Git and persist `ProjectInfo.git` |
@@ -619,3 +604,14 @@ Symmetric to `discard_turn_changes`: re-applies the file changes that were disca
 | `project.git.diff_unwatch` | `/ws/git` | Cancel watches |
 | `project.git.discard_turn_changes` | `/ws/git` | Discard the current session's last turn code changes |
 | `project.git.redo_turn_changes` | `/ws/git` | Redo the current session's last turn discarded changes |
+
+## Cross-session Agent messages and steering
+
+Non-cron Web/TUI single-Agent Sessions belonging to the same user on the same AgentServer can exchange messages through the existing tools:
+
+- Use `session_list` to find a target. `session_send_message(target_session_id, message)` defaults to `steer`: a running target handles the input in its current turn; an idle target starts a new turn.
+- Use `input_mode="follow_up"` for an independent queued task. Plan mode and active Goals always defer cross-session input to that queue. Each delivery lane is FIFO; steering can overtake independent tasks.
+- Use `session_message_list` to inspect the existing mailbox. `accepted: true` means persisted; `delivered` means supplemental input was accepted, not that the model consumed it or the target task succeeded. `succeeded` requires actual completion of an independent execution.
+- Temporary refusals before SDK submission (including pending user interactions and closing input windows) return to the independent-task queue. Interrupted or uncertain delivery becomes `unknown`, retaining the existing explicit resolution workflow without automatic replay. Failed input-boundary publication drops the supplemental input before model admission and does not fail the original task.
+
+Source Session, message ID, chain and Agent provenance are retained in delivery, UI and history. Live and restored Agent inputs use a Host-generated tool call/result pair for SDK compatibility; the payload has tool authority and grants no new user authorization. Existing ownership, idempotency, capacity and hop limits remain in force. This adds no reply protocol; previously persisted independent tasks keep their delivery mode.

@@ -203,20 +203,25 @@ class WebClient {
           this.updateState('closed');
           return;
         }
-        // 1008 Policy Violation: gateway 鉴权失败 (token 失效/缺失)。
-        // 重载页面, AppWithAuth 会探测 cookie 失效 -> 回到登录页。
-        if (closeEvent.code === 1008) {
-          this.updateState('closed');
-          if (typeof window !== 'undefined') {
-            window.location.reload();
-          }
-          return;
-        }
         this.scheduleReconnect();
       };
     });
 
     return this.connectPromise;
+  }
+
+  /**
+   * 断开后立刻用同一组参数重连。
+   *
+   * 登录态变化时必须调这个：登录会话 id 是 **WS 握手时**从 cookie / 请求头读的，
+   * 之后这条连接就一直用那份值。而登录走的是 HTTP，发生在握手之后——不重连的话，
+   * 连接上停留的还是登录前那份，服务端据此取凭据会取不到，
+   * 表现为"选了免费模型却跑了配置的模型"。
+   */
+  async reconnect(reason = 'Auth changed'): Promise<void> {
+    const options = this.lastConnectOptions;
+    await this.disconnect(reason);
+    await this.connect(options);
   }
 
   disconnect(reason = 'User disconnect'): Promise<void> {
@@ -313,7 +318,22 @@ class WebClient {
         messageType: 'req',
         data: message,
       });
-      this.ws?.send(JSON.stringify(message));
+      try {
+        options.onRequestId?.(id);
+        this.ws!.send(JSON.stringify(message));
+        if (method === 'chat.send' || method === 'chat.interrupt') {
+          console.info('[DispatchTrace] browser_ws_frame_sent', {
+            requestId: id,
+            method,
+            sessionId: params?.session_id,
+            ts: new Date().toISOString(),
+          });
+        }
+      } catch (error) {
+        window.clearTimeout(timeoutId);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -420,10 +440,12 @@ class WebClient {
       if (!eventName) {
         return null;
       }
+      const payload = this.normalizePayload(msg.payload);
       return {
         type: 'event',
-        event: eventName,
-        payload: this.normalizePayload(msg.payload),
+        // Older gateways wrap control ACKs in chat.final; an ACK must never close a turn.
+        event: eventName === 'chat.final' && payload.event_type === 'runtime.accepted' ? 'runtime.accepted' : eventName,
+        payload,
         seq: typeof msg.seq === 'number' ? msg.seq : undefined,
         stream_id: typeof msg.stream_id === 'string' ? msg.stream_id : undefined,
       };
@@ -434,10 +456,11 @@ class WebClient {
       if (!mappedEvent) {
         return null;
       }
+      const payload = this.normalizePayload(msg.payload);
       return {
         type: 'event',
-        event: mappedEvent,
-        payload: this.normalizePayload(msg.payload),
+        event: mappedEvent === 'chat.final' && payload.event_type === 'runtime.accepted' ? 'runtime.accepted' : mappedEvent,
+        payload,
       };
     }
 
@@ -500,7 +523,8 @@ class WebClient {
       typeof message.payload.error === 'string'
         ? message.payload.error
         : i18n.t('network.requestFailed');
-    pending.reject(this.createWebError(error, undefined, requestId, true));
+    const code = typeof message.payload.code === 'string' ? message.payload.code : undefined;
+    pending.reject(this.createWebError(error, code, requestId, true, message.payload));
   }
 
   private dispatchEvent(event: WsEvent): void {

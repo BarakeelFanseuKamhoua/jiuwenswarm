@@ -10,6 +10,9 @@ from jiuwenswarm.common.schema.message import ReqMethod
 from openjiuwen.extensions.observability.demand import (
     get_trajectory_span_processor,
 )
+from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (
+    SESSION_MESSAGING_ROUTE_EXTRA_KEY,
+)
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep as interface_deep_module
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
 from jiuwenswarm.symphony.llm import SYMPHONY_LLM_CONFIG_REF_KEY
@@ -18,7 +21,12 @@ from jiuwenswarm.symphony.llm import SYMPHONY_LLM_CONFIG_REF_KEY
 def _assert_symphony_request_model_context(inputs: dict) -> None:
     run = inputs["run"]
     assert run["kind"] == "normal"
-    assert set(run["context"]["extra"]) == {SYMPHONY_LLM_CONFIG_REF_KEY}
+    # The session-messaging route extra may ride along; it has dedicated tests
+    # in test_session_messaging.py. Here we only pin the model-reference contract.
+    assert set(run["context"]["extra"]) == {
+        SYMPHONY_LLM_CONFIG_REF_KEY,
+        SESSION_MESSAGING_ROUTE_EXTRA_KEY,
+    }
     reference = run["context"]["extra"][SYMPHONY_LLM_CONFIG_REF_KEY]
     assert isinstance(reference, str)
     assert len(reference) == 64
@@ -953,7 +961,8 @@ async def test_agent_stream_slash_followup_continues_into_runner(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_team_stream_injects_image_tool_context_for_non_vision_model(monkeypatch):
+@pytest.mark.parametrize("image_status", ["unsupported", "disabled", "unknown"])
+async def test_team_stream_injects_image_tool_context_for_non_vision_model(monkeypatch, image_status):
     """Team mode must preserve the same local-image tool context as agent mode."""
     adapter = JiuWenSwarmDeepAdapter()
     adapter._instance = SimpleNamespace()  # pylint: disable=protected-access
@@ -968,7 +977,7 @@ async def test_team_stream_injects_image_tool_context_for_non_vision_model(monke
         lambda _model, **_kwargs: None,
     )
     monkeypatch.setattr(adapter, "_resolve_runtime_language", lambda: "cn")
-    monkeypatch.setattr(adapter, "_native_image_input_enabled", lambda *_args: False)
+    monkeypatch.setattr(adapter, "_native_image_input_status", lambda *_args: image_status)
     monkeypatch.setattr(adapter, "_write_runtime_state", lambda **_kwargs: None)
 
     async def _capture_team_inputs(_request, inputs, _instance):
@@ -999,8 +1008,16 @@ async def test_team_stream_injects_image_tool_context_for_non_vision_model(monke
         is_stream=True,
     )
 
-    async for _ in adapter.process_message_stream_impl(request, {"query": "解析图片内容"}):
-        pass
+    chunks = [chunk async for chunk in adapter.process_message_stream_impl(request, {"query": "解析图片内容"})]
 
     assert "jiuwenswarm_image_tool_context" in captured["query"]
     assert "agent/sessions/sess-team-image/uploads/persisted.png" in captured["query"]
+    assert f'"imageInputStatus": "{image_status}"' in captured["query"]
+    notices = [chunk.payload for chunk in chunks if chunk.payload.get("event_type") == "chat.notice"]
+    assert len(notices) == 1
+    assert notices[0]["image_input_status"] == image_status
+    if image_status == "unknown":
+        assert "尚未确认" in notices[0]["content"]
+        assert "尚未确认" in captured["query"]
+    if image_status != "unsupported":
+        assert "不支持" not in notices[0]["content"]

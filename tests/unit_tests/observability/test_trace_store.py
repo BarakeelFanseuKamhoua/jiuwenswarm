@@ -20,7 +20,6 @@ from jiuwenswarm.observability import store as store_module
 from jiuwenswarm.observability.models import StreamFrameData, TraceRecordData
 from jiuwenswarm.observability.store import (
     AsyncTrajectoryReader,
-    TrajectoryCursorError,
     TrajectoryStore,
 )
 
@@ -40,6 +39,7 @@ def _raw_record(
     parent_span_id: str = "",
     name: str = "agent.run",
     status_code: str = "STATUS_CODE_UNSET",
+    attributes: list[dict[str, Any]] | None = None,
 ) -> bytes:
     return json.dumps(
         {
@@ -58,7 +58,7 @@ def _raw_record(
                                     "startTimeUnixNano": "100",
                                     "endTimeUnixNano": "200",
                                     "status": {"code": status_code},
-                                    "attributes": [],
+                                    "attributes": attributes or [],
                                 }
                             ],
                         }
@@ -69,6 +69,13 @@ def _raw_record(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _turn_attributes(turn_id: str, turn_number: int) -> list[dict[str, Any]]:
+    return [
+        {"key": "openjiuwen.turn.id", "value": {"stringValue": turn_id}},
+        {"key": "openjiuwen.turn.number", "value": {"intValue": str(turn_number)}},
+    ]
 
 
 def _core_record(
@@ -101,22 +108,12 @@ def _core_record(
         request_id=request_id,
         run_id=run_id,
         agent_mode=agent_mode,
-        schema_version="1",
+        schema_version="2",
     )
 
 
 def _stored_record(**overrides: object) -> TraceRecordData:
     return TraceRecordData.from_core_record(_core_record(**overrides))
-
-
-def _team_raw_record(trace_id: str, span_id: str) -> bytes:
-    payload = json.loads(_raw_record(trace_id, span_id))
-    attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
-    attributes.append({
-        "key": "agentteam.team.id",
-        "value": {"stringValue": "research-team"},
-    })
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def _snapshot_record_for(
@@ -142,7 +139,7 @@ def _snapshot_record_for(
         request_id="request-1",
         run_id="run-1",
         agent_mode="agent.work.normal",
-        schema_version="1",
+        schema_version="2",
         lifecycle="running",
     )
     return TraceRecordData.from_core_snapshot(snapshot)
@@ -271,6 +268,111 @@ def test_frames_name_their_span_once_instead_of_on_every_row(
     test_logger.info("64 frames name their span through one row")
 
 
+def _frame_rows(database_path: Path) -> tuple[list[int], int]:
+    """Return the frame sequences held, and how many spans are named."""
+    connection = sqlite3.connect(database_path)
+    try:
+        frames = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT sequence FROM trajectory_stream_frames ORDER BY sequence"
+            )
+        ]
+        spans = int(
+            connection.execute("SELECT COUNT(*) FROM trajectory_frame_spans").fetchone()[0]
+        )
+    finally:
+        connection.close()
+    return frames, spans
+
+
+def test_a_terminal_record_discards_the_frames_it_supersedes(tmp_path: Path) -> None:
+    """Frames stand in for an answer being written; the record states it in full.
+
+    From the moment a span's terminal record lands, nothing reads its frames:
+    the reader drops its own copy, the detail read never consults them, and an
+    archive excludes them. They are the largest table in the database, so they
+    go with the record that supersedes them rather than waiting for the turn
+    page to be retired.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([], frames=[_frame(index) for index in range(8)])
+        assert _frame_rows(database_path) == ([0, 1, 2, 3, 4, 5, 6, 7], 1)
+        # The same flush window may carry a span's last frames and its record.
+        store.write_records([_stored_record()], frames=[_frame(8), _frame(9)])
+    finally:
+        store.close()
+
+    # The span was named only so its frames could point at it.
+    assert _frame_rows(database_path) == ([], 0)
+    test_logger.info("a terminal record took its span's frames with it")
+
+
+def test_frames_of_a_running_span_outlive_its_snapshots(tmp_path: Path) -> None:
+    """Only a terminal record supersedes frames -- a snapshot is still partial.
+
+    A running span's snapshots restate what it has produced so far, but the
+    reader reaches a still-streaming answer through the frames. Discarding them
+    on a snapshot would blank a live answer mid-sentence.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([], frames=[_frame(0), _frame(1)])
+        store.write_records([_snapshot_record(1, name="agent.run")], frames=[_frame(2)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([0, 1, 2], 1)
+    test_logger.info("a snapshot left the live answer's frames in place")
+
+
+def test_frames_landing_after_their_span_ended_are_not_stored(tmp_path: Path) -> None:
+    """Records and frames queue separately, so a frame can arrive too late.
+
+    Nothing would delete such a frame afterwards: the discard runs as a record
+    lands, and that record has already landed. Retention's orphan sweep does
+    not reach it either, because that ages out frames of spans holding no
+    record at all. So it is refused at the door instead.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()])
+        store.write_records([], frames=[_frame(0), _frame(1)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([], 0)
+    test_logger.info("frames of an ended span were refused rather than stranded")
+
+
+def test_keeping_the_frames_of_ended_spans_is_configurable(tmp_path: Path) -> None:
+    """Replaying a finished answer frame by frame needs those frames kept.
+
+    Nothing reads them today, so they are discarded by default. This is the
+    switch that a frame-by-frame replay of a completed turn would need, and
+    with it off the frames live as long as their turn page does.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path, discard_final_span_frames=False)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()], frames=[_frame(0)])
+        # Also kept when the frame arrives after its span's record.
+        store.write_records([], frames=[_frame(1)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([0, 1], 1)
+    test_logger.info("frames of ended spans were kept for replay")
+
+
 def test_a_span_name_lives_exactly_as_long_as_its_frames(tmp_path: Path) -> None:
     """Nothing refers to a span once its frames are gone, so it goes with them.
 
@@ -320,85 +422,6 @@ def test_a_span_name_lives_exactly_as_long_as_its_frames(tmp_path: Path) -> None
     test_logger.info("span names are swept with the last frame that used them")
 
 
-def test_a_frame_table_that_names_a_span_per_row_is_discarded(
-    tmp_path: Path,
-) -> None:
-    """Frames expire on their own, so an older shape is dropped, not moved.
-
-    Retention clears frames within days and the records they accompany are
-    untouched, so rewriting every row of an older table would buy back
-    something that was about to go anyway. What has to keep working is the
-    file: opening it must not fail on an index over a column the old table
-    does not have.
-    """
-    database_path = tmp_path / "trajectory.sqlite3"
-    store = TrajectoryStore(database_path)
-    store.initialize()
-    store.close()
-
-    # Rebuild the oldest shape: a session column, three identity columns per
-    # frame, a separate write timestamp, and the index over the session.
-    connection = sqlite3.connect(database_path)
-    connection.execute("DROP TABLE trajectory_stream_frames")
-    connection.execute(
-        """
-        CREATE TABLE trajectory_stream_frames (
-            frame_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            execution_subject_id TEXT NOT NULL DEFAULT 'main',
-            trace_id TEXT NOT NULL,
-            span_id TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            text TEXT,
-            tool_call_id TEXT,
-            tool_name TEXT,
-            arguments_delta TEXT,
-            timestamp_unix_nano INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX idx_trajectory_frames_session_seq "
-        "ON trajectory_stream_frames(session_id, frame_seq)"
-    )
-    connection.execute(
-        "INSERT INTO trajectory_stream_frames ("
-        "  frame_seq, session_id, execution_subject_id, trace_id, span_id,"
-        "  sequence, kind, text, timestamp_unix_nano, created_at"
-        ") VALUES (7000, 'session-1', 'main', ?, ?, 0, 'text-delta', 'gone ', 1, 1)",
-        (_TRACE_ID, _ROOT_SPAN_ID),
-    )
-    connection.commit()
-    connection.close()
-    assert "session_id" in _frame_columns(database_path)
-
-    store = TrajectoryStore(database_path)
-    store.initialize()
-    try:
-        store.write_records([], frames=[_frame(0, text="new ")])
-    finally:
-        store.close()
-
-    assert "session_id" not in _frame_columns(database_path)
-    assert "created_at" not in _frame_columns(database_path)
-    # The old index went with the table that owned it.
-    assert _frame_indexes(database_path) == ["idx_trajectory_frames_span_ref"]
-
-    connection = sqlite3.connect(database_path)
-    try:
-        frames = connection.execute(
-            "SELECT frame_seq, kind, text FROM trajectory_stream_frames"
-        ).fetchall()
-    finally:
-        connection.close()
-    # Only what this shape wrote, numbered from the start of the new table. A
-    # reader holding 7000 sees a watermark beyond the file and starts over.
-    assert frames == [(1, 1, "new ")]
-    test_logger.info("older frame table is discarded rather than rewritten")
-
-
 def test_store_preserves_exact_raw_and_records_hash_conflict(tmp_path: Path) -> None:
     database_path = tmp_path / "trajectory.sqlite3"
     store = TrajectoryStore(database_path)
@@ -445,27 +468,14 @@ async def test_live_revisions_finalize_in_place_and_reject_late_running(
         connection = store._require_connection()
         current = connection.execute(
             """
-            SELECT lifecycle, record_revision, raw_json, raw_size_bytes
+            SELECT lifecycle, record_revision, change_seq, raw_json, raw_size_bytes
             FROM trajectory_current_records
             WHERE trace_id = ? AND span_id = ?
             """,
             (_TRACE_ID, _ROOT_SPAN_ID),
         ).fetchone()
-        change_count = connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM trajectory_changes
-            WHERE trace_id = ? AND span_id = ?
-            """,
-            (_TRACE_ID, _ROOT_SPAN_ID),
-        ).fetchone()
-        journal_payload_bytes = connection.execute(
-            """
-            SELECT COALESCE(SUM(LENGTH(raw_json)), 0) AS payload_bytes
-            FROM trajectory_changes
-            WHERE trace_id = ? AND span_id = ?
-            """,
-            (_TRACE_ID, _ROOT_SPAN_ID),
+        state = connection.execute(
+            "SELECT max_change_seq FROM trajectory_store_state WHERE singleton = 1"
         ).fetchone()
     finally:
         store.close()
@@ -478,16 +488,15 @@ async def test_live_revisions_finalize_in_place_and_reject_late_running(
     assert current is not None
     assert current["lifecycle"] == "final"
     # Once the span is final its payload is archived in otlp_span_records, so
-    # this table stops carrying a second copy — the rule the change journal
-    # below already follows. The size stays, because the detail reader budgets
-    # pages by it before fetching any payload.
+    # this table stops carrying a second copy. The size stays, because the
+    # detail reader budgets pages by it before fetching any payload.
     assert bytes(current["raw_json"]) == b""
     assert int(current["raw_size_bytes"]) == len(final_record.raw_json)
     # Dropping the copy must not change what a reader gets back.
     assert resolved_raw == final_record.raw_json
-    assert change_count is not None and int(change_count["count"]) == 3
-    assert journal_payload_bytes is not None
-    assert int(journal_payload_bytes["payload_bytes"]) == 0
+    # Three accepted revisions, each handed the next value of the counter.
+    assert int(current["change_seq"]) == 3
+    assert state is not None and int(state["max_change_seq"]) == 3
 
     detail = await AsyncTrajectoryReader(database_path).get_subject_records(
         "session-1",
@@ -679,15 +688,6 @@ async def test_store_preserves_multiple_step_request_spans_and_real_timing(
             """,
             (_TRACE_ID,),
         ).fetchall()
-        change_rows = connection.execute(
-            """
-            SELECT span_id, parent_span_id, request_id, start_time_unix_nano
-            FROM trajectory_changes
-            WHERE trace_id = ?
-            ORDER BY start_time_unix_nano ASC
-            """,
-            (_TRACE_ID,),
-        ).fetchall()
     finally:
         store.close()
 
@@ -703,14 +703,6 @@ async def test_store_preserves_multiple_step_request_spans_and_real_timing(
             int(row["start_time_unix_nano"]),
         )
         for row in current_rows
-    } == expected
-    assert {
-        str(row["span_id"]): (
-            row["parent_span_id"],
-            row["request_id"],
-            int(row["start_time_unix_nano"]),
-        )
-        for row in change_rows
     } == expected
 
     detail = await AsyncTrajectoryReader(database_path).get_subject_records(
@@ -1117,62 +1109,6 @@ async def test_reader_accepts_agent_and_team_modes_but_rejects_unknown_traces(
 
 
 @pytest.mark.asyncio
-async def test_initialize_repairs_mode_less_team_trace_from_raw_contract(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "trajectory.sqlite3"
-    store = TrajectoryStore(database_path)
-    store.initialize()
-    try:
-        store.write_records([
-            _stored_record(
-                agent_mode=None,
-                raw_json=_team_raw_record(_TRACE_ID, _ROOT_SPAN_ID),
-            ),
-            _stored_record(
-                span_id=_CHILD_SPAN_ID,
-                parent_span_id=_ROOT_SPAN_ID,
-                agent_mode=None,
-                raw_json=_raw_record(
-                    _TRACE_ID,
-                    _CHILD_SPAN_ID,
-                    parent_span_id=_ROOT_SPAN_ID,
-                    name="llm.call",
-                ),
-            ),
-        ])
-    finally:
-        store.close()
-
-    before, _epoch, _cursor = await AsyncTrajectoryReader(database_path).list_subjects("session-1")
-    assert before == []
-
-    reopened = TrajectoryStore(database_path)
-    reopened.initialize()
-    reopened.close()
-
-    reader_after = AsyncTrajectoryReader(database_path)
-    after, _epoch, _cursor = await reader_after.list_subjects("session-1")
-    assert [item["subject_id"] for item in after] == ["main"]
-    repaired_chain = await reader_after.get_subject_records(
-        "session-1", "main", since_revision=0, limit=100
-    )
-    assert {record["trace_id"] for record in repaired_chain["records"]} == {_TRACE_ID}
-    with sqlite3.connect(database_path) as connection:
-        for table in (
-            "otlp_span_records",
-            "trajectory_current_records",
-            "trajectory_changes",
-        ):
-            modes = connection.execute(
-                f"SELECT DISTINCT agent_mode FROM {table} WHERE trace_id = ?",
-                (_TRACE_ID,),
-            ).fetchall()
-            assert modes == [("team",)]
-    test_logger.info("startup repaired a legacy mode-less Team trace without rewriting raw OTLP")
-
-
-@pytest.mark.asyncio
 async def test_detail_byte_budget_uses_index_descriptor_and_preserves_raw(
     tmp_path: Path,
 ) -> None:
@@ -1429,11 +1365,19 @@ async def test_partial_retention_rotates_epoch_and_rebuilds_remaining_view(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "trajectory.sqlite3"
-    expired = TraceRecordData.from_core_record(_core_record(), created_at=1)
+    # Retention removes whole turns: the expired turn goes, the turn written
+    # inside the window stays.
+    expired = TraceRecordData.from_core_record(
+        _core_record(
+            raw_json=_raw_record(_TRACE_ID, _ROOT_SPAN_ID, attributes=_turn_attributes("turn-1", 1)),
+        ),
+        created_at=1,
+    )
     retained = TraceRecordData.from_core_record(
         _core_record(
+            trace_id=_SECOND_TRACE_ID,
             span_id=_CHILD_SPAN_ID,
-            raw_json=_raw_record(_TRACE_ID, _CHILD_SPAN_ID),
+            raw_json=_raw_record(_SECOND_TRACE_ID, _CHILD_SPAN_ID, attributes=_turn_attributes("turn-2", 2)),
         ),
         created_at=100,
     )
@@ -1684,13 +1628,13 @@ def test_error_probe_skips_parsing_when_no_status_code_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parses: list[bytes] = []
-    original = store_module._strict_otlp_payload
+    original = store_module.strict_otlp_payload
 
     def _counting(raw_json: bytes) -> Any:
         parses.append(raw_json)
         return original(raw_json)
 
-    monkeypatch.setattr(store_module, "_strict_otlp_payload", _counting)
+    monkeypatch.setattr(store_module, "strict_otlp_payload", _counting)
     # Core serializes an unset span status as {}, so the whole payload can be
     # ruled out without decoding it.
     without_code = json.dumps(
@@ -1767,44 +1711,6 @@ def test_running_snapshot_keeps_its_own_payload_until_the_span_is_final(
     test_logger.info("running snapshot retained the payload it alone holds")
 
 
-@pytest.mark.asyncio
-async def test_reader_resolves_payloads_written_before_the_size_column_existed(
-    tmp_path: Path,
-) -> None:
-    # Rows from an older database still carry their own final payload and a
-    # zero size. They must resolve without any backfill.
-    database_path = tmp_path / "trajectory.sqlite3"
-    store = TrajectoryStore(database_path)
-    store.initialize()
-    try:
-        record = _stored_record(raw_json=_raw_record(_TRACE_ID, _ROOT_SPAN_ID, name="legacy"))
-        store.write_records([record])
-        connection = store._require_connection()
-        connection.execute(
-            """
-            UPDATE trajectory_current_records
-            SET raw_json = ?, raw_size_bytes = 0
-            WHERE trace_id = ? AND span_id = ?
-            """,
-            (sqlite3.Binary(record.raw_json), _TRACE_ID, _ROOT_SPAN_ID),
-        )
-        connection.commit()
-        assert store.fetch_raw(_TRACE_ID, _ROOT_SPAN_ID) == record.raw_json
-    finally:
-        store.close()
-
-    detail = await AsyncTrajectoryReader(database_path).get_subject_records(
-        "session-1",
-        "main",
-        since_revision=0,
-        limit=100,
-    )
-    assert detail is not None
-    assert [item["lifecycle"] for item in detail["records"]] == ["final"]
-    assert int(detail["projected_raw_bytes"]) == len(record.raw_json)
-    test_logger.info("pre-migration row resolved through its own stored payload")
-
-
 def test_archived_payload_is_stored_compressed_but_reads_back_intact(
     tmp_path: Path,
 ) -> None:
@@ -1834,12 +1740,100 @@ def test_archived_payload_is_stored_compressed_but_reads_back_intact(
     test_logger.info("archived payload shrank on disk and returned byte-identical")
 
 
-def test_payload_decoding_passes_through_uncompressed_rows() -> None:
-    # A database written before compression stores plain JSON. Both forms must
-    # resolve, which is what lets the change ship without a migration.
+def test_payload_decoding_round_trips_compressed_and_empty_rows() -> None:
     plain = b'{"resourceSpans":[]}'
-    assert store_module._decode_payload(plain) == plain
     assert store_module._decode_payload(store_module._encode_payload(plain)) == plain
+    # The empty BLOB marks a final row whose payload lives in the archive.
     assert store_module._decode_payload(b"") == b""
     assert store_module._decode_payload(None) == b""
-    test_logger.info("payload decoding handled compressed, plain and empty rows")
+    test_logger.info("payload decoding handled compressed and empty rows")
+
+
+def test_incompatible_schema_version_discards_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()])
+        store._require_connection().execute("PRAGMA user_version=3")
+        store._require_connection().commit()
+    finally:
+        store.close()
+
+    reopened = TrajectoryStore(database_path)
+    reopened.initialize()
+    try:
+        connection = reopened._require_connection()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        record_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM otlp_span_records"
+        ).fetchone()["count"]
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        reopened.close()
+
+    assert version == store_module._SCHEMA_VERSION
+    assert record_count == 0
+    assert "trajectory_changes" not in tables
+    test_logger.info("a database from another schema version was rebuilt empty")
+
+
+@pytest.mark.asyncio
+async def test_reader_treats_incompatible_schema_version_as_absent(tmp_path: Path) -> None:
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()])
+        store._require_connection().execute("PRAGMA user_version=3")
+        store._require_connection().commit()
+    finally:
+        store.close()
+
+    items, epoch, watermark = await AsyncTrajectoryReader(database_path).list_subjects("session-1")
+    assert items == []
+    assert watermark == 0
+    assert epoch == "absent"
+    test_logger.info("reader did not interpret a database from another schema version")
+
+
+def test_change_seq_comes_from_store_state_and_never_rewinds(tmp_path: Path) -> None:
+    database_path = tmp_path / "trajectory.sqlite3"
+    expired = TraceRecordData.from_core_record(_core_record(), created_at=1)
+    store = TrajectoryStore(database_path, retention_days=1)
+    store.initialize()
+    try:
+        store.write_records([expired])
+        assert store.delete_expired(now=86402) == 1
+        store.write_records([
+            _stored_record(
+                span_id=_CHILD_SPAN_ID,
+                raw_json=_raw_record(_TRACE_ID, _CHILD_SPAN_ID),
+            )
+        ])
+        connection = store._require_connection()
+        change_seq = connection.execute(
+            "SELECT change_seq FROM trajectory_current_records WHERE span_id = ?",
+            (_CHILD_SPAN_ID,),
+        ).fetchone()["change_seq"]
+    finally:
+        store.close()
+
+    # Retention removed revision 1; the next record still gets 2, so a reader
+    # resuming from 1 is never handed a revision it already consumed.
+    assert change_seq == 2
+    reopened = TrajectoryStore(database_path, retention_days=1)
+    reopened.initialize()
+    try:
+        state = reopened._require_connection().execute(
+            "SELECT max_change_seq FROM trajectory_store_state WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        reopened.close()
+    assert int(state["max_change_seq"]) == 2
+    test_logger.info("revision counter kept growing across retention and restart")

@@ -160,6 +160,78 @@ async def test_session_fork_server_preserves_runtime_commit_and_wire_order() -> 
 
 
 @pytest.mark.asyncio
+async def test_session_fork_server_forwards_message_cutoff() -> None:
+    trace: list[str] = []
+    runtime, _ = _runtime_adapter(trace=trace)
+    ws = SimpleNamespace(send=AsyncMock())
+    request = _request()
+    request.params["fork_point"] = {
+        "message_id": "request-1:assistant",
+        "role": "assistant",
+        "content": "first answer",
+        "timestamp": "2026-09-13T05:36:11Z",
+    }
+    request.params["session_equipment_override"] = {
+        "agent_template_name": "expert-a",
+        "mcp": ["connector-a"],
+    }
+
+    await _server(runtime)._handle_session_fork(ws, request, asyncio.Lock())
+
+    runtime.prepare_session_fork.assert_awaited_once_with(
+        SessionForkInput(
+            channel_id="tui",
+            source_session_id="fork-source",
+            target_session_id="fork-target",
+            title="Forked session",
+            cutoff_message_id="request-1:assistant",
+            cutoff_role="assistant",
+            cutoff_content="first answer",
+            cutoff_timestamp="2026-09-13T05:36:11Z",
+            session_equipment_override={
+                "agent_template_name": "expert-a",
+                "mcp": ["connector-a"],
+            },
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_fork_rejects_invalid_equipment_override() -> None:
+    trace: list[str] = []
+    runtime, _ = _runtime_adapter(trace=trace)
+    ws = SimpleNamespace(send=AsyncMock())
+    request = _request(channel_id="web")
+    request.params["session_equipment_override"] = ["connector-a"]
+
+    await _server(runtime)._handle_session_fork(ws, request, asyncio.Lock())
+
+    assert trace == []
+    runtime.prepare_session_fork.assert_not_awaited()
+    response = _parse_sent_response(ws)
+    assert response.ok is False
+    assert response.payload["code"] == "BAD_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_session_fork_rejects_removed_side_option_without_creating_session() -> None:
+    trace: list[str] = []
+    runtime, _ = _runtime_adapter(trace=trace)
+    ws = SimpleNamespace(send=AsyncMock())
+    request = _request(channel_id="web")
+    request.params["side_conversation"] = True
+
+    await _server(runtime)._handle_session_fork(ws, request, asyncio.Lock())
+
+    assert trace == []
+    runtime.prepare_session_fork.assert_not_awaited()
+    runtime.commit_session_provision.assert_not_awaited()
+    response = _parse_sent_response(ws)
+    assert response.ok is False
+    assert response.payload["code"] == "BAD_REQUEST"
+
+
+@pytest.mark.asyncio
 async def test_session_fork_crosses_real_runtime_boundary_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

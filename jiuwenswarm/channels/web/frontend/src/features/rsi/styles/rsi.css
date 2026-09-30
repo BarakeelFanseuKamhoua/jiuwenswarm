@@ -158,6 +158,44 @@
 .rsi-detail__tag--meta {
   color: var(--color-text-placeholder);
 }
+.rsi-detail__failure-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.rsi-detail__failure-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+}
+.rsi-detail__failure-trigger:hover,
+.rsi-detail__failure-trigger:focus-visible {
+  outline: 2px solid rgb(239, 68, 68, 0.35);
+  outline-offset: 2px;
+}
+.rsi-detail__failure-popover {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  left: 0;
+  width: min(420px, calc(100vw - 48px));
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid #f3b4ae;
+  border-radius: 8px;
+  background: #fff8f7;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 14%);
+  color: #a1261c;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .rsi-detail__tag svg {
   flex-shrink: 0;
 }
@@ -232,10 +270,10 @@
   flex-shrink: 0;
 }
 .rsi-detail__actions .rsi-btn {
-  width: 96px;
   height: 32px;
   padding: 0;
   border-radius: 9999px;
+  padding: 0px 14px;
 }
 .rsi-detail__actions .rsi-btn--ghost {
   background: #ffffff;
@@ -245,7 +283,6 @@
   color: #ffffff;
 }
 .rsi-detail__actions .rsi-detail__action--delete {
-  width: 52px;
   background: transparent;
   border-color: transparent;
   color: #191919;
@@ -555,6 +592,10 @@
 }
 .rsi-canvas--dragging {
   cursor: grabbing;
+}
+.rsi-canvas--dragging .rsi-canvas__inner {
+  /* 拖拽时提升为合成层，避免高频 transform 更新引发整块重绘 */
+  will-change: transform;
 }
 .rsi-canvas__inner {
   position: relative;
@@ -1473,7 +1514,6 @@
   color: #191919;
 }
 .rsi-intro__create {
-  width: 96px;
   height: 32px;
   border: none;
   border-radius: 8px;
@@ -1483,6 +1523,7 @@
   line-height: 22px;
   font-weight: 400;
   cursor: pointer;
+  padding: 0px 14px;
 }
 .rsi-intro__create:hover {
   opacity: 0.85;

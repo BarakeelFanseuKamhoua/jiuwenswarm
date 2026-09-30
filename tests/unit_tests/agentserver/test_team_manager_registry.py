@@ -48,6 +48,23 @@ class _TeamManagerHarness(TeamManager):
         return self._get_lifecycle_lock(session_id)
 
 
+@pytest.mark.asyncio
+async def test_has_resumable_runtime_reflects_runner_pool_entry() -> None:
+    manager = _TeamManagerHarness()
+    manager.stub_resolve_resumable_runner_entry_for_test(
+        lambda _session_id: asyncio.sleep(0, result=("demo-team", object()))
+    )
+    assert await manager.has_resumable_runtime("sess-1") is True
+
+
+@pytest.mark.asyncio
+async def test_has_resumable_runtime_is_false_without_runner_entry() -> None:
+    manager = _TeamManagerHarness()
+    manager.stub_resolve_resumable_runner_entry_for_test(
+        lambda _session_id: asyncio.sleep(0, result=None)
+    )
+    assert await manager.has_resumable_runtime("sess-1") is False
+
 class _FakeRail:
     pass
 
@@ -136,6 +153,141 @@ def setup_function() -> None:
 
 def teardown_function() -> None:
     reset_team_manager()
+
+
+@pytest.mark.asyncio
+async def test_is_runtime_paused_only_for_paused_pool_entry() -> None:
+    manager = _TeamManagerHarness()
+    for state, expected in ((RuntimeState.PAUSED, True), (RuntimeState.RUNNING, False)):
+        entry = SimpleNamespace(state=state)
+        manager.stub_resolve_resumable_runner_entry_for_test(
+            lambda _session_id, entry=entry: asyncio.sleep(0, result=("demo-team", entry))
+        )
+        assert await manager.is_runtime_paused("sess-1") is expected
+
+
+@pytest.mark.asyncio
+async def test_add_leader_note_targets_session_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    add_note = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.add_agent_team_leader_note",
+        add_note,
+    )
+
+    assert await manager.add_leader_note("sess-1", "报表稍后再整理。") is True
+    add_note.assert_awaited_once_with("报表稍后再整理。", team_name="demo-team", session_id="sess-1")
+
+
+def _stub_pool_entry(manager: _TeamManagerHarness, state: RuntimeState) -> None:
+    entry = SimpleNamespace(state=state)
+    manager.stub_resolve_resumable_runner_entry_for_test(
+        lambda _session_id, entry=entry: asyncio.sleep(0, result=("demo-team", entry))
+    )
+
+
+@pytest.mark.asyncio
+async def test_pause_session_members_holds_a_paused_runtime_for_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spoken pause on a barge-in-paused team holds the members down."""
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    _stub_pool_entry(manager, RuntimeState.PAUSED)
+    hold = AsyncMock(return_value=True)
+    pause = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.hold_agent_team_members_on_start",
+        hold,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.pause_agent_team_members",
+        pause,
+    )
+
+    assert await manager.pause_session_members("sess-1") is True
+    hold.assert_awaited_once_with(team_name="demo-team", session_id="sess-1")
+    pause.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pause_session_members_pauses_a_running_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spoken pause on a live team parks the members, leader keeps running."""
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    _stub_pool_entry(manager, RuntimeState.RUNNING)
+    hold = AsyncMock(return_value=True)
+    pause = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.hold_agent_team_members_on_start",
+        hold,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.pause_agent_team_members",
+        pause,
+    )
+
+    assert await manager.pause_session_members("sess-1") is True
+    pause.assert_awaited_once_with(team_name="demo-team", session_id="sess-1")
+    hold.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pause_session_members_without_runtime_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    pause = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.pause_agent_team_members",
+        pause,
+    )
+
+    assert await manager.pause_session_members("sess-1") is False
+
+
+@pytest.mark.asyncio
+async def test_resume_session_members_restarts_only_when_members_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    members_paused = AsyncMock(return_value=False)
+    resume = AsyncMock(return_value=["analyst"])
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.agent_team_members_paused",
+        members_paused,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.resume_agent_team_members",
+        resume,
+    )
+
+    # Nothing held down: a normal team turn must not touch member runtimes.
+    assert await manager.resume_session_members("sess-1") == []
+    resume.assert_not_awaited()
+
+    members_paused.return_value = True
+    assert await manager.resume_session_members("sess-1") == ["analyst"]
+    resume.assert_awaited_once_with(team_name="demo-team", session_id="sess-1")
+
+
+@pytest.mark.asyncio
+async def test_read_member_statuses_normalizes_enum_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openjiuwen.agent_teams.schema.status import MemberStatus
+
+    from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
+
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    read_db = AsyncMock(return_value=[{"member_id": "analyst", "status": MemberStatus.PAUSED}])
+    monkeypatch.setattr(TeamMonitorHandler, "get_member_list_from_db", read_db)
+
+    assert await manager.read_member_statuses("sess-1") == [{"member_id": "analyst", "status": "paused"}]
+    read_db.assert_awaited_once_with("demo-team", exclude_leader=True)
 
 
 def test_get_team_manager_is_singleton() -> None:
@@ -1238,7 +1390,7 @@ async def test_distributed_runtime_activations_switch_atomically(
 
 
 @pytest.mark.asyncio
-async def test_delete_session_runtime_deletes_single_team_session_team(
+async def legacy_delete_session_runtime_deletes_single_team_session_team(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _TeamManagerHarness()
@@ -1277,7 +1429,7 @@ async def test_delete_session_runtime_deletes_single_team_session_team(
 
 
 @pytest.mark.asyncio
-async def test_delete_session_runtime_uses_metadata_not_active_team_name(
+async def legacy_delete_session_runtime_uses_metadata_not_active_team_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _TeamManagerHarness()
@@ -1391,7 +1543,11 @@ async def test_pause_session_runtime_pauses_runner_owned_team_runtime(
     assert paused is True
     assert pause_calls == [("demo-team", "sess-1")]
     assert manager.is_runtime_active("sess-1") is False
-    assert manager.is_session_initialized("sess-1") is True
+    # The parked Runner runtime is preserved, but the completed foreground
+    # stream must not remain marked as initialized.  The next chat.send needs
+    # to enter run_agent_team_streaming again so AgentCore can execute its
+    # RESUME_FROM_PAUSE path and rebuild monitor/event delivery.
+    assert manager.is_session_initialized("sess-1") is False
     assert manager.consume_team_evolution_watcher_deferred("sess-1") is True
 
 
@@ -1442,6 +1598,41 @@ async def test_pause_session_runtime_pauses_controller_before_runner(
 
 
 @pytest.mark.asyncio
+async def test_pause_session_runtime_keeps_stream_when_runner_rejects_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    getattr(manager, "_initialized_sessions").add("sess-1")
+    stream_task = asyncio.create_task(asyncio.sleep(3600))
+    manager.register_stream_task_for_test("sess-1", stream_task)
+
+    async def fake_pause_agent_team(*, team_name: str, session_id: str) -> bool:
+        assert (team_name, session_id) == ("demo-team", "sess-1")
+        return False
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.pause_agent_team",
+        fake_pause_agent_team,
+    )
+
+    try:
+        paused = await manager.pause_session_runtime(
+            "sess-1", reason="interrupt(intent=pause): "
+        )
+
+        assert paused is False
+        assert manager.is_runtime_active("sess-1") is True
+        assert manager.is_session_initialized("sess-1") is True
+        assert manager.has_stream_task("sess-1") is True
+        assert not stream_task.done()
+    finally:
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
+
+
+@pytest.mark.asyncio
 async def test_pause_session_runtime_waits_for_stream_task_graceful_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1474,6 +1665,73 @@ async def test_pause_session_runtime_waits_for_stream_task_graceful_exit(
     assert stream_task.done()
     assert not stream_task.cancelled()
     assert manager.has_stream_task("sess-1") is False
+
+
+def _pause_with_leader_notes(
+    monkeypatch: pytest.MonkeyPatch, manager: _TeamManagerHarness,
+) -> list[str]:
+    notes: list[str] = []
+
+    async def fake_pause_agent_team(*, team_name: str, session_id: str, voice: bool = False) -> bool:
+        return True
+
+    async def fake_add_leader_note(session_id: str, text: str) -> bool:
+        notes.append(text)
+        return True
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.pause_agent_team",
+        fake_pause_agent_team,
+    )
+    monkeypatch.setattr(manager, "add_leader_note", fake_add_leader_note)
+    return notes
+
+
+@pytest.mark.asyncio
+async def test_voice_pause_during_activation_requeues_unadmitted_round_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    notes = _pause_with_leader_notes(monkeypatch, manager)
+    manager.remember_pending_round_query("sess-1", "把周报的截止日期改到周五")
+    await manager.prepare_runtime_activation("sess-1", "demo-team")
+
+    paused = await manager.pause_session_runtime("sess-1", voice=True)
+
+    assert paused is True
+    assert notes == ["把周报的截止日期改到周五"]
+    assert manager.is_runtime_pending("sess-1") is False
+
+
+@pytest.mark.asyncio
+async def test_button_pause_during_activation_does_not_requeue_round_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    notes = _pause_with_leader_notes(monkeypatch, manager)
+    manager.remember_pending_round_query("sess-1", "整理本周的会议纪要")
+    await manager.prepare_runtime_activation("sess-1", "demo-team")
+
+    paused = await manager.pause_session_runtime("sess-1")
+
+    assert paused is True
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_voice_pause_after_runtime_ready_leaves_admitted_input_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    notes = _pause_with_leader_notes(monkeypatch, manager)
+    manager.remember_pending_round_query("sess-1", "整理本周的会议纪要")
+    await manager.prepare_runtime_activation("sess-1", "demo-team")
+    manager.commit_runtime_ready("sess-1", "demo-team")
+
+    paused = await manager.pause_session_runtime("sess-1", voice=True)
+
+    assert paused is True
+    assert notes == []
 
 
 @pytest.mark.asyncio
@@ -1654,6 +1912,92 @@ async def test_interact_restores_resumable_runtime_before_runner_call(
 
 
 @pytest.mark.asyncio
+async def test_interact_discards_paused_entry_with_stopped_native_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    failure_reason = (
+        "deliver_to_leader_failed:[123023] deepagent runtime error, "
+        "reason: NativeHarness already stopped."
+    )
+
+    class _FailedInteract:
+        reason = failure_reason
+
+        def __bool__(self) -> bool:
+            return False
+
+    stop_agent_team = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.interact_agent_team",
+        AsyncMock(return_value=_FailedInteract()),
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.stop_agent_team",
+        stop_agent_team,
+    )
+
+    success, reason = await manager.interact("sess-1", "revised request")
+
+    assert success is False
+    assert reason == failure_reason
+    stop_agent_team.assert_awaited_once_with(
+        team_name="demo-team",
+        session_id="sess-1",
+    )
+    assert manager.get_active_team_name("sess-1") is None
+    assert manager.is_session_initialized("sess-1") is False
+
+
+@pytest.mark.asyncio
+async def test_voice_interact_keeps_runtime_with_stopped_harness_while_stream_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Voice: a resumed round owns the entry until kernel.start rebuilds the harness.
+
+    Tearing it down would kill that round and the spoken input it carries.
+    """
+    manager = _TeamManagerHarness()
+    manager.set_active_runtime_for_test("sess-1", "demo-team")
+    failure_reason = (
+        "deliver_to_leader_failed:[123023] deepagent runtime error, "
+        "reason: NativeHarness already stopped."
+    )
+
+    class _FailedInteract:
+        reason = failure_reason
+
+        def __bool__(self) -> bool:
+            return False
+
+    stop_agent_team = AsyncMock(return_value=True)
+    interact_agent_team = AsyncMock(return_value=_FailedInteract())
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.interact_agent_team",
+        interact_agent_team,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.Runner.stop_agent_team",
+        stop_agent_team,
+    )
+    stream_task = asyncio.create_task(asyncio.sleep(3600))
+    manager.register_stream_task("sess-1", stream_task)
+    try:
+        success, reason = await manager.interact("sess-1", "revised request", voice=True)
+    finally:
+        stream_task.cancel()
+
+    assert interact_agent_team.await_args.kwargs["voice"] is True
+
+    assert success is False
+    assert reason == failure_reason
+    stop_agent_team.assert_not_awaited()
+    assert manager.get_active_team_name("sess-1") == "demo-team"
+    assert manager.has_stream_task("sess-1") is True
+
+
+@pytest.mark.asyncio
 async def test_resolve_resumable_runner_entry_ignores_stale_active_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1827,7 +2171,7 @@ async def test_stop_session_runtime_uses_metadata_team_name_for_non_active_sessi
 
 
 @pytest.mark.asyncio
-async def test_delete_session_runtime_uses_metadata_team_name(
+async def legacy_delete_session_runtime_uses_metadata_team_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _TeamManagerHarness()
@@ -1865,7 +2209,7 @@ async def test_delete_session_runtime_uses_metadata_team_name(
 
 
 @pytest.mark.asyncio
-async def test_delete_session_runtime_falls_back_to_release_without_team_name(
+async def legacy_delete_session_runtime_falls_back_to_release_without_team_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = _TeamManagerHarness()
@@ -2323,3 +2667,97 @@ async def test_cleanup_drops_controller_on_stop_but_keeps_it_across_pause(monkey
 
     await tm._cleanup_runtime_locals("s")                             # stop/cancel path
     assert tm.get_background_task_controller("s") is not ctl
+
+@pytest.mark.asyncio
+async def test_permanent_delete_quiesce_closes_team_execution_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TeamManager()
+    monkeypatch.setattr(manager, "_dispatch_swarmflow_controller", AsyncMock())
+    monkeypatch.setattr(manager, "_cleanup_runtime_locals", AsyncMock())
+    target = SimpleNamespace(descriptor=SimpleNamespace(session_id="deleting-session"))
+
+    await manager.quiesce_for_delete(target, reason="permanent-delete")
+
+    with pytest.raises(RuntimeError, match="permanently deleted"):
+        manager.begin_round("deleting-session", "request-1")
+    with pytest.raises(RuntimeError, match="permanently deleted"):
+        await manager.prepare_runtime_activation("deleting-session", "team-1")
+
+    manager.delete_aborted(target)
+    assert "deleting-session" not in manager._terminal_delete_sessions
+
+    await manager.quiesce_for_delete(target, reason="permanent-delete-retry")
+    manager.delete_committed(target)
+    assert "deleting-session" not in manager._terminal_delete_sessions
+
+
+@pytest.mark.asyncio
+async def test_team_running_window_follows_execution_not_round_or_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only executing members block, even if an old round still owns the stream."""
+    from jiuwenswarm.agents.harness.team import team_manager as team_manager_module
+    from openjiuwen.agent_teams.agent.member_activity import MemberActivityRegistry
+    from openjiuwen.agent_teams.schema.status import MemberStatus
+
+    manager = TeamManager()
+    monkeypatch.setattr(team_manager_module, "_team_manager", manager)
+    session_id = "sess-running"
+
+    assert not team_manager_module.is_team_session_running(session_id)
+
+    manager.begin_request(session_id, "request-1")
+    assert not team_manager_module.is_team_session_running(session_id)
+
+    manager.begin_round(session_id, "request-1")
+    assert not team_manager_module.is_team_session_running(session_id)
+
+    registry = MemberActivityRegistry("leader")
+    agent = SimpleNamespace(
+        is_agent_running=lambda: True,
+        _state=SimpleNamespace(member_registry=registry),
+    )
+    manager._runner_team_agents[session_id] = agent
+    assert team_manager_module.is_team_session_running(session_id)
+    agent.is_agent_running = lambda: False
+    registry.record("leader", MemberStatus.BUSY)  # lagging leader projection
+    assert not team_manager_module.is_team_session_running(session_id)
+    registry.record("peer", MemberStatus.BUSY)
+    assert team_manager_module.is_team_session_running(session_id)
+    registry.record("peer", MemberStatus.PAUSED)
+    assert not team_manager_module.is_team_session_running(session_id)
+
+    # 持久 stream 与常驻运行时在 round 结束后仍然存在，但不得继续算运行中。
+    manager.commit_runtime_ready(session_id, "team-1")
+    manager._stream_tasks[session_id] = SimpleNamespace()  # type: ignore[assignment]
+    await manager.release_round(session_id, "request-1")
+
+    assert not manager.is_round_active(session_id)
+    assert manager.has_stream_task(session_id)
+    assert manager.is_runtime_active(session_id)
+    assert not team_manager_module.is_team_session_running(session_id)
+
+    manager.begin_request(session_id, "request-2")
+    manager.end_request(session_id, "request-2")
+    assert not team_manager_module.is_team_session_running(session_id)
+
+
+@pytest.mark.parametrize("status", ["running", "waiting_for_human", "completed", "failed"])
+@pytest.mark.parametrize("live", [False, True])
+def test_team_running_checks_workflow_execution_only(monkeypatch, status, live):
+    from jiuwenswarm.agents.harness.team import team_manager as module
+
+    manager = TeamManager()
+    monkeypatch.setattr(module, "_team_manager", manager)
+    run = SimpleNamespace(
+        status="running",
+        phases=[SimpleNamespace(agents=[SimpleNamespace(status=status)])],
+    )
+    manager._workflow_handlers["sid"] = SimpleNamespace(get_run_states=lambda: {"wf": run})
+    manager._background_task_controllers["sid"] = SimpleNamespace(
+        _active={"wf": object()} if live else {},
+    )
+    assert module.is_team_session_running("sid") is (live and status == "running")
+    run.status = "paused"
+    assert not module.is_team_session_running("sid")

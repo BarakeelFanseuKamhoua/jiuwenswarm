@@ -1,6 +1,11 @@
+import { PublicationDetailStatus } from '../marketplace/PublicationDetailStatus';
+import { openAssetPublish } from '../../features/assetPublishEvents';
+import { canShowAssetPublish } from '../../features/assetPublishState';
+
 import { useTranslation } from 'react-i18next';
 import {
   getAgentAvatarUrl,
+  type AgentFileContent,
   type AgentDetail,
   type DefinitionFileEntry,
   type RequestStatus,
@@ -9,7 +14,6 @@ import UninstallIcon from '../../assets/agent-management/uninstall.svg?react';
 import PromptSendIcon from '../../assets/agent-management/prompt-send.svg?react';
 import BackIcon from '../../assets/work-mode/arrow-left.svg?react';
 import { DetailPromptChip, DetailSection, EntityHeader, MarkdownPane, PageToolbar, Tabs } from '../ui';
-import { getSkillAvatar } from '../../utils/skillAvatar';
 import { DefinitionFilePreview } from './DefinitionFilePreview';
 
 type DefinitionDetailPageProps = {
@@ -21,7 +25,7 @@ type DefinitionDetailPageProps = {
   filesStatus: RequestStatus;
   filesError: string | null;
   selectedFilePath: string | null;
-  fileContent: { relativePath: string; content: string } | null;
+  fileContent: AgentFileContent | null;
   fileStatus: RequestStatus;
   fileError: string | null;
   actionError: string | null;
@@ -37,6 +41,8 @@ type DefinitionDetailPageProps = {
   onReconnect: (id: string) => void;
   onInstall: (id: string) => void;
   onUninstall: (id: string) => void;
+  onDelete: (id: string, name: string) => void;
+  onEdit: (id: string) => void;
 };
 
 export function DefinitionDetailPage({
@@ -64,40 +70,41 @@ export function DefinitionDetailPage({
   onReconnect,
   onInstall,
   onUninstall,
+  onDelete,
 }: DefinitionDetailPageProps) {
   const { t } = useTranslation();
 
-  if (detailStatus === 'loading' && !detail) {
-    return (
-      <div
-        className="agent-management-detail agent-management-detail--state"
-        data-testid="agent-management-detail-state"
-        data-variant="loading"
-      >
-        <button type="button" className="detail-back" onClick={onBack}>
-          <BackIcon aria-hidden="true" />
-          {t('agentManagement.actions.back')}
-        </button>
-        <p>{t('common.loading')}</p>
-      </div>
-    );
-  }
   if (!detail) {
+    const loading = detailStatus === 'loading';
     return (
-      <div
-        className="agent-management-detail agent-management-detail--state agent-management-state--error"
-        role="alert"
-        data-testid="agent-management-detail-state"
-        data-variant="error"
-      >
-        <button type="button" className="detail-back" onClick={onBack}>
+      <div className={`agent-management-detail${loading ? ' detail-loading-shell' : ''}`} data-testid="agent-detail" aria-busy={loading}>
+        <button type="button" className="detail-back" data-testid="agent-management-detail-back" onClick={onBack}>
           <BackIcon aria-hidden="true" />
           {t('agentManagement.actions.back')}
         </button>
-        <p>{detailError || t('agentManagement.states.detailError')}</p>
-        <button type="button" className="agent-management-button agent-management-button--secondary" onClick={onRetry}>
-          {t('common.retry')}
-        </button>
+        <div
+          className={loading ? 'detail-loading-center' : 'detail-body flex-1 min-h-0 overflow-y-auto pb-[72px]'}
+          data-testid="agent-management-detail-state-body"
+        >
+          <div
+            className={`agent-management-detail--state${loading ? '' : ' agent-management-state--error'}`}
+            data-testid="agent-management-detail-state"
+            data-variant={loading ? 'loading' : undefined}
+            role={loading ? 'status' : 'alert'}
+          >
+            <p>{loading ? t('common.loading') : detailError || t('agentManagement.states.detailError')}</p>
+            {!loading && (
+              <button
+                type="button"
+                className="agent-management-button agent-management-button--secondary"
+                data-testid="agent-management-detail-retry"
+                onClick={onRetry}
+              >
+                {t('common.retry')}
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
@@ -106,6 +113,12 @@ export function DefinitionDetailPage({
   const canUse = detail.installed && detail.connectionState === 'connected' && detail.enabled !== false;
   const needsConnection = detail.installed && detail.connectionState !== 'connected';
   const canDelete = detail.source === 'local' && !detail.installed;
+  const category = detail.category?.trim() || '';
+  const categoryLabel = category
+    ? t(`agentManagement.categories.${category}`, {
+        defaultValue: category,
+      })
+    : null;
   const capabilityGroups = [
     { title: t('agentManagement.detail.tags'), items: detail.tags.map((tag) => ({ id: tag.id, name: tag.label })) },
     { title: t('agentManagement.detail.skills'), items: detail.skills },
@@ -114,21 +127,20 @@ export function DefinitionDetailPage({
     { title: t('agentManagement.detail.mcps'), items: detail.mcps },
   ].filter((group) => group.items.length > 0);
   return (
-    <div className="agent-management-detail" data-testid="agent-management-detail">
-      <button type="button" className="detail-back" onClick={onBack} data-testid="agent-management-detail-back-btn">
+    <div className="agent-management-detail" data-testid="agent-detail">
+      <button type="button" className="detail-back" onClick={onBack} data-testid="agent-management-detail-back">
         <BackIcon aria-hidden="true" />
         {t('agentManagement.actions.back')}
       </button>
       <div className="detail-body flex-1 min-h-0 overflow-y-auto">
+        <PublicationDetailStatus kind="agent_template" localId={detail.runtimePackageName} />
         <EntityHeader
           testId="agent-management-detail-header"
-          avatar={avatarUrl ? <img src={avatarUrl} alt="" /> : getSkillAvatar(detail.displayName)}
+          avatar={{ name: detail.displayName, iconUrl: avatarUrl, testId: 'agent-management-detail-avatar' }}
           title={detail.displayName}
           titleTestId="agent-management-detail-name"
           tags={[
-            t(`agentManagement.categories.${detail.category}`, {
-              defaultValue: detail.category || t('agentManagement.categoryOther'),
-            }),
+            ...(categoryLabel ? [categoryLabel] : []),
             t('agentManagement.detail.sourcePrefix', {
               source: t(`agentManagement.source.${detail.source}`),
             }),
@@ -136,6 +148,22 @@ export function DefinitionDetailPage({
           ]}
           actions={
             <div className="agent-management-detail__actions">
+              {canShowAssetPublish(detail.installed) && (
+                <button
+                  type="button"
+                  className="agent-management-button agent-management-button--secondary"
+                  data-testid="agent-management-agent-template-publish"
+                  onClick={() =>
+                    openAssetPublish({
+                      kind: 'agent_template',
+                      local_id: detail.runtimePackageName,
+                      avatar_url: avatarUrl || undefined,
+                    })
+                  }
+                >
+                  {t('skills.actions.publish')}
+                </button>
+              )}
               {detail.installed ? (
                 <>
                   {needsConnection ? (
@@ -150,16 +178,27 @@ export function DefinitionDetailPage({
                       {busy ? t('agentManagement.actions.connecting') : t('agentManagement.actions.connect')}
                     </button>
                   ) : null}
+
                   <button
                     type="button"
                     className="agent-management-detail-action agent-management-detail-action--uninstall"
                     disabled={busy}
                     aria-busy={busy}
-                    onClick={() => onUninstall(detail.id)}
+                    onClick={() =>
+                      detail.source === 'local' ? onDelete(detail.id, detail.displayName) : onUninstall(detail.id)
+                    }
                     data-testid="agent-management-detail-uninstall-btn"
                   >
                     <UninstallIcon aria-hidden="true" />
-                    {busy ? t('agentManagement.actions.uninstalling') : t('agentManagement.actions.uninstall')}
+                    {t(
+                      detail.source === 'local'
+                        ? busy
+                          ? 'agentManagement.actions.deleting'
+                          : 'agentManagement.actions.delete'
+                        : busy
+                          ? 'agentManagement.actions.uninstalling'
+                          : 'agentManagement.actions.uninstall',
+                    )}
                   </button>
                   <button
                     type="button"
@@ -180,7 +219,7 @@ export function DefinitionDetailPage({
                       className="agent-management-detail-action agent-management-detail-action--uninstall"
                       disabled={busy}
                       aria-busy={busy}
-                      onClick={() => onUninstall(detail.id)}
+                      onClick={() => onDelete(detail.id, detail.displayName)}
                       data-testid="agent-management-detail-delete-btn"
                     >
                       <UninstallIcon aria-hidden="true" />
@@ -289,7 +328,7 @@ export function DefinitionDetailPage({
               ariaLabel={t('agentManagement.detail.tabsLabel')}
               wrapperTestId="agent-management-detail-tabs"
               itemTestId="agent-management-detail-tab"
-              className="text-base"
+              className="page-tabs"
               value={detailTab}
               onChange={onTabChange}
               items={[

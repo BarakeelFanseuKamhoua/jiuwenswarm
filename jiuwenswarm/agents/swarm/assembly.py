@@ -35,8 +35,13 @@ from openjiuwen.agent_teams.paths import (
     configure_global_skills_dir,
     team_home,
 )
+from openjiuwen.agent_teams.external import external_cli_agent_spec_from_template
 from openjiuwen.agent_teams.schema.blueprint import TransportSpec
-from openjiuwen.agent_teams.schema.team import TeamMemberSpec, TeamRole
+from openjiuwen.agent_teams.schema.team import (
+    ExternalCliMemberSpec,
+    TeamMemberSpec,
+    TeamRole,
+)
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
 from openjiuwen.harness.schema.extension_spec import AgentTemplateSpec
@@ -206,6 +211,7 @@ def _apply_agent_group(spec: Any, agent_group_name: str) -> None:
     from jiuwenswarm.agents.swarm.agent_group import load_agent_group_package
     from jiuwenswarm.server.runtime.extension_package_manager import (
         resolve_agent_group_dir,
+        resolve_agent_group_member_display_name,
     )
 
     package_dir = resolve_agent_group_dir(agent_group_name)
@@ -234,19 +240,37 @@ def _apply_agent_group(spec: Any, agent_group_name: str) -> None:
         if agent_name == "leader":
             continue
         member_prompt = _template_team_prompt(template, teammate_base)
-        spec.agents[agent_name] = _with_agent_template(
-            teammate_base.model_copy(deep=True),
-            template,
-        )
-        predefined_members.append(
-            TeamMemberSpec(
+        external_config = external_cli_agent_spec_from_template(template)
+        if external_config is None:
+            spec.agents[agent_name] = _with_agent_template(
+                teammate_base.model_copy(deep=True),
+                template,
+            )
+            member = TeamMemberSpec(
                 member_name=agent_name,
-                display_name=template.agent_card.name or agent_name,
+                display_name=resolve_agent_group_member_display_name(
+                    package_dir,
+                    agent_name,
+                    fallback=template.agent_card.name or agent_name,
+                ),
                 desc=template.agent_card.description or "",
                 prompt=member_prompt,
                 role_type=TeamRole.TEAMMATE,
             )
-        )
+        else:
+            spec.agents[agent_name] = teammate_base.model_copy(deep=True)
+            member = ExternalCliMemberSpec(
+                member_name=agent_name,
+                display_name=resolve_agent_group_member_display_name(
+                    package_dir,
+                    agent_name,
+                    fallback=template.agent_card.name or agent_name,
+                ),
+                desc=template.agent_card.description or "",
+                prompt=member_prompt,
+                external_cli=external_config,
+            )
+        predefined_members.append(member)
 
     spec.predefined_members = predefined_members
     spec.team_mode = "hybrid"

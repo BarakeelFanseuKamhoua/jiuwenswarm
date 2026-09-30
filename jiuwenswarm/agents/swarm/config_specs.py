@@ -46,6 +46,7 @@ from jiuwenswarm.common.config import (
     get_default_model_provider,
     get_evolution_auto_save_enabled,
     get_skill_evolution_enabled,
+    get_symphony_evolution_enabled,
 )
 from jiuwenswarm.common.kv_cache_affinity_config import (
     KVCacheAffinityConfig,
@@ -194,7 +195,6 @@ _CODE_TOOL_NAMES: tuple[str, ...] = (
 )
 
 # code_agent sub-agents are always-on (explore / plan) or config-gated.
-_DEFAULT_SUBAGENT_MAX_ITERATIONS = 15
 
 
 def _is_code_mode(mode: str) -> bool:
@@ -515,10 +515,14 @@ def _code_base_rail_names(role: str) -> tuple[str, ...]:
 
 def _role_evolution_rails(config: dict[str, Any], role: str) -> list[RailSpec]:
     """Return the role-specific skill-evolution rails (shared by both profiles)."""
+    rails: list[RailSpec] = []
+    if role == "leader" and get_symphony_evolution_enabled(config):
+        rails.append(RailSpec(type=registry.SYMPHONY_GRAPH_EVOLUTION, params={}))
     if not get_skill_evolution_enabled(config):
-        return []
+        return rails
     if role == "leader":
         return [
+            *rails,
             RailSpec(
                 type=registry.TEAM_SKILL_EVOLUTION,
                 params=_team_evolution_rail_params(config),
@@ -733,12 +737,11 @@ def _code_subagent_spec(
     elif name == "statusline-setup":
         max_iterations = registry.DEFAULT_STATUSLINE_SETUP_MAX_ITERATIONS
     else:
-        max_iterations = react_cfg.get(
-            "max_iterations",
-            _DEFAULT_SUBAGENT_MAX_ITERATIONS,
-        )
-    if isinstance(sub_cfg, dict) and sub_cfg.get("max_iterations"):
+        max_iterations = react_cfg.get("max_iterations", 100)
+    if isinstance(sub_cfg, dict) and sub_cfg.get("max_iterations") is not None:
         max_iterations = sub_cfg["max_iterations"]
+    if max_iterations is not None:
+        max_iterations = int(max_iterations)
     card_kwargs: dict[str, Any] = {"name": name}
     if name == "statusline-setup":
         card_kwargs["id"] = "jiuwenswarm.statusline-setup"
@@ -747,7 +750,7 @@ def _code_subagent_spec(
         system_prompt="",
         factory_name=factory_name,
         factory_kwargs={
-            "max_iterations": int(max_iterations),
+            "max_iterations": max_iterations,
             "language": language,
         },
     )

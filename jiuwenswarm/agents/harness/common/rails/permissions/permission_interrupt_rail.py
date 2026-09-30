@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from openjiuwen.core.runner.callback import AbortError
@@ -22,6 +23,7 @@ from jiuwenswarm.agents.harness.common.rails.permissions.root_permission_queue_r
 from jiuwenswarm.agents.harness.common.rails.permissions.native_path_context import (
     NativePathGuardProjection, current_native_path_access,
 )
+from jiuwenswarm.common.utils import logger
 
 ExactPermissionPersistCallback = Callable[
     [str, dict[str, Any], tuple[tuple[str, str], ...]], bool
@@ -60,7 +62,42 @@ class JiuwenSwarmPermissionInterruptRail(PermissionInterruptRail):
         if checker is not None and not isinstance(checker, NativePathGuardProjection):
             self._engine._file_guard = NativePathGuardProjection(checker)  # pylint: disable=protected-access
 
+    def _sync_engine_workspace_root(self) -> None:
+        """Refresh file_guard workspace when the host resolver changes."""
+        host = getattr(self, "_host", None)
+        resolver = getattr(host, "resolve_workspace_dir", None) if host is not None else None
+        if resolver is None:
+            return
+        try:
+            workspace = resolver()
+            if workspace is None:
+                return
+            normalized = Path(workspace).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug(
+                "[PermissionInterruptRail] workspace_resolve_failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return
+        engine = self._engine
+        current = getattr(engine, "_workspace_root", None)
+        if current is not None:
+            try:
+                if Path(current).expanduser().resolve(strict=False) == normalized:
+                    return
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.debug(
+                    "[PermissionInterruptRail] workspace_compare_failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+        engine._workspace_root = normalized  # pylint: disable=protected-access
+        engine._rebuild_file_guard()  # pylint: disable=protected-access
+        self._project_native_path_guard()
+
     def update_config(self, *args: Any, **kwargs: Any) -> None:
+        self._sync_engine_workspace_root()
         super().update_config(*args, **kwargs)
         self._project_native_path_guard()
 
@@ -101,6 +138,15 @@ class JiuwenSwarmPermissionInterruptRail(PermissionInterruptRail):
         user_input: Any,
         auto_confirm_config: dict | None = None,
     ) -> Any:
+        # Bug #4851 defense boundary: if the response slot received something
+        # we cannot parse (typically chat text accidentally routed in by the
+        # Host after a cold recovery), reject and audit-log instead of letting
+        # super().resolve_interrupt() silently re-issue the interrupt and skip
+        # the permission chain (which would bypass any session-layer allow rule).
+        rejected = self._reject_unparseable_resume(ctx, tool_call, user_input)
+        if rejected is not None:
+            return rejected
+
         if self._exact_persist_callback is None:
             return await super().resolve_interrupt(
                 ctx, tool_call, user_input, auto_confirm_config
@@ -163,9 +209,58 @@ class JiuwenSwarmPermissionInterruptRail(PermissionInterruptRail):
         updated.pop(key, None)
         session.update_state({INTERRUPT_AUTO_CONFIRM_KEY: updated})
 
+    def _reject_unparseable_resume(
+        self,
+        ctx: AgentCallbackContext,
+        tool_call: Any,
+        user_input: Any,
+    ) -> Any:
+        """Defense boundary for bug #4851 (jiuwenswarm-only fix).
+
+        Returns a ``RejectResult`` when ``user_input`` exists but cannot be
+        parsed into a ``ConfirmPayload`` (chat text, malformed dict, or any
+        other non-parseable shape). Returns ``None`` when ``user_input`` is
+        ``None`` (canonical first entry — pass through) or when it parses
+        cleanly (legitimate resume — pass through to the normal response
+        branch).
+
+        Privacy: the audit log records only the input type, the tool call's
+        name and id, and the session id. The raw user_input is **never**
+        logged.
+        """
+        if user_input is None:
+            return None
+        try:
+            payload = self.parse_confirm_payload(user_input)
+        except Exception:
+            payload = None
+        if payload is not None:
+            return None
+        tool_name = getattr(tool_call, "name", None)
+        tool_id = getattr(tool_call, "id", None)
+        session = getattr(ctx, "session", None)
+        session_id = getattr(session, "session_id", lambda: None)() if session is not None else None
+        logger.warning(
+            "[PermissionInterruptRail] invalid_permission_resume "
+            "reason=unparseable_payload user_input_type=%s tool_name=%s "
+            "tool_call_id=%s session_id=%s",
+            type(user_input).__name__,
+            tool_name,
+            tool_id,
+            session_id,
+        )
+        return self.reject(
+            tool_result=(
+                "[PERMISSION_DENIED] Invalid permission resume payload. "
+                "Only ConfirmPayload-shaped responses are accepted on the "
+                "approval slot."
+            )
+        )
+
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
         if root_nonpermission_resume_from_context(ctx) is not None:
             return
+        self._sync_engine_workspace_root()
         try:
             await super().before_tool_call(ctx)
         except AbortError as exc:

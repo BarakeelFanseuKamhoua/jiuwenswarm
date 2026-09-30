@@ -101,6 +101,18 @@ class PortOnlyHub:
         raise AssertionError("list must not resolve downloads")
 
 
+class QueryRecordingHub(FakeHubAssetPort):
+    def __init__(self, kind: str) -> None:
+        super().__init__(_item(kind=kind))
+        self.requests: list[object] = []
+
+    async def search_assets(self, request) -> HubSearchPage:
+        self.requests.append(request)
+        return HubSearchPage(
+            items=(self.item,), total=1, page=request.page, page_size=request.page_size
+        )
+
+
 class FakeDownloader:
     def __init__(self, *, connectors: tuple[str, ...] = ()) -> None:
         self.calls = 0
@@ -410,6 +422,68 @@ async def test_list_fetches_all_hub_pages(extension_workspace: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "list_catalog"),
+    [
+        ("agent_template", catalog.list_agent_templates_with_hub),
+        ("plugin", catalog.list_plugin_packages_with_hub),
+        ("agent_group", catalog.list_agent_groups_with_hub),
+    ],
+)
+async def test_market_search_forwards_visible_keyword_to_hub(
+    extension_workspace: Path, kind: str, list_catalog
+) -> None:
+    hub = QueryRecordingHub(kind)
+
+    await list_catalog(
+        {"filter": "builtin+hub", "query": "销售 分析", "cache_mode": "prefer_cache"},
+        hub_port=hub,
+    )
+
+    assert len(hub.requests) == 1
+    request = hub.requests[0]
+    assert request.kind == kind
+    assert request.query == "销售 分析"
+
+
+@pytest.mark.asyncio
+async def test_my_equipment_search_never_calls_hub(
+    extension_workspace: Path,
+) -> None:
+    hub = QueryRecordingHub("agent_template")
+
+    await catalog.list_agent_templates_with_hub(
+        {"filter": "mine", "query": "销售"}, hub_port=hub
+    )
+
+    assert hub.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "list_method"),
+    [
+        ("agent_template", catalog.list_agent_templates_with_hub),
+        ("plugin", catalog.list_plugin_packages_with_hub),
+        ("agent_group", catalog.list_agent_groups_with_hub),
+    ],
+)
+async def test_market_search_drops_hub_results_matching_only_internal_asset_id(
+    extension_workspace: Path,
+    kind: str,
+    list_method,
+) -> None:
+    hub = QueryRecordingHub(kind)
+    hub.item = replace(hub.item, asset_id="93e6e963-0896-4473-8655-09f611bcddc8")
+
+    cards = await list_method(
+        {"filter": "builtin+hub", "query": "6"}, hub_port=hub
+    )
+
+    assert cards == []
+
+
+@pytest.mark.asyncio
 async def test_list_hub_failure_keeps_local_catalog(
     extension_workspace: Path,
 ) -> None:
@@ -453,11 +527,41 @@ async def test_same_named_local_package_wins_without_hub_provenance(
     assert [(card["id"], card["source"], card["installed"]) for card in cards] == [
         ("sales-expert", "local", True)
     ]
+    assert cards[0]["avatar"] == "https://example.test/icon.png"
 
 
 @pytest.mark.asyncio
-async def test_list_uses_provenance_to_return_installed_hub_package_once(
+async def test_catalog_list_keeps_hub_card_when_same_named_local_exists(
     extension_workspace: Path,
+) -> None:
+    local = (
+        extension_workspace / "plugins" / "plugin_packages" / "local" / "sales-plugin"
+    )
+    local.mkdir(parents=True)
+    (local / "manifest.json").write_text(
+        json.dumps({"package_type": "plugin", "id": "sales-plugin"}),
+        encoding="utf-8",
+    )
+    catalog.upsert_plugin_marketplace_entry(
+        "sales-plugin", installed=False, source="local"
+    )
+    hub = FakeHubAssetPort(
+        _item("plugin-asset-uuid", "plugin", package_name="sales-plugin")
+    )
+
+    cards = await catalog.list_plugin_packages_with_hub(
+        {"filter": "builtin+hub"}, hub_port=hub
+    )
+
+    assert [(card["id"], card["source"], card["avatar"]) for card in cards] == [
+        ("plugin-asset-uuid", "hub", "https://example.test/icon.png")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_filter", [None, "builtin+hub", "mine"])
+async def test_list_uses_provenance_to_return_installed_hub_package_once(
+    extension_workspace: Path, source_filter,
 ) -> None:
     local = (
         extension_workspace / "plugins" / "agent_templates" / "local" / "sales-expert"
@@ -480,11 +584,14 @@ async def test_list_uses_provenance_to_return_installed_hub_package_once(
         )
     )
 
-    cards = await catalog.list_agent_templates_with_hub({}, hub_port=FakeHubAssetPort())
+    cards = await catalog.list_agent_templates_with_hub({"filter": source_filter}, hub_port=FakeHubAssetPort())
 
     assert [(card["id"], card["source"], card["installed"]) for card in cards] == [
         ("sales-expert", "hub", True)
     ]
+    if source_filter != "mine":
+        assert cards[0]["displayName"]["zh"] == "销售专家"
+        assert cards[0]["avatar"] == "https://example.test/icon.png"
 
 
 @pytest.mark.asyncio
@@ -943,11 +1050,15 @@ async def test_remote_hub_expert_zip_preview_lists_nested_previewable_files(
                 )
                 archive.writestr(
                     f"{artifact.package_name}/persona/sales.md",
-                    "# persona\n",
+                    "# persona\napi_key: sk-preview-secret-12345678\n",
                 )
                 archive.writestr(
                     f"{artifact.package_name}/tools/secret.bin",
                     b"\x00\x01",
+                )
+                archive.writestr(
+                    f"{artifact.package_name}/docs/guide.pdf",
+                    b"%PDF-1.4",
                 )
             return buffer.getvalue()
 
@@ -963,11 +1074,18 @@ async def test_remote_hub_expert_zip_preview_lists_nested_previewable_files(
     preview = await catalog.read_agent_template_file_with_hub(
         asset_id, "persona/sales.md", hub_port=hub, downloader=downloader
     )
+    pdf_preview = await catalog.read_agent_template_file_with_hub(
+        asset_id, "docs/guide.pdf", hub_port=hub, downloader=downloader
+    )
 
     assert any(entry["path"] == "manifest.json" for entry in tree)
     persona = next(entry for entry in tree if entry["path"] == "persona/")
     assert any(child["path"] == "persona/sales.md" for child in persona["children"])
     assert preview["content"].startswith("# persona")
+    assert "sk-preview-secret-12345678" not in preview["content"]
+    assert "******" in preview["content"]
+    assert pdf_preview["content"] is None
+    assert pdf_preview["download_url"].startswith("data:application/pdf;base64,")
     assert downloader.calls == 1
     assert not (
         extension_workspace / "plugins" / "agent_templates" / "hub_preview"
@@ -1093,3 +1211,18 @@ async def test_hub_asset_uuid_remains_external_while_package_name_drives_runtime
     assert [(card["id"], card["installed"]) for card in cards] == [
         (asset_id, False)
     ]
+
+@pytest.mark.asyncio
+async def test_expert_catalog_keeps_hub_card_with_same_named_local_package(extension_workspace):
+    local = extension_workspace / 'plugins' / 'agent_templates' / 'local' / 'sales-expert'
+    local.mkdir(parents=True)
+    (local / 'manifest.json').write_text(json.dumps({'package_type': 'agent_template', 'name': 'sales-expert'}))
+    catalog.upsert_agent_template_marketplace_entry('sales-expert', installed=True, source='local')
+    hub = FakeHubAssetPort(_item(asset_id='remote-expert-id', package_name='sales-expert'))
+    cards = await catalog.list_agent_templates_with_hub({'filter': 'builtin+hub'}, hub_port=hub)
+    assert [(c['id'], c['source']) for c in cards] == [('remote-expert-id', 'hub')]
+    assert cards[0]['avatar'] == hub.item.icon_uri
+    # A matching name alone does not prove the local copy was installed from Hub.
+    assert cards[0]['installed'] is False
+    mine = await catalog.list_agent_templates_with_hub({'filter': 'mine'}, hub_port=hub)
+    assert [(c['id'], c['source']) for c in mine] == [('sales-expert', 'local')]

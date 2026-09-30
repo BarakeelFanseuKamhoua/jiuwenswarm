@@ -38,8 +38,41 @@ function getFileExtension(filename: string): string {
   return filename.slice(idx).toLowerCase();
 }
 
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
+
+/**
+ * Keep a MIME that mimetypes (or the browser) already resolved.
+ * Fill image/webp only when that result is missing or octet-stream.
+ */
+export function resolveImageMimeType(filename: string, mimeType?: string): string {
+  const normalized = (mimeType || '').toLowerCase().split(';')[0].trim();
+  if (normalized && normalized !== 'application/octet-stream') {
+    return normalized;
+  }
+  return IMAGE_MIME_BY_EXTENSION[getFileExtension(filename)] || normalized || 'application/octet-stream';
+}
+
+/** Desktop picks have no browser File; retry still works from base64 or a local path. */
+export function canRetryAttachmentDraft(draft: {
+  file?: unknown;
+  base64Data?: string;
+  localPath?: string;
+}): boolean {
+  if (draft.file) return true;
+  if (typeof draft.base64Data === 'string' && draft.base64Data.length > 0) return true;
+  return typeof draft.localPath === 'string' && draft.localPath.trim().length > 0;
+}
+
 function isImageFile(file: File): boolean {
-  if (ACCEPTED_IMAGE_TYPES.has(file.type)) return true;
+  const type = file.type.toLowerCase();
+  if (ACCEPTED_IMAGE_TYPES.has(type)) return true;
+  if (type && type !== 'application/octet-stream') return false;
   return IMAGE_EXTENSIONS.has(getFileExtension(file.name || ''));
 }
 
@@ -61,20 +94,65 @@ export type ClipboardFileItemLike = {
 
 export type ClipboardDataLike = {
   items?: ArrayLike<ClipboardFileItemLike> | null;
+  files?: ArrayLike<File> | null;
 };
 
 /**
- * Prefer clipboardData.items only — Chromium often mirrors the same screenshot in files.
+ * Prefer clipboardData.items — Chromium often mirrors the same screenshot in files.
+ * Fall back to files only when there are no file items.
  * Do not dedupe by name/size/MIME: distinct images can share those metadata fields.
  */
-export function getClipboardImageFiles(clipboardData: ClipboardDataLike | null | undefined): File[] {
-  if (!clipboardData) return [];
+export function inspectClipboardImageFiles(clipboardData: ClipboardDataLike | null | undefined): {
+  files: File[];
+  hasUnsupportedFiles: boolean;
+} {
   const files: File[] = [];
-  for (const item of Array.from(clipboardData.items || [])) {
-    if (item.kind !== 'file') continue;
-    const file = item.getAsFile();
-    if (!file || !isImageFile(file)) continue;
+  let hasUnsupportedFiles = false;
+  const fileItems = Array.from(clipboardData?.items || []).filter((item) => item.kind === 'file');
+  const clipboardFiles = fileItems.length
+    ? fileItems.map((item) => item.getAsFile())
+    : Array.from(clipboardData?.files || []);
+  for (const file of clipboardFiles) {
+    if (!file || !isImageFile(file)) {
+      hasUnsupportedFiles = true;
+      continue;
+    }
     files.push(ensureClipboardImageFilename(file));
   }
-  return files;
+  return { files, hasUnsupportedFiles };
+}
+
+export function getClipboardImageFiles(clipboardData: ClipboardDataLike | null | undefined): File[] {
+  return inspectClipboardImageFiles(clipboardData).files;
+}
+
+/** Dispatched by desktop context-menu paste when Clipboard API yields image blobs. */
+export const DESKTOP_CLIPBOARD_IMAGES_EVENT = 'jiuwen-desktop-clipboard-images';
+
+export type DesktopClipboardImagesEventDetail = {
+  files?: File[];
+};
+
+/**
+ * Read image blobs via Clipboard API (screenshots / copied bitmaps).
+ * Used when there is no paste ClipboardEvent (e.g. custom context-menu Paste).
+ */
+export async function readClipboardImageFilesFromClipboardApi(
+  clipboard: Clipboard | null | undefined = typeof navigator !== 'undefined' ? navigator.clipboard : undefined,
+): Promise<File[]> {
+  if (!clipboard || typeof clipboard.read !== 'function') return [];
+  try {
+    const items = await clipboard.read();
+    const files: File[] = [];
+    for (const item of items) {
+      const imageType = item.types.find((type) => ACCEPTED_IMAGE_TYPES.has(type.toLowerCase()));
+      if (!imageType) continue;
+      const blob = await item.getType(imageType);
+      const type = ACCEPTED_IMAGE_TYPES.has(blob.type) ? blob.type : imageType.toLowerCase();
+      files.push(ensureClipboardImageFilename(new File([blob], '', { type })));
+    }
+    return files;
+  } catch {
+    return [];
+  }
 }

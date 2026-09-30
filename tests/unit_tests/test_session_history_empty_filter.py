@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 import time
+from concurrent.futures import Future
 
 import pytest
 
@@ -143,6 +144,60 @@ def test_has_persistable_assistant_payload_subagent_activity():
             }
         },
     ) is True
+
+
+def test_has_persistable_assistant_payload_ask_user_question():
+    # 问题澄清对话框载荷在 questions[] 里（无 content），必须落盘才能在刷新后恢复。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_question",
+        extra={
+            "request_id": "req-1",
+            "source": "ask_user_interrupt",
+            "questions": [
+                {"question": "用哪种方案?", "header": "Question", "options": []},
+            ],
+        },
+    ) is True
+    # 空 questions 列表仍应被拒绝（空壳）。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_question",
+        extra={"request_id": "req-2", "source": "ask_user_interrupt", "questions": []},
+    ) is False
+    # 缺少 questions 字段也应被拒绝。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_question",
+        extra={"request_id": "req-3", "source": "ask_user_interrupt"},
+    ) is False
+
+
+def test_has_persistable_assistant_payload_ask_user_answer():
+    # 问题澄清答案载荷在 answers[] 里（无 content），必须落盘才能在刷新后回显。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_answer",
+        extra={
+            "request_id": "req-1",
+            "source": "ask_user_interrupt",
+            "answers": [
+                {"question": "用哪种方案?", "selected_options": ["方案A"]},
+            ],
+        },
+    ) is True
+    # 空 answers 列表仍应被拒绝（空壳）。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_answer",
+        extra={"request_id": "req-2", "source": "ask_user_interrupt", "answers": []},
+    ) is False
+    # 缺少 answers 字段也应被拒绝。
+    assert session_history._has_persistable_assistant_payload(
+        content_text="",
+        event_type="chat.ask_user_answer",
+        extra={"request_id": "req-3", "source": "ask_user_interrupt"},
+    ) is False
 
 
 def test_has_persistable_assistant_payload_usage_summary():
@@ -370,6 +425,24 @@ def test_request_completion_is_persisted_after_prior_history(tmp_path, monkeypat
         session_history.SESSION_REQUEST_COMPLETED_EVENT,
     ]
     assert records[-1]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_history_receipt_timeout_does_not_cancel_writer_future() -> None:
+    receipt: Future[None] = Future()
+
+    with pytest.raises(TimeoutError):
+        await session_history.wait_for_history_receipt(receipt, timeout=0.001)
+
+    assert receipt.cancelled() is False
+    receipt.set_result(None)
+
+
+def test_history_worker_ignores_a_cancelled_receipt() -> None:
+    receipt: Future[None] = Future()
+    receipt.cancel()
+
+    session_history._settle_history_receipt(receipt)
 
 
 def test_append_history_persists_tool_result_with_nested_payload(tmp_path, monkeypatch):

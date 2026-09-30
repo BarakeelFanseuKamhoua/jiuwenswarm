@@ -10,6 +10,9 @@ from openjiuwen.harness.rails.security.tool_security_rail import PermissionInter
 
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
 from jiuwenswarm.agents.harness.common.rails.permissions.auto_permission_rail import AutoPermissionInterruptRail
+from jiuwenswarm.agents.harness.common.rails.permissions.permission_interrupt_rail import (
+    JiuwenSwarmPermissionInterruptRail,
+)
 from jiuwenswarm.server.runtime.agent_adapter import interface, interface_deep
 from jiuwenswarm.server.runtime.agent_adapter.browser_runtime_security import BrowserRuntimeSecurityProfile
 from jiuwenswarm.server.runtime.agent_manager import AgentManager
@@ -19,6 +22,7 @@ from tests.unit_tests.agentserver.permissions.test_permission_lifecycle_integrat
 
 
 @pytest.mark.parametrize("persisted", [True, False, RuntimeError("write failed")])
+@pytest.mark.usefixtures("internal_auto_mode")
 def test_exact_persist_notifies_only_after_success(monkeypatch, tmp_path, persisted):
     persist = Mock(side_effect=persisted if isinstance(persisted, Exception) else None,
                    return_value=persisted)
@@ -69,8 +73,10 @@ def test_facade_propagates_permission_notifier_during_lazy_adapter_creation(monk
 @pytest.mark.parametrize("change", ["permissions", "model", "already_dirty"])
 @pytest.mark.parametrize("installed,desired", [(True, "auto"), (True, "manual"), (False, "auto")])
 async def test_permission_notification_preserves_child_reload_versions(
-    monkeypatch, include_legacy, change, installed, desired,
+    monkeypatch, include_legacy, change, installed, desired, request,
 ):
+    if desired == "auto":
+        request.getfixturevalue("internal_auto_mode")
     router = interface_deep.JiuWenSwarmDeepAdapter()
     config = {"permissions": {"enabled": True, "mode": desired}, "models": {"default": "old"}}
     smart = interface_deep.JiuWenSwarmDeepAdapter()
@@ -239,6 +245,7 @@ async def test_busy_transition_preserves_old_mode_until_settlement(lifecycle, tr
     await h.reload()
     assert h.adapter._enable_auto_permission is (transition == "enter")
     if transition == "exit":
-        assert type(h.adapter._permission_rail) is PermissionInterruptRail
+        assert type(h.adapter._permission_rail) is JiuwenSwarmPermissionInterruptRail
+        assert isinstance(h.adapter._permission_rail, PermissionInterruptRail)
     elif transition == "disable":
         assert h.permissions() == []

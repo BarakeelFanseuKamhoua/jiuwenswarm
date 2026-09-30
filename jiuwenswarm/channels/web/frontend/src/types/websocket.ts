@@ -2,12 +2,9 @@
  * WebSocket 消息类型
  */
 
-export type WebConnectionState =
-  | 'idle'
-  | 'connecting'
-  | 'ready'
-  | 'reconnecting'
-  | 'closed';
+import type { AutoReviewerMetadata } from './message';
+
+export type WebConnectionState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'closed';
 
 export interface WsRequest {
   type: 'req';
@@ -43,6 +40,8 @@ export interface WebRequestOptions {
   isStream?: boolean;
   /** Keep the existing request pending until the runtime confirms acceptance. */
   awaitRuntimeAccepted?: boolean;
+  /** Called before sending, so supplemental receipts can be associated with this request. */
+  onRequestId?: (requestId: string) => void;
 }
 
 export interface WebConnectOptions {
@@ -110,6 +109,12 @@ export interface InterruptResultPayload {
   merged_input?: string;
   paused_task?: string;
   has_active_task?: boolean;  // 是否有活跃任务，false 表示任务已完成
+  settled?: boolean;
+  operation_id?: string;
+  // 语音口令暂停团队后落库的成员状态（后端静默置为 paused，没有 status_changed 事件）
+  team_members?: Array<{ member_id: string; status: string }>;
+  /** Voice pause only: the confirmation shown and spoken in the paused Leader's place. */
+  voice_reply?: string;
 }
 
 /**
@@ -147,17 +152,20 @@ export interface QuestionOption {
  * 问题定义
  */
 export interface Question {
-  card_id?: string;
   question: string;
   header: string;
   options: QuestionOption[];
   multi_select?: boolean;
+  card_id?: string;
+  tool_payload?: unknown;
+  reviewer_metadata?: AutoReviewerMetadata;
 }
 
 /**
  * 用户问题请求 Payload（服务端 -> 客户端）
  */
 export interface AskUserQuestionPayload {
+  duplexJobId?: string;
   request_id: string;
   questions: Question[];
   source?: string; // 来源标识，用于区分自进化确认和工具权限确认

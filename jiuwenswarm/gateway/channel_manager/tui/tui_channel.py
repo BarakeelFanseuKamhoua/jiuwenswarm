@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from jiuwenswarm.common.schema.message import EventType
+from jiuwenswarm.common.session_message import (
+    SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY,
+    SESSION_MESSAGE_OWNER_SCOPE_METADATA_KEY,
+)
 from jiuwenswarm.gateway.channel_manager.base import RobotMessageRouter
 from jiuwenswarm.gateway.routing.base_ws_channel import BaseWsChannel
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
@@ -48,9 +52,14 @@ class TuiChannel(BaseWsChannel):
         super().__init__(config or TuiChannelConfig(), router or RobotMessageRouter())
         self.config: TuiChannelConfig = config or TuiChannelConfig()
         self._on_message_cb: Callable[[Any], Any] | None = None
+        self._voice_mirror_registry: Any = None
 
     def on_message(self, callback: Callable[[Any], Any]) -> None:
         self._on_message_cb = callback
+
+    def set_voice_mirror_registry(self, registry: Any) -> None:
+        """Attach the optional read-only Web mirror."""
+        self._voice_mirror_registry = registry
 
     def _extract_ws_user_id(self, ws: Any) -> str:
         """TuiChannel: 从 ws 提取 GatewayServer 设置的 user_id。"""
@@ -93,6 +102,15 @@ class TuiChannel(BaseWsChannel):
         的 cron 广播分支，对此类消息广播给所有 tui 客户端——多开终端都会收到结果，
         前端按当前活跃会话展示。
         """
+        if self._voice_mirror_registry is not None:
+            try:
+                await self._voice_mirror_registry.mirror(msg, routing_target)
+            except Exception:  # noqa: BLE001 - mirror failure must not break TUI delivery
+                logger.exception(
+                    "[TuiChannel] failed to mirror event id=%s",
+                    getattr(msg, "id", ""),
+                )
+
         # ── 定时任务推 tui：scheduler 对 tui 置空 msg.session_id（见 scheduler
         # _push_to_targets 的 routing_sid 注释），按 session_id 路由会被丢弃。
         # cron 推送（占位 + 结果）带 payload.cron 标记，普通对话 chat.final 不带，
@@ -115,6 +133,34 @@ class TuiChannel(BaseWsChannel):
                 len(clients), getattr(msg, "id", ""),
                 (msg.payload.get("cron") or {}).get("run_id", ""),
             )
+            return
+
+        payload = getattr(msg, "payload", None)
+        if isinstance(payload, dict) and payload.get("event_type") == "session.message.updated":
+            metadata = getattr(msg, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            owner_scope_id = str(metadata.get(SESSION_MESSAGE_OWNER_SCOPE_METADATA_KEY) or "").strip()
+            session_id = getattr(msg, "session_id", None)
+            if not owner_scope_id or not session_id:
+                return
+            anonymous_owner = metadata.get(SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY)
+            if owner_scope_id == "local" and not isinstance(anonymous_owner, bool):
+                return
+            frame = self._serialize_frame(msg)
+            clients: set[Any] = set()
+            for rk, ws_list in self._clients_by_key.items():
+                if rk.session_id != session_id:
+                    continue
+                for ws in ws_list:
+                    user_id = self._extract_ws_user_id(ws)
+                    matches_owner = (
+                        not user_id if anonymous_owner
+                        else rk.user_id == owner_scope_id and user_id == owner_scope_id
+                    )
+                    if not getattr(ws, "closed", False) and matches_owner:
+                        clients.add(ws)
+            for ws in clients:
+                self._enqueue_send(ws, frame)
             return
 
         ws_set: set[Any] = set()

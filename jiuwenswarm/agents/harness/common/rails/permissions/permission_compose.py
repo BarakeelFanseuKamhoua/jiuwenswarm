@@ -13,6 +13,23 @@ logger = logging.getLogger(__name__)
 _SESSION_DROP = frozenset({"deny_tools", "ask_tools", "enabled"})
 _TOOL_LEVELS = frozenset({"allow", "ask", "deny"})
 _NET_ACTIONS = frozenset({"allow", "deny"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
+
+
+def _package_builtin_rules_enabled(layer: dict[str, Any]) -> bool:
+    """Global-only host fact. Missing / invalid defaults to True."""
+    try:
+        from openjiuwen.harness.security.permission_engine.toolguard.builtin_rules import (
+            package_builtin_rules_enabled,
+        )
+    except ImportError:
+        value = layer.get("package_builtin_rules")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in _FALSE_STRINGS:
+            return False
+        return True
+    return package_builtin_rules_enabled(layer)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -62,11 +79,13 @@ def _pick_level(global_lv: str | None, user_lv: str | None, session_lv: str | No
     for lv in (global_lv, user_lv):
         if lv == "deny":
             return "deny"
+    if session_lv == "allow":
+        return "allow"
+    if user_lv == "allow":
+        return "allow"
     for lv in (global_lv, user_lv):
         if lv == "ask":
             return "ask"
-    if session_lv == "allow" and global_lv not in ("deny", "ask") and user_lv not in ("deny", "ask"):
-        return "allow"
     for lv in (global_lv, user_lv, session_lv):
         if lv == "allow":
             return "allow"
@@ -194,6 +213,10 @@ def _compose_net_guard(global_perms: dict[str, Any], user_perms: dict[str, Any])
 
 def _fail_closed(reason: str, enabled: bool) -> dict[str, Any]:
     logger.error("[permissions.compose] fail-closed reason=%s", reason)
+    from jiuwenswarm.agents.harness.common.rails.permissions.tool_capabilities import (
+        shell_tool_names,
+    )
+
     return {
         "enabled": enabled,
         "schema": "tiered_policy",
@@ -202,6 +225,8 @@ def _fail_closed(reason: str, enabled: bool) -> dict[str, Any]:
         "tools": {},
         "rules": [],
         "approval_overrides": [],
+        "categories": {"shell": shell_tool_names()},
+        "package_builtin_rules": True,
         "file_guard": {
             "enabled": True,
             "defaults": {"read": "ask", "write": "ask", "exec": "ask"},
@@ -219,7 +244,11 @@ def compose_host_effective_permissions(
     session_id: str | None = None,
     agent_permissions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Effective = Global ⊕ User ⊕ Session. ``agent_permissions`` is ignored in P1."""
+    """Effective = Global ⊕ User ⊕ Session. ``agent_permissions`` is ignored in P1.
+
+    Whole-tool deny still wins. User allow relaxes Global ask; Session allow
+    relaxes User/Global ask. Session deny/ask fields are dropped.
+    """
     _ = (session_id, agent_permissions)
     try:
         g = _as_dict(global_permissions)
@@ -285,6 +314,18 @@ def compose_host_effective_permissions(
 
         out["net_guard"] = _compose_net_guard(g, u)
         out["shell_guard"] = _compose_shell_guard(g, u)
+
+        from jiuwenswarm.agents.harness.common.rails.permissions.tool_capabilities import (
+            shell_tool_names,
+        )
+
+        # Host facts：User / Session 不得覆盖 shell 工具名单 / 包内 builtin_rules
+        out.pop("categories", None)
+        out["categories"] = {"shell": shell_tool_names()}
+        use_package = _package_builtin_rules_enabled(g)
+        out["package_builtin_rules"] = use_package
+        if not use_package:
+            return out
 
         from openjiuwen.harness.security.permission_engine.fileguard.sensitive_paths import (
             merge_package_sensitive_paths,

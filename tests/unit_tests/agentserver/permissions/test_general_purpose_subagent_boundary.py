@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from openjiuwen.core.single_agent import AgentCard
 from openjiuwen.harness.rails import SubagentRail, SysOperationRail
 from openjiuwen.harness.schema.config import SubAgentConfig
@@ -135,8 +136,106 @@ def test_reload_config_uses_explicit_gp_and_disables_core_injection() -> None:
 
     spec = _gp(config.subagents)
     assert config.add_general_purpose_agent is False
+    assert spec.max_iterations == 3
     assert spec.model is model and spec.tools == [tool.card]
     assert spec.restrict_to_work_dir is False
     assert spec.rails is not None and spec.rails[1] is ordinary
     assert spec.workspace is config.workspace
     assert spec.sys_operation is config.sys_operation is adapter._sys_operation
+
+
+@pytest.mark.asyncio
+async def test_cold_create_passes_only_explicit_gp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = JiuWenSwarmDeepAdapter()
+    adapter.mark_as_session_scoped("gp_boundary")
+    config = {
+        "react": {
+            "agent_name": "root",
+            "workspace_dir": "/tmp/workspace",
+            "subagents": {"general_agent": {"enabled": True}},
+        },
+        "permissions": {"enabled": True},
+    }
+    ordinary, sys_operation = _RailA(), MagicMock()
+    created = MagicMock(ensure_initialized=AsyncMock())
+    monkeypatch.setattr(interface_deep, "get_config", lambda: config)
+
+    with (
+        patch.object(adapter, "set_checkpoint", AsyncMock()),
+        patch.object(adapter, "_refresh_multimodal_configs"),
+        patch.object(adapter, "_create_model", return_value=MagicMock()),
+        patch.object(adapter, "_try_init_a2x_client", AsyncMock()),
+        patch.object(adapter, "_get_tool_cards", AsyncMock(return_value=[])),
+        patch.object(adapter, "_build_agent_rails", return_value=[ordinary]),
+        patch.object(adapter, "_create_sys_operation", return_value=sys_operation),
+        patch.object(adapter, "_build_configured_subagents", return_value=(None, True)),
+        patch.object(adapter, "_register_mcp_servers_from_config", AsyncMock()),
+        patch.object(adapter, "_ensure_cron_tools_registered"),
+        patch.object(adapter, "_load_active_packages", AsyncMock()),
+        patch.object(adapter, "load_user_rails", AsyncMock()),
+        patch.object(
+            interface_deep, "create_deep_agent", return_value=created
+        ) as create,
+    ):
+        await adapter.create_instance()
+
+    kwargs = create.call_args.kwargs
+    spec = _gp(kwargs["subagents"])
+    assert kwargs["add_general_purpose_agent"] is False
+    assert spec.max_iterations == 100
+    assert spec.rails is not None and spec.rails[1] is ordinary
+    assert spec.workspace is kwargs["workspace"]
+    assert spec.sys_operation is kwargs["sys_operation"] is sys_operation
+
+
+def _build_gp(
+    react_config: dict[str, object],
+    *,
+    allow_general: bool = True,
+) -> SubAgentConfig:
+    adapter = JiuWenSwarmDeepAdapter()
+    with patch.object(adapter, "_build_configured_subagents", return_value=(None, True)):
+        subagents = adapter._build_subagents_with_general_purpose(
+            MagicMock(),
+            react_config,
+            {},
+            rails=[SysOperationRail()],
+            tools=[],
+            workspace=Workspace(root_path="/tmp/workspace", language="en"),
+            sys_operation=MagicMock(),
+            reload=False,
+            allow_general=allow_general,
+        )
+    return _gp(subagents)
+
+
+def test_general_purpose_inherits_former_generic_cap_when_unconfigured() -> None:
+    spec = _build_gp({"subagents": {"general_agent": {"enabled": True}}})
+
+    assert spec.max_iterations == 100
+
+
+def test_general_purpose_inherits_configured_generic_cap() -> None:
+    spec = _build_gp(
+        {
+            "max_iterations": 42,
+            "subagents": {"general_agent": {"enabled": True}},
+        }
+    )
+
+    assert spec.max_iterations == 42
+
+
+def test_general_purpose_honors_own_max_iterations() -> None:
+    spec = _build_gp(
+        {
+            "max_iterations": 42,
+            "subagents": {
+                "general_agent": {"enabled": True, "max_iterations": 7},
+            },
+        }
+    )
+
+    assert spec.max_iterations == 7
