@@ -206,6 +206,10 @@ class ReqMethod(Enum):
     PERSONAL_CONTEXT_CONTEXT_SEARCH_PAGES = "personal_context.context.search_pages"
     PERSONAL_CONTEXT_CONTEXT_GET_NODE = "personal_context.context.get_node"
     PERSONAL_CONTEXT_CONTEXT_GET_SOURCE = "personal_context.context.get_source"
+    PERSONAL_CONTEXT_IM_LEARNING_GET_STATUS = (
+        "personal_context.im_learning.get_status"
+    )
+    PERSONAL_CONTEXT_IM_LEARNING_RUN_NOW = "personal_context.im_learning.run_now"
 
     # Plugin management (reuses skills marketplace infrastructure)
     PLUGINS_LIST = "plugins.list"
@@ -314,6 +318,20 @@ class ReqMethod(Enum):
     WORKSPACE_ENTRIES_DELETE = "workspace.entries.delete"
     WORKSPACE_PREVIEW = "workspace.preview"
     WORKSPACE_DOWNLOAD = "workspace.download"
+
+    # User-state IM hosting (数字分身)
+    IM_HOSTING_STATUS = "im.hosting.status"
+    IM_HOSTING_DISCOVER = "im.hosting.discover"
+    IM_HOSTING_TARGETS_LIST = "im.hosting.targets.list"
+    IM_HOSTING_TARGETS_ADD = "im.hosting.targets.add"
+    IM_HOSTING_TARGETS_PATCH = "im.hosting.targets.patch"
+    IM_HOSTING_TARGETS_DELETE = "im.hosting.targets.delete"
+    IM_HOSTING_POLICY_GET = "im.hosting.policy.get"
+    IM_HOSTING_POLICY_PATCH = "im.hosting.policy.patch"
+    IM_HOSTING_POLL_NOW = "im.hosting.poll_now"
+    IM_HOSTING_HISTORY = "im.hosting.history"
+    IM_HOSTING_LOGIN_START = "im.hosting.login.start"
+    IM_HOSTING_LOGIN_STATUS = "im.hosting.login.status"
 
 
 class EventType(Enum):
