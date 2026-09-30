@@ -274,6 +274,7 @@ export const getMemberStatusLabel = (member: TeamMember): string => {
 
 export const getMemberStatusKey = (member: TeamMember): string => {
   const status = normalizeMemberRuntimeState(member);
+  if (status.includes('paus')) return 'paused';
   if (status.includes('execut') || status.includes('running') || status.includes('busy') || status.includes('working')) return 'running';
   if (status.includes('ready') || status.includes('idle')) return 'idle';
   if (status.includes('restart')) return 'restarting';
@@ -289,6 +290,7 @@ export const getMemberStatusDotClass = (member: TeamMember): string => {
   if (key === 'idle') return 'bg-emerald-500';
   if (key === 'error') return 'bg-red-500';
   if (key === 'restarting') return 'bg-amber-500';
+  if (key === 'paused') return 'bg-warn';
   if (key === 'shutdown') return 'bg-gray-400';
   return 'bg-slate-300';
 };

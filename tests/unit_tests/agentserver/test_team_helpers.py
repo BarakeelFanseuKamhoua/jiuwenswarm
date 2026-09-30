@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,6 +43,201 @@ def test_team_event_queue_is_bounded() -> None:
 
     assert queue.maxsize == team_helpers.TEAM_EVENT_QUEUE_MAXSIZE
     assert queue.maxsize > 0
+
+
+@pytest.mark.asyncio
+async def test_team_session_runtime_ignores_resumable_runner_entry() -> None:
+    """A parked (PAUSED) pool entry must not look like a live runtime.
+
+    First-request detection relies on this: after pause/stream-end the next
+    chat.send has to be classified as a first request so AgentCore's
+    RESUME_FROM_PAUSE can re-use the team and reset the closed gate.
+    Counting the entry here would route the message into interact(), which
+    can only fail against the gate of the finished stream.
+    """
+    manager = _InactiveTeamRuntimeManagerMixin()
+    manager.has_resumable_runtime = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    assert await team_helpers._team_session_has_runtime(manager, "session-1") is False
+
+
+@pytest.mark.asyncio
+async def test_team_session_runtime_without_any_marker_is_false() -> None:
+    manager = _InactiveTeamRuntimeManagerMixin()
+    assert await team_helpers._team_session_has_runtime(manager, "session-1") is False
+
+
+_NOT_STARTED_REASON = (
+    "deliver_to_leader_failed:[123023] deepagent runtime error, "
+    "reason: NativeHarness not started. Call start() first."
+)
+
+
+@pytest.mark.asyncio
+async def test_followup_boundary_extends_deadline_while_bootstrap_pending() -> None:
+    """Bootstrap 期 "not started" 失败应续期轮询窗口，等 harness 就绪后投递成功。
+
+    timeout_sec=1.0 而 harness 1.5s 后才就绪：没有续期逻辑时轮询必然超时，
+    有续期时窗口跟随 stream task 存活期，最终投递成功。
+    """
+    # 预热 begin 日志的 query preview：首次 _safe_query_preview 会懒加载
+    # jiuwenswarm config（实测可 >0.2s），不预热的话这笔一次性开销会直接
+    # 吃掉整个轮询窗口，让测试因与续期逻辑无关的原因失败。
+    team_helpers._safe_query_preview("warmup")
+    harness_ready_at = time.monotonic() + 1.5
+
+    class _BootstrappingManager(_InactiveTeamRuntimeManagerMixin):
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            return True
+
+        async def interact(self, session_id: str, query: Any) -> tuple[bool, str | None]:
+            if time.monotonic() < harness_ready_at:
+                return False, _NOT_STARTED_REASON
+            return True, None
+
+    result = await team_helpers._deliver_followup_interact_across_boundary(
+        _BootstrappingManager(),
+        "session-1",
+        "hello",
+        timeout_sec=1.0,
+        poll_interval_sec=0.05,
+        bootstrap_max_wait_sec=10.0,
+    )
+    assert result.success is True
+    assert result.reason is None
+
+
+@pytest.mark.asyncio
+async def test_followup_boundary_waits_while_runtime_starting() -> None:
+    """AgentCore 在 run cycle 启动期返回 runtime_starting，保证首句先入队；follow-up 应等待后投递。"""
+    team_helpers._safe_query_preview("warmup")
+    ready_at = time.monotonic() + 1.5
+
+    class _StartingManager(_InactiveTeamRuntimeManagerMixin):
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            return True
+
+        async def interact(
+            self, session_id: str, query: Any, *, voice: bool = False,
+        ) -> tuple[bool, str | None]:
+            assert voice is True
+            if time.monotonic() < ready_at:
+                return False, "runtime_starting"
+            return True, None
+
+    result = await team_helpers._deliver_followup_interact_across_boundary(
+        _StartingManager(),
+        "session-1",
+        "hello",
+        timeout_sec=1.0,
+        poll_interval_sec=0.05,
+        bootstrap_max_wait_sec=10.0,
+        voice=True,
+    )
+    assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_voice_followup_boundary_waits_for_resumed_harness_rebuild() -> None:
+    """语音：RESUME_FROM_PAUSE 期间 "already stopped" + stream 存活是暂态，应续期直到投递成功。
+
+    暂停后两条语音同时放行：一条经 first-request 恢复团队（gate 已 reset、
+    harness 尚未由 kernel.start 重建），另一条 follow-up 撞上旧 harness。
+    """
+    team_helpers._safe_query_preview("warmup")
+    harness_ready_at = time.monotonic() + 1.5
+    stopped_reason = (
+        "deliver_to_leader_failed:[123023] deepagent runtime error, "
+        "reason: NativeHarness already stopped."
+    )
+
+    class _ResumingManager(_InactiveTeamRuntimeManagerMixin):
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            return True
+
+        async def interact(
+            self, session_id: str, query: Any, *, voice: bool = False,
+        ) -> tuple[bool, str | None]:
+            assert voice is True
+            if time.monotonic() < harness_ready_at:
+                return False, stopped_reason
+            return True, None
+
+    result = await team_helpers._deliver_followup_interact_across_boundary(
+        _ResumingManager(),
+        "session-1",
+        "hello",
+        timeout_sec=1.0,
+        poll_interval_sec=0.05,
+        bootstrap_max_wait_sec=10.0,
+        voice=True,
+    )
+    assert result.success is True
+    assert result.reason is None
+
+
+@pytest.mark.asyncio
+async def test_followup_boundary_does_not_wait_on_stopped_harness_without_voice() -> None:
+    """非语音 follow-up 保持原语义："already stopped" 不续期，截止时间到即放弃。"""
+    team_helpers._safe_query_preview("warmup")
+    stopped_reason = (
+        "deliver_to_leader_failed:[123023] deepagent runtime error, "
+        "reason: NativeHarness already stopped."
+    )
+    calls: list[dict[str, Any]] = []
+
+    class _StoppedManager(_InactiveTeamRuntimeManagerMixin):
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            return True
+
+        async def interact(self, session_id: str, query: Any, **kwargs: Any) -> tuple[bool, str | None]:
+            calls.append(kwargs)
+            return False, stopped_reason
+
+    started = time.monotonic()
+    result = await team_helpers._deliver_followup_interact_across_boundary(
+        _StoppedManager(),
+        "session-1",
+        "hello",
+        timeout_sec=0.3,
+        poll_interval_sec=0.05,
+        bootstrap_max_wait_sec=10.0,
+    )
+    assert result.success is False
+    assert time.monotonic() - started < 1.0
+    assert calls and all(call == {} for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_followup_boundary_stops_waiting_once_bootstrap_stream_ends() -> None:
+    """stream task 消失后不再续期：下个 tick 判 first-request ready，走降级重建。"""
+    class _EndedBootstrapManager(_InactiveTeamRuntimeManagerMixin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stream_task_alive = True
+
+        def has_stream_task(self, session_id: str) -> bool:
+            return self.stream_task_alive
+
+        async def interact(self, session_id: str, query: Any) -> tuple[bool, str | None]:
+            # 第一次 interact 后 bootstrap 流结束，模拟建队失败/收尾
+            self.stream_task_alive = False
+            return False, _NOT_STARTED_REASON
+
+    result = await team_helpers._deliver_followup_interact_across_boundary(
+        _EndedBootstrapManager(),
+        "session-1",
+        "hello",
+        timeout_sec=5.0,
+        poll_interval_sec=0.01,
+        bootstrap_max_wait_sec=5.0,
+    )
+    assert result.success is False
+    assert result.first_request_ready is True
+    assert result.reason == _NOT_STARTED_REASON
 
 
 def test_agent_group_selection_inherits_session_binding(
@@ -2029,6 +2225,226 @@ async def test_heartbeat_team_followup_waits_for_real_round_and_routes_once(monk
     assert (await browser_queue.get())["content"] == "interactive"
 
 
+def _voice_pause_script_manager(session_id: str, script: list[tuple[float, dict]]):
+    """Real TeamManager whose interact() plays a timed script of leader events.
+
+    The voice members-pause round is a follow-up with no pre-existing
+    interactive waiter (barge-in tore the previous stream down), so the request
+    attaches its own waiter; has_stream_task keeps the runtime "alive" exactly
+    like the parked-team stream in production.
+    """
+    from jiuwenswarm.agents.harness.team.team_manager import TeamManager
+
+    class _ScriptManager(TeamManager):
+        def has_stream_task(self, sid: str) -> bool:
+            return sid == session_id
+
+        async def get_swarm_enriched_team_spec(self, **kwargs):
+            return SimpleNamespace(team_name="unit-team")
+
+        async def interact(self, sid: str, query, **_kwargs):
+            async def _run_script() -> None:
+                for delay, event in script:
+                    await asyncio.sleep(delay)
+                    await self.broadcast_event(
+                        sid, {"role": "leader", "rid": 5, **event},
+                    )
+
+            asyncio.create_task(_run_script())
+            return True, None
+
+    return _ScriptManager()
+
+
+def _voice_pause_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        session_id="sess-voice-pause",
+        request_id="req-voice-pause",
+        channel_id="web",
+        metadata=None,
+        params={
+            "mode": "team",
+            "voice_pause_members": True,
+            "voice_display_text": "把报表任务先停一停。",
+        },
+    )
+
+
+async def _collect_voice_pause_chunks(manager, monkeypatch, *, timeout: float = 5.0):
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda channel_id: manager)
+    monkeypatch.setattr(team_helpers, "_persist_team_file_monitor_roots", lambda *args: None)
+
+    async def _collect() -> list:
+        collected = []
+        async for chunk in team_helpers.process_team_message_stream(
+            _voice_pause_request(),
+            {"query": "把报表任务先停一停"},
+            object(),
+        ):
+            collected.append(chunk)
+        return collected
+
+    # 修复缺失时该请求永不自行结束（stream task 常驻、无终态事件），
+    # wait_for 把挂死变成确定的测试失败。
+    return await asyncio.wait_for(_collect(), timeout=timeout)
+
+
+@pytest.mark.anyio
+async def test_voice_members_pause_round_ends_after_quiet_window(monkeypatch):
+    """答复落地且队列静默满窗口后，语音成员级暂停请求必须结束并释放 waiter。
+
+    否则下一句语音只能作为 deferred follow-up 骑在本轮流上（outcome=unknown、
+    回复要等会话级兜底才来）。
+    """
+    monkeypatch.setattr(team_helpers, "_VOICE_PAUSE_QUIET_SECONDS", 0.25)
+    manager = _voice_pause_script_manager(
+        "sess-voice-pause",
+        [(0.05, {"event_type": "chat.final", "content": "好的，成员已暂停。"})],
+    )
+
+    chunks = await _collect_voice_pause_chunks(manager, monkeypatch)
+
+    payloads = [chunk.payload for chunk in chunks if chunk.payload is not None]
+    assert [p["event_type"] for p in payloads] == ["chat.final"]
+    assert payloads[0]["content"] == "好的，成员已暂停。"
+    assert chunks[-1].is_complete is True
+    # waiter 已释放：下一句语音会挂自己的 waiter 走请求级流式。
+    assert manager.has_interactive_waiter("sess-voice-pause") is False
+
+
+@pytest.mark.anyio
+async def test_voice_members_pause_holds_through_leader_tool_chain(monkeypatch):
+    """工具链期间的静默（tool_call→tool_result、结果→下一次模型输出）不算答复完成。
+
+    静默窗口在工具事件后必须被扣住，直到最后一个 leader final 落地。
+    """
+    monkeypatch.setattr(team_helpers, "_VOICE_PAUSE_QUIET_SECONDS", 0.25)
+    # 0.15→0.75 的静默远超窗口：没有工具链扣住逻辑就会提前结束请求。
+    manager = _voice_pause_script_manager(
+        "sess-voice-pause",
+        [
+            (0.05, {"event_type": "chat.final", "content": "先确认一下状态。"}),
+            (0.10, {"event_type": "chat.tool_call", "tool": "pause_members"}),
+            (0.60, {"event_type": "chat.tool_result", "ok": True}),
+            (0.05, {"event_type": "chat.final", "content": "已全部暂停。"}),
+        ],
+    )
+
+    chunks = await _collect_voice_pause_chunks(manager, monkeypatch)
+
+    payloads = [chunk.payload for chunk in chunks if chunk.payload is not None]
+    assert [p["event_type"] for p in payloads] == [
+        "chat.final",
+        "chat.tool_call",
+        "chat.tool_result",
+        "chat.final",
+    ]
+    assert chunks[-1].is_complete is True
+    assert manager.has_interactive_waiter("sess-voice-pause") is False
+
+
+@pytest.mark.anyio
+async def test_voice_members_pause_delivers_all_leader_finals(monkeypatch):
+    """一个 turn 内多个 leader final（工具分段）都要投递，不能见第一个就收。
+
+    见 team_helpers 对 persistent Team stream 多 final 的说明。
+    """
+    monkeypatch.setattr(team_helpers, "_VOICE_PAUSE_QUIET_SECONDS", 0.25)
+    manager = _voice_pause_script_manager(
+        "sess-voice-pause",
+        [
+            (0.05, {"event_type": "chat.final", "content": "第一段。"}),
+            (0.08, {"event_type": "chat.final", "content": "第二段。"}),
+        ],
+    )
+
+    chunks = await _collect_voice_pause_chunks(manager, monkeypatch)
+
+    payloads = [chunk.payload for chunk in chunks if chunk.payload is not None]
+    finals = [p for p in payloads if p["event_type"] == "chat.final"]
+    assert [p["content"] for p in finals] == ["第一段。", "第二段。"]
+    assert chunks[-1].is_complete is True
+
+
+@pytest.mark.anyio
+async def test_voice_members_pause_ends_immediately_on_terminal_status(monkeypatch):
+    """终态 processing_status（team 完成/空闲/流关闭）一到就结束，不等静默窗口。"""
+    monkeypatch.setattr(team_helpers, "_VOICE_PAUSE_QUIET_SECONDS", 5.0)
+    manager = _voice_pause_script_manager(
+        "sess-voice-pause",
+        [
+            (0.05, {"event_type": "chat.final", "content": "好的，成员已暂停。"}),
+            (
+                0.05,
+                {
+                    "event_type": "chat.processing_status",
+                    "session_id": "sess-voice-pause",
+                    "is_processing": False,
+                    "is_complete": True,
+                },
+            ),
+        ],
+    )
+
+    # 窗口被放大到 5s：若没有终态直通分支，2s 内收不完。
+    chunks = await _collect_voice_pause_chunks(manager, monkeypatch, timeout=2.0)
+
+    payloads = [chunk.payload for chunk in chunks if chunk.payload is not None]
+    assert [p["event_type"] for p in payloads] == [
+        "chat.final",
+        "chat.processing_status",
+    ]
+    assert chunks[-1].is_complete is True
+    assert manager.has_interactive_waiter("sess-voice-pause") is False
+
+
+@pytest.mark.anyio
+async def test_non_voice_followup_without_pause_flag_keeps_deferred_path(monkeypatch):
+    """不带 voice_pause_members 的普通 follow-up 不受静默窗口影响，仍走 deferred 短流。"""
+    monkeypatch.setattr(team_helpers, "_VOICE_PAUSE_QUIET_SECONDS", 0.25)
+
+    class _FakeManager(_InactiveTeamRuntimeManagerMixin):
+        @staticmethod
+        def has_stream_task(session_id: str) -> bool:
+            return True
+
+        @staticmethod
+        async def get_swarm_enriched_team_spec(**kwargs):
+            return SimpleNamespace(team_name="unit-team")
+
+        @classmethod
+        async def interact(cls, session_id: str, query: str, **_kwargs):
+            return True, None
+
+    manager = _FakeManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda channel_id: manager)
+    request = SimpleNamespace(
+        session_id="sess-team-plain-followup",
+        request_id="req-team-plain-followup",
+        channel_id="web",
+        metadata=None,
+        params={"mode": "team", "voice_display_text": "把报表任务先停一停。"},
+    )
+
+    async def _collect() -> list:
+        collected = []
+        async for chunk in team_helpers.process_team_message_stream(
+            request, {"query": "把报表任务先停一停"}, object(),
+        ):
+            collected.append(chunk)
+        return collected
+
+    chunks = await asyncio.wait_for(_collect(), timeout=2.0)
+
+    # mixin 的 has_interactive_waiter 缺省不可用 → 无 waiter → deferred 短流
+    assert len(chunks) == 2
+    assert chunks[0].payload == {
+        "event_type": "chat.processing_status_deferred",
+        "session_id": "sess-team-plain-followup",
+    }
+    assert chunks[-1].is_complete is True
+
+
 @pytest.mark.anyio
 async def test_interactive_followup_attaches_after_headless_heartbeat(monkeypatch):
     """A user can consume a stream whose only previous waiter was Heartbeat."""
@@ -2299,6 +2715,11 @@ async def test_concurrent_team_cold_start_delivers_output_once(monkeypatch, firs
     async def _runner(channel_id, session_id, spec, query, **kwargs):
         starts.append(_delivered_content(query))
         runner_started.set()
+        # 真实 _consume_stream_with_query 收到 team.runtime_ready 块后会
+        # commit_runtime_ready（置 active、清 pending、唤醒等待中的 follow-up）；
+        # 假 runner 必须同样提交，否则并发 follow-up 会在
+        # wait_for_runtime_ready 里等满超时，而不是立即投递。
+        manager.commit_runtime_ready(session_id, "unit-team")
         try:
             await emit_output.wait()
             await manager.broadcast_event(
@@ -3034,6 +3455,10 @@ async def test_process_team_message_stream_restarts_round_after_shutdown_race(mo
             )
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
             captured["prepared"] = (session_id, team_name)
 
@@ -3138,6 +3563,10 @@ async def test_process_team_message_stream_fallback_reuses_first_request_directi
             return False, "gate_closed"
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
             captured["prepared"] = (session_id, team_name)
 
@@ -3231,6 +3660,10 @@ async def test_process_team_message_stream_silences_gate_closed_when_shutdown_ra
             assert session_id == "sess-team-followup-timeout"
             assert _delivered_content(query) == "还在收尾"
             return False, "gate_closed"
+
+        @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
 
         @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
@@ -3373,6 +3806,10 @@ async def test_process_team_message_stream_resumes_active_session_without_stream
             return True, None
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(*_args, **_kwargs):
             pytest.fail("active team sessions should not be recreated")
 
@@ -3432,6 +3869,10 @@ async def test_process_team_message_stream_routes_evolution_interrupt_to_active_
         @staticmethod
         async def get_swarm_enriched_team_spec(**kwargs):
             return SimpleNamespace(team_name="unit-team", enable_swarmflow=False)
+
+        @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
 
         @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
@@ -3527,6 +3968,10 @@ async def test_process_team_message_stream_resumes_structured_team_plan_confirm_
             return True, None
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
             raise AssertionError("prepare_runtime_activation should not run for resumed approval")
 
@@ -3600,6 +4045,10 @@ async def test_process_team_message_stream_rejects_orphaned_interactive_input(mo
         @staticmethod
         async def get_swarm_enriched_team_spec(**_kwargs):
             pytest.fail("orphaned interactive inputs should not recreate team runtime")
+
+        @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
 
         @staticmethod
         async def prepare_runtime_activation(*_args, **_kwargs):
@@ -3743,6 +4192,10 @@ async def test_process_team_message_stream_treats_plain_query_as_first_request_a
         @staticmethod
         async def get_swarm_enriched_team_spec(**_kwargs):
             return SimpleNamespace(team_name="unit-team", enable_swarmflow=False)
+
+        @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
 
         @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str):
@@ -3890,6 +4343,10 @@ async def test_process_team_message_stream_defers_first_evolve_until_team_runtim
             )
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str) -> None:
             return None
 
@@ -3955,6 +4412,10 @@ async def test_process_team_message_stream_runs_evolve_followup_without_rail(mon
             )
 
         @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
+
+        @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str) -> None:
             return None
 
@@ -4015,6 +4476,10 @@ async def test_process_team_message_stream_does_not_emit_evolution_status_for_no
                 team_name="unit-team",
                 workspace=SimpleNamespace(root_path=str(tmp_path / "team-workspace")),
             )
+
+        @staticmethod
+        def remember_pending_round_query(session_id: str, query) -> None:
+            return None
 
         @staticmethod
         async def prepare_runtime_activation(session_id: str, team_name: str) -> None:

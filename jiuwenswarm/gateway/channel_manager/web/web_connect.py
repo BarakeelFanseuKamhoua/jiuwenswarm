@@ -1819,6 +1819,14 @@ class WebChannel(BaseWsChannel):
         }
         return frame
 
+    def serialize_event_frame(
+        self,
+        msg: Any,
+        routing_target: RoutingTarget | None = None,
+    ) -> dict[str, Any]:
+        """Public serializer for read-only consumers of Web event frames."""
+        return self._serialize_frame(msg, routing_target)
+
     @staticmethod
     def _parse_req_method(method: str) -> ReqMethod | None:
         for item in ReqMethod:

@@ -24,6 +24,7 @@ import { useTranslation } from 'react-i18next';
 import { CircleAlert } from 'lucide-react';
 import { ApplicationTaskControls } from '../../applicationPlugins/ApplicationTaskControls';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
+import { useChatStore } from '../../stores/chatStore';
 import type { TeamTask as SessionTeamTask } from '../../stores/sessionStore';
 import { LoadingSpinner } from '../ui/LoadingSpinner/LoadingSpinner';
 import statusSuccessIcon from '../../assets/work-mode/status-success.svg';
@@ -64,6 +65,11 @@ export function CompactTaskList({
   onTaskClick,
 }: CompactTaskListProps) {
   const { t } = useTranslation();
+  // A paused Team keeps its in-flight tasks in the running column; show them
+  // as parked rather than spinning, which reads as still being worked on.
+  const teamPaused = useChatStore(state =>
+    state.activeSessionId ? Boolean(state.runtimes[state.activeSessionId]?.isPaused) : false,
+  );
 
   if (tasks.length === 0) {
     return (
@@ -87,14 +93,21 @@ export function CompactTaskList({
         const assigneeName = getMemberDisplayName(task.assignee || '');
         const title = getBoardTaskTitle(task);
         const columnKey = getTaskColumnKey(task);
+        const pausedRunning = teamPaused && columnKey === 'running';
         const statusIcon = renderStatusIcon ? (
           renderStatusIcon(task)
         ) : columnKey === 'running' ? (
           <span
             className="flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden"
             data-testid="team-area-task-planning-task-status-icon"
+            data-variant={pausedRunning ? 'paused' : columnKey}
+            title={pausedRunning ? t('team.memberStatus.paused') : undefined}
           >
-            <LoadingSpinner />
+            {pausedRunning ? (
+              <img src={statusWaitingIcon} className="h-4 w-4 shrink-0" aria-hidden="true" />
+            ) : (
+              <LoadingSpinner />
+            )}
           </span>
         ) : columnKey === 'cancelled' ? (
           <span

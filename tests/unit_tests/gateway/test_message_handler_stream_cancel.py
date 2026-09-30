@@ -63,6 +63,35 @@ class _HangingAgentClient:
             yield env
 
 
+class _BlockingInterruptAgentClient:
+    def __init__(self, extra_payload: dict | None = None) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.extra_payload = extra_payload or {}
+
+    async def send_request(self, env: object) -> SimpleNamespace:
+        self.started.set()
+        await self.release.wait()
+        return SimpleNamespace(
+            request_id=getattr(env, "request_id", "strong-pause"),
+            channel_id="web",
+            ok=True,
+            payload={
+                "event_type": "chat.interrupt_result",
+                "intent": "pause",
+                "success": True,
+                "message": "任务已暂停",
+                **self.extra_payload,
+            },
+            metadata=None,
+        )
+
+    @staticmethod
+    async def send_request_stream(env: object):
+        if False:
+            yield env
+
+
 class _FailedCancelAgentClient:
     @staticmethod
     async def send_request(env: object) -> SimpleNamespace:
@@ -218,6 +247,90 @@ async def test_tui_non_stream_request_times_out_before_frontend_request(monkeypa
         "error": "AgentServer request timed out",
         "code": "AGENT_SERVER_TIMEOUT",
     }
+
+
+@pytest.mark.asyncio
+async def test_strong_pause_notifies_only_after_agent_runtime_has_settled() -> None:
+    client = _BlockingInterruptAgentClient()
+    handler = _TestMessageHandler.create_with_client(client)
+    await handler.start_forwarding()
+    try:
+        pause_msg = Message(
+            id="strong-pause-request",
+            type="req",
+            channel_id="web",
+            session_id="sess-strong-pause",
+            params={
+                "intent": "pause",
+                "mode": "team",
+                "wait_for_completion": True,
+                "operation_id": "voice-barge-in-1",
+            },
+            timestamp=0.0,
+            ok=True,
+            req_method=ReqMethod.CHAT_CANCEL,
+            is_stream=False,
+        )
+        await handler.publish_user_messages(pause_msg)
+        await asyncio.wait_for(client.started.wait(), timeout=1.0)
+
+        # Unlike the normal optimistic pause path, barge-in must not tell the
+        # browser it is safe to dispatch a new command while the runner is
+        # still tearing down.
+        assert await handler.consume_robot_messages(timeout=0.01) is None
+
+        client.release.set()
+        result = await handler.consume_robot_messages(timeout=1.0)
+        assert result is not None
+        assert result.payload == {
+            "event_type": "chat.interrupt_result",
+            "intent": "pause",
+            "success": True,
+            "message": "任务已暂停",
+            "has_active_task": False,
+            "settled": True,
+            "operation_id": "voice-barge-in-1",
+        }
+    finally:
+        client.release.set()
+        await handler.stop_forwarding()
+
+
+@pytest.mark.asyncio
+async def test_strong_pause_forwards_settled_team_member_statuses() -> None:
+    members = [{"member_id": "analyst", "status": "paused"}]
+    client = _BlockingInterruptAgentClient(
+        extra_payload={"team_members": members, "voice_reply": "团队任务已暂停。"}
+    )
+    client.release.set()
+    handler = _TestMessageHandler.create_with_client(client)
+    await handler.start_forwarding()
+    try:
+        await handler.publish_user_messages(Message(
+            id="spoken-pause-request",
+            type="req",
+            channel_id="web",
+            session_id="sess-spoken-pause",
+            params={
+                "intent": "pause",
+                "mode": "team",
+                "wait_for_completion": True,
+                "operation_id": "voice-pause-1",
+                "voice": True,
+                "voice_display_text": "先停一下手头的报表任务。",
+            },
+            timestamp=0.0,
+            ok=True,
+            req_method=ReqMethod.CHAT_CANCEL,
+            is_stream=False,
+        ))
+        result = await handler.consume_robot_messages(timeout=1.0)
+        assert result is not None
+        assert result.payload["settled"] is True
+        assert result.payload["team_members"] == members
+        assert result.payload["voice_reply"] == "团队任务已暂停。"
+    finally:
+        await handler.stop_forwarding()
 
 
 @pytest.mark.asyncio

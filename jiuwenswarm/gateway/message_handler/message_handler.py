@@ -353,6 +353,9 @@ class MessageHandler(ABC):
         self._disconnect_cancel_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._stream_app_ids: dict[str, str] = {}  # request_id -> app_id, 多应用流式精确路由
         self._fire_and_forget_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
+        # Team pause is session-scoped and may wait on native-harness cleanup.
+        # Keep the forward loop free; chat.send streams await this barrier.
+        self._session_pause_barriers: dict[str, asyncio.Task] = {}
         self._evolution_approval = EvolutionApprovalCoordinator()
         # 配置仅在启动/成功热重载时解析；流式 chunk 热路径直接读取该内存值，
         # 避免每个审批事件重新读取磁盘配置。
@@ -542,10 +545,14 @@ class MessageHandler(ABC):
             msg.metadata["member_name"] = mname
 
         self._remember_user_query_context(msg)
+        _enqueue_ts = time.time()
         self._user_messages.put_nowait(msg)
         logger.info(
-            "[MessageHandler] _user_messages 入队: id=%s channel_id=%s session_id=%s",
-            msg.id, msg.channel_id, msg.session_id,
+            "[DispatchTrace] gateway_inbound_enqueued request_id=%s method=%s channel_id=%s "
+            "session_id=%s is_stream=%s queue_size=%s enqueue_ts=%.6f",
+            msg.id, getattr(msg.req_method, "value", msg.req_method), msg.channel_id,
+            msg.session_id, msg.is_stream,
+            getattr(self._user_messages, "qsize", lambda: -1)(), _enqueue_ts,
         )
 
     async def _maybe_register_godview(self, msg: "Message") -> None:
@@ -4364,6 +4371,15 @@ class MessageHandler(ABC):
                 msg = await self.consume_user_messages(timeout=None)
                 if msg is None:
                     continue
+                if msg.req_method in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_CANCEL):
+                    logger.info(
+                        "[DispatchTrace] gateway_inbound_dequeued request_id=%s method=%s "
+                        "channel_id=%s session_id=%s queue_age_sec=%.3f queue_size=%s",
+                        msg.id, getattr(msg.req_method, "value", msg.req_method), msg.channel_id,
+                        msg.session_id,
+                        max(0.0, time.time() - float(getattr(msg, "timestamp", time.time()))),
+                        getattr(self._user_messages, "qsize", lambda: -1)(),
+                    )
 
                 # Explicit steer/follow_up is normalized before slash commands.
                 # Busy-session chat.send is classified later, after the target
@@ -4668,7 +4684,6 @@ class MessageHandler(ABC):
                                     else str(pr_state.mode)
                                 )
                         env_interrupt = self.message_to_e2a(agent_msg)
-                        asyncio.create_task(self._send_interrupt_to_agent(env_interrupt))
                         # 检查当前 session 是否有活跃的流式任务
                         current_sid = msg.session_id
                         has_active_task = False
@@ -4676,11 +4691,112 @@ class MessageHandler(ABC):
                             if self._stream_sessions.get(rid) == current_sid and not task.done():
                                 has_active_task = True
                                 break
-                        # 通知前端状态变更（事件）
-                        await self._send_interrupt_result_notification(
-                            msg.id, msg.channel_id, msg.session_id, intent,
-                            has_active_task=has_active_task,
-                        )
+                        source_params = msg.params if isinstance(msg.params, dict) else {}
+                        wait_for_completion = bool(source_params.get("wait_for_completion"))
+                        operation_id = source_params.get("operation_id")
+                        if not isinstance(operation_id, str) or not operation_id.strip():
+                            operation_id = None
+
+                        if wait_for_completion:
+                            _wait_t0 = time.perf_counter()
+                            logger.info(
+                                "[DispatchTrace] interrupt_wait_begin request_id=%s intent=%s "
+                                "session_id=%s has_active_task=%s operation_id=%s",
+                                msg.id, intent, msg.session_id, has_active_task, operation_id,
+                            )
+                            # 语音 barge-in 需要强顺序保证：旧 Team Runner 真正暂停完成后，
+                            # 前端才可发送刚识别出的新指令。普通按钮暂停仍走下面的乐观通知，
+                            # 避免改变现有交互的响应速度。
+                            pause_task = asyncio.create_task(
+                                self._send_interrupt_to_agent(
+                                    env_interrupt,
+                                    channel_id=msg.channel_id,
+                                    session_id=msg.session_id,
+                                    metadata=msg.metadata,
+                                    notify_on_completion=True,
+                                    notification_request_id=msg.id,
+                                    intent=intent,
+                                    has_active_task=has_active_task,
+                                    operation_id=operation_id,
+                                ),
+                                name=f"session-pause-{msg.session_id or 'default'}",
+                            )
+                            if intent == "pause" and msg.session_id:
+                                previous = self._session_pause_barriers.get(msg.session_id)
+
+                                async def _pause_sequence(
+                                    prior: asyncio.Task | None = previous,
+                                    current: asyncio.Task = pause_task,
+                                ) -> None:
+                                    if prior is not None and not prior.done():
+                                        try:
+                                            await asyncio.shield(prior)
+                                        except Exception:
+                                            pass
+                                    await asyncio.shield(current)
+
+                                barrier = asyncio.create_task(
+                                    _pause_sequence(),
+                                    name=f"session-pause-barrier-{msg.session_id}",
+                                )
+                                self._session_pause_barriers[msg.session_id] = barrier
+
+                                def _clear_pause_barrier(
+                                    done: asyncio.Task,
+                                    sid: str = msg.session_id,
+                                ) -> None:
+                                    if self._session_pause_barriers.get(sid) is done:
+                                        self._session_pause_barriers.pop(sid, None)
+
+                                barrier.add_done_callback(_clear_pause_barrier)
+                            logger.info(
+                                "[DispatchTrace] interrupt_wait_deferred request_id=%s intent=%s "
+                                "session_id=%s operation_id=%s elapsed_sec=%.3f",
+                                msg.id, intent, msg.session_id, operation_id,
+                                time.perf_counter() - _wait_t0,
+                            )
+                        else:
+                            interrupt_task = asyncio.create_task(
+                                self._send_interrupt_to_agent(
+                                    env_interrupt,
+                                    channel_id=msg.channel_id,
+                                    session_id=msg.session_id,
+                                    metadata=msg.metadata,
+                                )
+                            )
+                            if intent == "pause" and msg.session_id:
+                                previous = self._session_pause_barriers.get(msg.session_id)
+
+                                async def _pause_sequence(
+                                    prior: asyncio.Task | None = previous,
+                                    current: asyncio.Task = interrupt_task,
+                                ) -> None:
+                                    if prior is not None and not prior.done():
+                                        try:
+                                            await asyncio.shield(prior)
+                                        except Exception:
+                                            pass
+                                    await asyncio.shield(current)
+
+                                barrier = asyncio.create_task(
+                                    _pause_sequence(),
+                                    name=f"session-pause-barrier-{msg.session_id}",
+                                )
+                                self._session_pause_barriers[msg.session_id] = barrier
+
+                                def _clear_pause_barrier(
+                                    done: asyncio.Task,
+                                    sid: str = msg.session_id,
+                                ) -> None:
+                                    if self._session_pause_barriers.get(sid) is done:
+                                        self._session_pause_barriers.pop(sid, None)
+
+                                barrier.add_done_callback(_clear_pause_barrier)
+                            # 普通暂停/恢复沿用乐观通知。
+                            await self._send_interrupt_result_notification(
+                                msg.id, msg.channel_id, msg.session_id, intent,
+                                has_active_task=has_active_task,
+                            )
 
                     continue
 
@@ -4821,8 +4937,10 @@ class MessageHandler(ABC):
                             )
 
                 logger.info(
-                    "[MessageHandler] dispatch: request_id=%s channel=%s session_id=%s user_id=%s is_stream=%s",
+                    "[DispatchTrace] gateway_dispatch_start request_id=%s method=%s channel=%s "
+                    "session_id=%s user_id=%s is_stream=%s",
                     msg.id,
+                    getattr(msg.req_method, "value", msg.req_method),
                     msg.channel_id,
                     msg.session_id,
                     getattr(msg, "user_id", "") or "",
@@ -4942,6 +5060,11 @@ class MessageHandler(ABC):
         try:
             await self._sync_agentos_cron_jobs(env)
             await self._apply_session_login_owner(env)
+            logger.info(
+                "[DispatchTrace] gateway_agent_stream_rpc_begin request_id=%s channel=%s "
+                "session_id=%s",
+                rid, channel_id, session_id,
+            )
             async for chunk in self.agent_client.send_request_stream(env):
                 _proc_count += 1
                 if _proc_count <= 3:
@@ -4988,6 +5111,11 @@ class MessageHandler(ABC):
             logger.info(
                 "[MessageHandler] Stream 正常完成: request_id=%s total_chunks=%s",
                 rid, _proc_count,
+            )
+            logger.info(
+                "[DispatchTrace] gateway_agent_stream_rpc_end request_id=%s total_chunks=%s "
+                "cancelled=%s",
+                rid, _proc_count, cancelled,
             )
         except asyncio.CancelledError:
             cancelled = True
@@ -5199,22 +5327,36 @@ class MessageHandler(ABC):
         self._stream_modes[stream_rid] = (
             msg.params.get("mode", "plan") if isinstance(msg.params, dict) else "plan"
         )
-        if emit_processing_status:
-            await self._send_processing_status(
-                stream_rid,
-                msg.session_id,
-                msg.channel_id,
-                is_processing=True,
-                app_id=msg.app_id or "",
-            )
-        task = asyncio.create_task(
-            self.process_stream(
+        async def _run_after_session_pause() -> None:
+            barrier = self._session_pause_barriers.get(msg.session_id or "")
+            if barrier is not None and not barrier.done():
+                logger.info(
+                    "[DispatchTrace] chat_send_wait_pause request_id=%s session_id=%s",
+                    stream_rid, msg.session_id,
+                )
+                try:
+                    await asyncio.shield(barrier)
+                except Exception:
+                    logger.warning(
+                        "[DispatchTrace] chat_send_pause_barrier_failed request_id=%s session_id=%s",
+                        stream_rid, msg.session_id,
+                    )
+            if emit_processing_status:
+                await self._send_processing_status(
+                    stream_rid,
+                    msg.session_id,
+                    msg.channel_id,
+                    is_processing=True,
+                    app_id=msg.app_id or "",
+                )
+            await self.process_stream(
                 env,
                 msg.session_id,
                 msg.metadata,
                 emit_processing_status=emit_processing_status,
             )
-        )
+
+        task = asyncio.create_task(_run_after_session_pause())
         self._stream_tasks[stream_rid] = task
         self._stream_channels[stream_rid] = msg.channel_id
         self._stream_sessions[stream_rid] = msg.session_id
@@ -5234,26 +5376,73 @@ class MessageHandler(ABC):
         channel_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
+        notify_on_completion: bool = False,
+        notification_request_id: str | None = None,
+        intent: str | None = None,
+        has_active_task: bool | None = None,
+        operation_id: str | None = None,
     ) -> None:
-        """Fire-and-forget: 发送中断到 AgentServer，不阻塞转发循环.
+        """发送中断到 AgentServer；普通中断后台执行，强暂停由调用方等待完成。
 
-        ``interrupt_result`` 已由调用方提前推送；此处仍要把响应里的
+        普通路径的 ``interrupt_result`` 已由调用方提前推送；此处仍要把响应里的
         ``cancelled_tools`` 转成 ``chat.tool_result``，否则前端 tool 卡片会一直转圈，
-        直到刷新历史才看到 ``[Interrupted]``.
+        直到刷新历史才看到 ``[Interrupted]``。强暂停路径则在 AgentServer 真正完成后
+        由这里发送带 ``settled`` 和 ``operation_id`` 的结果。
         """
+        _interrupt_t0 = time.perf_counter()
+        logger.info(
+            "[DispatchTrace] interrupt_agent_rpc_start request_id=%s intent=%s session_id=%s "
+            "channel_id=%s operation_id=%s notify_on_completion=%s",
+            getattr(env, "request_id", ""), intent, session_id, channel_id, operation_id,
+            notify_on_completion,
+        )
         try:
             resp = await self._send_non_stream_agent_request(env)
             logger.info(
-                "[MessageHandler] AgentServer 中断响应: request_id=%s ok=%s",
-                resp.request_id, resp.ok,
+                "[DispatchTrace] interrupt_agent_rpc_end request_id=%s ok=%s elapsed_sec=%.3f",
+                resp.request_id, resp.ok, time.perf_counter() - _interrupt_t0,
             )
             payload = resp.payload if isinstance(resp.payload, dict) else {}
             ch = (channel_id or getattr(env, "channel", None) or "").strip()
             sid = (session_id or getattr(env, "session_id", None) or "").strip()
             if ch and sid and payload.get("cancelled_tools"):
                 await self._send_cancelled_tool_results(ch, sid, payload, metadata)
+            if notify_on_completion and ch and sid and intent:
+                response_success = bool(resp.ok) and payload.get("success") is not False
+                response_message = payload.get("message")
+                team_members = payload.get("team_members")
+                voice_reply = payload.get("voice_reply")
+                await self._send_interrupt_result_notification(
+                    notification_request_id or resp.request_id,
+                    ch,
+                    sid,
+                    intent,
+                    message=response_message if isinstance(response_message, str) else None,
+                    success=response_success,
+                    has_active_task=has_active_task,
+                    settled=True,
+                    operation_id=operation_id,
+                    team_members=team_members if isinstance(team_members, list) else None,
+                    voice_reply=voice_reply if isinstance(voice_reply, str) else None,
+                )
         except Exception as e:
-            logger.warning("[MessageHandler] AgentServer 中断请求失败(忽略): %s", e)
+            logger.warning(
+                "[DispatchTrace] interrupt_agent_rpc_error request_id=%s elapsed_sec=%.3f "
+                "error_type=%s error=%s",
+                getattr(env, "request_id", ""), time.perf_counter() - _interrupt_t0,
+                type(e).__name__, e,
+            )
+            if notify_on_completion and channel_id and session_id and intent:
+                await self._send_interrupt_result_notification(
+                    notification_request_id or getattr(env, "request_id", ""),
+                    channel_id,
+                    session_id,
+                    intent,
+                    success=False,
+                    has_active_task=has_active_task,
+                    settled=True,
+                    operation_id=operation_id,
+                )
 
     async def _send_interrupt_result_notification(
         self,
@@ -5264,6 +5453,10 @@ class MessageHandler(ABC):
         message: str | None = None,
         success: bool = True,
         has_active_task: bool | None = None,
+        settled: bool = False,
+        operation_id: str | None = None,
+        team_members: list | None = None,
+        voice_reply: str | None = None,
     ) -> None:
         """发送 interrupt_result 事件到前端（pause / resume 等）."""
         from jiuwenswarm.common.schema.message import Message, EventType
@@ -5294,6 +5487,17 @@ class MessageHandler(ABC):
         }
         if has_active_task is not None:
             payload_dict["has_active_task"] = has_active_task
+        if settled:
+            payload_dict["settled"] = True
+        if operation_id:
+            payload_dict["operation_id"] = operation_id
+        if team_members is not None:
+            # Settled team pause: members are marked paused in the DB without a
+            # status event, so clients take the settled statuses from here.
+            payload_dict["team_members"] = team_members
+        if voice_reply:
+            # Spoken answer to a voice pause, which the paused leader cannot give.
+            payload_dict["voice_reply"] = voice_reply
         notify_msg = Message(
             id=request_id,
             type="event",
@@ -5484,6 +5688,10 @@ class MessageHandler(ABC):
         self._stream_emits_processing_status.clear()
         self._stream_methods.clear()
         self._stream_modes.clear()
+        for barrier in list(self._session_pause_barriers.values()):
+            if not barrier.done():
+                barrier.cancel()
+        self._session_pause_barriers.clear()
         pending_disconnect_cancels = list(self._disconnect_cancel_tasks.values())
         for task in pending_disconnect_cancels:
             if not task.done():

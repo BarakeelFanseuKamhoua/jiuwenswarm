@@ -20,7 +20,22 @@
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { AtSign, ChevronRight, CircleX, Loader2, Lock, Mic, Plus, Settings, Square, Workflow, X } from 'lucide-react';
+import {
+  AtSign,
+  ChevronRight,
+  CircleX,
+  Loader2,
+  Lock,
+  Mic,
+  MicOff,
+  Plus,
+  Power,
+  Settings,
+  Square,
+  Workflow,
+  X,
+} from 'lucide-react';
+import type { RealtimeVoiceController } from '../../hooks/useRealtimeVoice';
 
 // import { stopAllTts } from '../../utils';
 import {
@@ -302,12 +317,21 @@ function isDefaultProject(project: ProjectInfo): boolean {
   return project.is_default || project.project_id === 'default' || project.project_id === 'default_code';
 }
 
+export type InputAreaRealtimeVoiceControl = {
+  controller: RealtimeVoiceController;
+  error: string;
+  isPreparing: boolean;
+  canStart: boolean;
+  onToggle: () => Promise<void>;
+};
+
 interface InputAreaProps {
   onSubmit: (content: string, mediaItems?: MediaItem[]) => void;
   onEnsureSession: (initialTitle?: string) => Promise<string | null>;
   onForkSession: (sourceSessionId: string) => Promise<void>;
   /** Signals that the user is editing an existing real Session. */
   onInputIntent?: (sessionId: string) => void;
+  realtimeVoiceControl: InputAreaRealtimeVoiceControl;
   onPersistMedia: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
   onPersistDocuments: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
   /** Delete an unsent image copy under the session uploads directory. */
@@ -694,6 +718,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onEnsureSession,
     onForkSession,
     onInputIntent,
+    realtimeVoiceControl,
     onPersistMedia,
     onPersistDocuments,
     onDiscardMedia,
@@ -1004,6 +1029,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setPickerTab(isTeamMode ? 'group' : 'agent');
   }, [isAgentMode, isTeamMode]);
 
+  const {
+    controller: realtimeVoice,
+    error: realtimeVoiceError,
+    isPreparing: isPreparingVoice,
+    canStart: canStartRealtimeVoice,
+    onToggle: onToggleRealtimeVoice,
+  } = realtimeVoiceControl;
+  const realtimeVoiceStatus = realtimeVoice.state === 'connecting'
+    ? t('chat.realtimeVoiceConnecting')
+    : realtimeVoice.state === 'thinking'
+      ? t('chat.realtimeVoiceThinking')
+      : realtimeVoice.state === 'speaking'
+        ? t('chat.realtimeVoiceSpeaking')
+        : realtimeVoice.isMicrophoneEnabled
+          ? t('chat.realtimeVoiceListening')
+          : t('chat.realtimeVoiceMicrophoneOff');
   const isWorkContextLocked = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
   const showWorkContextRow = activeSessionId === NEW_CONVERSATION_ID;
   /** Goal 入口是否适用于当前上下文（agent 模式 + 已接入 onSetGoal，如欢迎页新会话就不适用） */
@@ -3280,6 +3321,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           )}
 
           <div className="chat-input-body" data-testid="chat-panel-input-body">
+            {realtimeVoice.isActive && (
+              <div className="chat-input-realtime-voice-bar" role="status" aria-live="polite">
+                <span className="chat-input-realtime-voice-dot" />
+                <span>{realtimeVoiceStatus}</span>
+                {realtimeVoice.transcript && (
+                  <span className="chat-input-realtime-voice-transcript">{realtimeVoice.transcript}</span>
+                )}
+              </div>
+            )}
+
+            {isTeamMode && realtimeVoice.state === 'error' && realtimeVoiceError && (
+              <div className="chat-input-realtime-voice-error" role="alert">
+                {realtimeVoiceError}
+              </div>
+            )}
+
             {attachments.length > 0 && (
               <div className="chat-input-attachment-panel" data-testid="chat-panel-input-attachment-panel">
                 <div
@@ -4434,6 +4491,66 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               </div>
 
               <div className="chat-input-actions" data-testid="chat-panel-input-actions">
+                {isTeamMode && (
+                  <button
+                    type="button"
+                    onClick={() => void onToggleRealtimeVoice()}
+                    disabled={
+                      !realtimeVoice.isSupported
+                      || !canStartRealtimeVoice
+                      || isPreparingVoice
+                      || realtimeVoice.state === 'connecting'
+                    }
+                    className={cx(
+                      'chat-input-btn chat-input-btn--realtime-voice',
+                      realtimeVoice.isMicrophoneEnabled && 'chat-input-btn--realtime-voice-active',
+                      (!realtimeVoice.isSupported || !canStartRealtimeVoice)
+                        && 'chat-input-btn--disabled',
+                    )}
+                    title={
+                      !realtimeVoice.isSupported
+                          ? t('chat.realtimeVoiceUnsupported')
+                          : isPreparingVoice
+                            ? t('chat.realtimeVoicePreparing')
+                          : !realtimeVoice.isActive
+                            ? t('chat.realtimeVoiceStart')
+                            : realtimeVoice.isMicrophoneEnabled
+                              ? t('chat.realtimeVoiceMuteMicrophone')
+                              : t('chat.realtimeVoiceUnmuteMicrophone')
+                    }
+                    aria-label={
+                      !realtimeVoice.isActive
+                        ? t('chat.realtimeVoiceStart')
+                        : realtimeVoice.isMicrophoneEnabled
+                          ? t('chat.realtimeVoiceMuteMicrophone')
+                          : t('chat.realtimeVoiceUnmuteMicrophone')
+                    }
+                  >
+                    {realtimeVoice.state === 'connecting' || isPreparingVoice ? (
+                      <Loader2 className="chat-input-btn-icon chat-input-realtime-voice-spin" aria-hidden="true" />
+                    ) : realtimeVoice.isMicrophoneEnabled || !realtimeVoice.isActive ? (
+                      <Mic className="chat-input-btn-icon" aria-hidden="true" />
+                    ) : (
+                      <MicOff className="chat-input-btn-icon" aria-hidden="true" />
+                    )}
+                  </button>
+                )}
+
+                {isTeamMode && (
+                  <button
+                    type="button"
+                    onClick={() => void realtimeVoice.stop()}
+                    disabled={!realtimeVoice.isActive}
+                    className={cx(
+                      'chat-input-btn',
+                      !realtimeVoice.isActive && 'chat-input-btn--disabled',
+                    )}
+                    title={t('chat.realtimeVoiceEndSession')}
+                    aria-label={t('chat.realtimeVoiceEndSession')}
+                  >
+                    <Power className="chat-input-btn-icon" aria-hidden="true" />
+                  </button>
+                )}
                 {/* {speechSupported && (
             <button
               type="button"

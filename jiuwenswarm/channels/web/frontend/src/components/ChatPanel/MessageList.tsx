@@ -39,6 +39,7 @@ const EMPTY_REASONING: ReasoningSegment[] = [];
 
 interface MessageListProps {
   messages: Message[];
+  processingOverride?: boolean;
   renderAfterMessage?: (message: Message) => ReactNode;
   canLoadOlderHistory?: boolean;
   onLoadOlderHistory?: () => void | Promise<void>;
@@ -58,6 +59,7 @@ interface ChatTimelineListProps {
   staticTimeline?: boolean;
   /** 静态历史预览可逐批准入；分享导出保持完整静态 DOM。 */
   virtualized?: boolean;
+  processingOverride?: boolean;
   mode?: string;
   disableA2UIInteraction?: boolean;
   incrementalStaticRendering?: boolean;
@@ -188,6 +190,7 @@ export function TurnElapsed({
   teamLayout,
   teamLeaderIdentity,
   teamGroupIdentity,
+  processingOverride = false,
 }: {
   startMs: number;
   endMs: number;
@@ -198,9 +201,10 @@ export function TurnElapsed({
   teamLayout: boolean;
   teamLeaderIdentity?: TeamLeaderIdentity | null;
   teamGroupIdentity?: AgentGroupIdentity | null;
+  processingOverride?: boolean;
 }) {
   const { t } = useTranslation();
-  const active = isLastTurn && isProcessing;
+  const active = isLastTurn && (isProcessing || processingOverride);
   const now = useNow(active);
   const end = active ? now : endMs;
   const rawElapsed = Math.max(0, end - startMs);
@@ -254,6 +258,7 @@ export function TurnElapsed({
 
 function CompletedWorkChip({
   variant,
+  interrupted = false,
   thinkingCount = 0,
   toolCount = 0,
   outcomeTone = 'neutral',
@@ -267,6 +272,7 @@ function CompletedWorkChip({
   teamGroupIdentity,
 }: {
   variant: 'turn' | 'streak';
+  interrupted?: boolean;
   thinkingCount?: number;
   toolCount?: number;
   outcomeTone?: 'success' | 'partial' | 'error' | 'neutral';
@@ -282,14 +288,19 @@ function CompletedWorkChip({
   const { t } = useTranslation();
   // 耗时并入 turn 折叠条文案（原底部 TurnElapsed 已移除），位置唯一不再打架。
   const label =
-    variant === 'turn'
+    interrupted
+      ? t('chatUi.workInterrupted')
+      : variant === 'turn'
       ? elapsedMs > 0
         ? `${t('chatUi.turnElapsed')} ${formatDurationPrecise(elapsedMs)}`
         : t('chatUi.workCompletedFallback')
       : formatStreakSummaryLabel(t, thinkingCount, toolCount, outcomeTone);
   // 图标统一用 status-waiting 时钟资源，状态色仍由 is-success/is-partial/is-error 通过 currentColor 区分。
   const applyOutcome = variant === 'streak';
-  const toneClass = !applyOutcome
+  const showErrorIcon = !interrupted && applyOutcome && outcomeTone === 'error';
+  const toneClass = interrupted
+    ? 'is-interrupted'
+    : !applyOutcome
     ? 'is-success'
     : outcomeTone === 'error'
       ? 'is-error'
@@ -316,7 +327,19 @@ function CompletedWorkChip({
         aria-hidden="true"
         data-testid="chat-panel-completed-work-chip-icon"
       >
-        <WaitingStatusIcon />
+        {interrupted ? (
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="10" cy="10" r="6.5" />
+            <path d="M7.6 7.6h4.8v4.8H7.6z" />
+          </svg>
+        ) : showErrorIcon ? (
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="10" cy="10" r="6.5" />
+            <path d="m7.6 7.6 4.8 4.8M12.4 7.6l-4.8 4.8" />
+          </svg>
+        ) : (
+          <WaitingStatusIcon />
+        )}
       </span>
       <span className="completed-work-chip__label" data-testid="chat-panel-completed-work-chip-label">
         {label}
@@ -521,6 +544,7 @@ export function ChatTimelineList({
   reasoningSegments: reasoningSegmentsProp,
   staticTimeline = false,
   virtualized = !staticTimeline,
+  processingOverride = false,
   mode = 'default',
   disableA2UIInteraction = false,
   incrementalStaticRendering = false,
@@ -545,7 +569,7 @@ export function ChatTimelineList({
   const storeReasoningSegments = useChatStore(
     (s) => s.runtimes[s.activeSessionId ?? '']?.reasoningSegments ?? EMPTY_REASONING,
   );
-  const isProcessing = staticTimeline ? false : storeIsProcessing;
+  const isProcessing = staticTimeline ? false : storeIsProcessing || processingOverride;
   const allReasoningSegments = reasoningSegmentsProp ?? (staticTimeline ? EMPTY_REASONING : storeReasoningSegments);
   const publishedBatchSeq = staticTimeline
     ? Number.MAX_SAFE_INTEGER
@@ -724,6 +748,7 @@ export function ChatTimelineList({
     <CompletedWorkChip
       key={`${timelineScope}/completed-work-${turnKey}`}
       variant="turn"
+      interrupted={meta.interrupted}
       outcomeTone={meta.outcomeTone}
       expanded={Boolean(expandedTurns[turnKey])}
       onToggle={() => toggleTurn(turnKey)}
@@ -869,6 +894,7 @@ export function ChatTimelineList({
           teamLayout={isTeamMode}
           teamLeaderIdentity={teamLeaderIdentity}
           teamGroupIdentity={teamGroupIdentity}
+          processingOverride={processingOverride}
         />
       );
     }
@@ -911,6 +937,7 @@ export function ChatTimelineList({
 
 export function MessageList({
   messages,
+  processingOverride,
   renderAfterMessage,
   canLoadOlderHistory,
   onLoadOlderHistory,
@@ -931,6 +958,7 @@ export function MessageList({
     <ChatTimelineList
       messages={messages}
       executions={executions}
+      processingOverride={processingOverride}
       mode={mode}
       renderAfterMessage={renderAfterMessage}
       sessionId={activeSessionId}

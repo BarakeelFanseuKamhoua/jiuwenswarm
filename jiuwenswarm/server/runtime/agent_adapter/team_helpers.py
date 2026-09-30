@@ -60,6 +60,10 @@ from jiuwenswarm.server.runtime.session.session_history import append_history_re
 from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
 from jiuwenswarm.server.utils.stream_utils import parse_stream_chunk
 from jiuwenswarm.server.runtime.agent_adapter.user_turn import TEAM_USER_TURN_KEY, UserTurn
+from jiuwenswarm.server.runtime.agent_adapter.voice_request import (
+    is_voice_members_pause_params,
+    is_voice_request_params,
+)
 from jiuwenswarm.common.schema.agent import AgentResponseChunk
 from jiuwenswarm.server.runtime.agent_adapter.evolution_helpers import (
     EvolutionProgressStatus,
@@ -126,6 +130,20 @@ from jiuwenswarm.server.runtime.debug_trace.directives import (
 )
 _FOLLOWUP_INTERACT_BOUNDARY_TIMEOUT_SEC = 10.0
 _FOLLOWUP_INTERACT_POLL_INTERVAL_SEC = 0.05
+# 硬上限：bootstrap 续期最多把 follow-up 轮询拉长到这个时长（秒）。
+# "NativeHarness not started" 且 stream task 仍在时是团队正在建立的暂态，
+# 轮询窗口应跟随 stream task 生命周期续期，而不是固定 10s 赛跑。
+_FOLLOWUP_BOOTSTRAP_MAX_WAIT_SEC = 300.0
+# 语音成员级暂停：leader 答复落地后，请求队列静默满这个窗口即结束该请求
+# （finally 释放 waiter，下一句语音才能挂上自己的 waiter 走请求级流式）。
+# 窗口必须盖住 final→usage/tool_call 的同响应尾随间隔（亚秒级），又要在
+# 用户听完答复再说下一句之前过期。
+_VOICE_PAUSE_QUIET_SECONDS = 2.5
+# 这些事件说明 leader 本轮还有工具链在跑（结果和后续模型调用都会再来），
+# 静默窗口不应在此期间触发；只有下一个 chat.final 才算答复真正落地。
+_VOICE_PAUSE_TOOL_EVENT_TYPES = frozenset(
+    {"chat.tool_call", "chat.tool_update", "chat.tool_result"}
+)
 _TEAM_HEARTBEAT_SERVICE: ContextVar[Any | None] = ContextVar(
     "team_heartbeat_service",
     default=None,
@@ -513,9 +531,44 @@ def _build_logical_targets(event: dict) -> list[dict]:
 def _is_followup_delivery_boundary_reason(reason: str | None) -> bool:
     """Return whether follow-up delivery likely hit a runtime boundary."""
     normalized = str(reason or "")
-    if normalized in {"agent_unavailable", "gate_closed", "not_active"}:
+    if normalized in {"agent_unavailable", "gate_closed", "not_active", "runtime_starting"}:
         return True
     return normalized.startswith("deliver_to_leader_failed:")
+
+
+def _is_bootstrap_pending_reason(reason: str | None, *, voice: bool = False) -> bool:
+    """Return whether the failure means the runtime is still bootstrapping.
+
+    ``NativeHarness not started`` (stream task still assembling the team) is a
+    transient state that resolves on its own once bootstrap finishes, unlike
+    ``already stopped`` which marks a dead entry.  The former is worth waiting
+    for; the latter is torn down by TeamManager.interact.
+
+    ``runtime_starting`` only comes back for voice follow-ups (AgentCore holds
+    them until the run cycle's own input is enqueued, preserving turn order).
+    For voice, ``already stopped`` is transient too while a stream task is
+    alive: a RESUME_FROM_PAUSE round re-opens the interact gate before
+    ``kernel.start`` rebuilds the harness that the pause stopped, and
+    TeamManager.interact keeps that runtime for voice.
+    Callers must pair this with a live stream-task check.
+    """
+    normalized = str(reason or "").lower()
+    if normalized == "runtime_starting" or "not started" in normalized:
+        return True
+    return voice and "already stopped" in normalized
+
+
+async def _interact_team(
+    team_manager: Any,
+    session_id: str,
+    payload: Any,
+    *,
+    voice: bool = False,
+) -> tuple[bool, str | None]:
+    """Deliver a follow-up; voice follow-ups opt into voice interact semantics."""
+    if voice:
+        return await team_manager.interact(session_id, payload, voice=True)
+    return await team_manager.interact(session_id, payload)
 
 
 @dataclass(slots=True)
@@ -535,24 +588,68 @@ async def _deliver_followup_interact_across_boundary(
     initial_reason: str | None = None,
     timeout_sec: float = _FOLLOWUP_INTERACT_BOUNDARY_TIMEOUT_SEC,
     poll_interval_sec: float = _FOLLOWUP_INTERACT_POLL_INTERVAL_SEC,
+    bootstrap_max_wait_sec: float = _FOLLOWUP_BOOTSTRAP_MAX_WAIT_SEC,
+    voice: bool = False,
 ) -> _FollowupInteractBoundaryResult:
     """Deliver a follow-up until interact succeeds or the session becomes first-run ready."""
+    started_at = time.monotonic()
+    attempt = 0
     deadline = time.monotonic() + max(0.0, timeout_sec)
+    bootstrap_deadline = started_at + max(0.0, bootstrap_max_wait_sec)
     sleep_sec = max(0.01, poll_interval_sec)
     last_reason = initial_reason
+    logger.info(
+        "[TeamHelpers][FollowupTrace] begin session_id=%s timeout_sec=%.3f poll_sec=%.3f initial_reason=%s query=%s",
+        session_id, timeout_sec, poll_interval_sec, initial_reason, _safe_query_preview(query),
+    )
     while time.monotonic() < deadline:
+        attempt += 1
         if not await _team_session_has_runtime(team_manager, session_id):
+            logger.warning(
+                "[TeamHelpers][FollowupTrace] runtime_not_ready_before_attempt session_id=%s attempt=%s elapsed_ms=%.1f last_reason=%s",
+                session_id, attempt, (time.monotonic() - started_at) * 1000, last_reason,
+            )
             return _FollowupInteractBoundaryResult(success=False, reason=last_reason, first_request_ready=True)
         await asyncio.sleep(sleep_sec)
         if not await _team_session_has_runtime(team_manager, session_id):
+            logger.warning(
+                "[TeamHelpers][FollowupTrace] runtime_not_ready_after_sleep session_id=%s attempt=%s elapsed_ms=%.1f last_reason=%s",
+                session_id, attempt, (time.monotonic() - started_at) * 1000, last_reason,
+            )
             return _FollowupInteractBoundaryResult(success=False, reason=last_reason, first_request_ready=True)
-        success, reason = await team_manager.interact(session_id, query)
+        success, reason = await _interact_team(team_manager, session_id, query, voice=voice)
+        logger.info(
+            "[TeamHelpers][FollowupTrace] attempt_result session_id=%s attempt=%s success=%s reason=%s elapsed_ms=%.1f",
+            session_id, attempt, success, reason, (time.monotonic() - started_at) * 1000,
+        )
         if success:
+            logger.info(
+                "[TeamHelpers][FollowupTrace] delivered session_id=%s attempts=%s elapsed_ms=%.1f",
+                session_id, attempt, (time.monotonic() - started_at) * 1000,
+            )
             return _FollowupInteractBoundaryResult(success=True, reason=None, first_request_ready=False)
         last_reason = reason
         if not _is_followup_delivery_boundary_reason(reason):
             return _FollowupInteractBoundaryResult(success=False, reason=reason, first_request_ready=False)
+        # Bootstrap 续期："not started" 且 stream task 仍在说明第一条消息的
+        # 团队还在建立（harness 尚未 start），这是暂态失败。此时重置轮询
+        # deadline，让窗口跟随 stream task 生命周期，而不是 10s 赛跑。
+        if (
+            _is_bootstrap_pending_reason(reason, voice=voice)
+            and bool(team_manager.has_stream_task(session_id))
+            and time.monotonic() < bootstrap_deadline
+        ):
+            deadline = time.monotonic() + timeout_sec
+            logger.info(
+                "[TeamHelpers][FollowupTrace] deadline_extended session_id=%s attempt=%s "
+                "bootstrap_pending=True elapsed_ms=%.1f",
+                session_id, attempt, (time.monotonic() - started_at) * 1000,
+            )
     first_request_ready = not await _team_session_has_runtime(team_manager, session_id)
+    logger.warning(
+        "[TeamHelpers][FollowupTrace] exhausted session_id=%s attempts=%s first_request_ready=%s final_reason=%s elapsed_ms=%.1f",
+        session_id, attempt, first_request_ready, last_reason, (time.monotonic() - started_at) * 1000,
+    )
     return _FollowupInteractBoundaryResult(
         success=False,
         reason=last_reason,
@@ -1186,13 +1283,14 @@ def _deliverable(turn: UserTurn, text: Any) -> Any:
 
 
 async def _team_session_has_runtime(team_manager: TeamManager, session_id: str) -> bool:
-    # Keep ordinary team first-request detection scoped to claw-local
-    # live markers only. Resumable Runner-pool entries are reserved for
-    # InteractiveInput recovery and must not make a fresh text request
-    # look like a follow-up after the previous round has ended.
+    # 只认 live 标记：active runtime 或正在跑的 stream task。
+    # Parked (PAUSED) Runner pool entry 不算——它由 first-request 路径恢复：
+    # AgentCore 的 RESUME_FROM_PAUSE 会复用该团队并 reset interact gate
+    # （见 pause_session_runtime 的契约注释）。把它算进 live runtime 会把
+    # pause/流结束后的下一条 chat.send 误路由到 interact()，而那条路的
+    # gate 已随上一个 stream 关闭，只能以 gate_closed 失败收场。
     return (
         team_manager.is_runtime_active(session_id)
-        or team_manager.is_runtime_pending(session_id)
         or bool(team_manager.has_stream_task(session_id))
     )
 
@@ -2226,6 +2324,7 @@ async def _start_team_stream_round(
     from jiuwenswarm.agents.harness.team.team_manager import sync_team_observability
 
     sync_team_observability()
+    team_manager.remember_pending_round_query(session_id, query)
     await team_manager.prepare_runtime_activation(session_id, team_name)
     if request_queue is None:
         request_queue = _new_team_event_queue()
@@ -2318,6 +2417,7 @@ async def _process_team_message_stream(
     channel_id = request.channel_id
 
     language = _resolve_request_language(request)
+    is_voice_request = is_voice_request_params(getattr(request, "params", None))
     # ``query`` stays the user's own words for the whole function — directive
     # stripping, ``$member`` routing and slash commands all parse it. Every
     # delivery into the team runtime goes through ``_deliverable`` instead, so
@@ -2337,6 +2437,17 @@ async def _process_team_message_stream(
             session_id,
             exc,
         )
+    # A second message can arrive while the first Team stream is still being
+    # assembled.  ``pending`` is not an interactive runtime; wait for the
+    # ready transition instead of calling interact() and returning not_active.
+    if team_manager.is_runtime_pending(session_id) and not team_manager.is_runtime_active(session_id):
+        wait_ready = getattr(team_manager, "wait_for_runtime_ready", None)
+        if callable(wait_ready):
+            ready = await wait_ready(session_id)
+            logger.info(
+                "[DispatchTrace] team_followup_runtime_ready_wait session_id=%s ready=%s",
+                session_id, ready,
+            )
     # The startup lock covers this check through waiter + stream registration,
     # including the awaits in spec assembly and MCP preflight below.
     has_active_waiters = team_manager.has_waiters(session_id)
@@ -2352,6 +2463,12 @@ async def _process_team_message_stream(
     is_heartbeat_request = _is_heartbeat_request(request)
     is_cron_request = _is_cron_request_id(rid)
     is_bounded_round = is_heartbeat_request or is_cron_request
+    # Spoken members-pause: the leader answers this turn itself while the
+    # members stay parked, and no team.completed / team.idle ever fires for
+    # the round (the stream task lives on). Consumed only by the
+    # first-request loop below to end that request once the leader's own
+    # final has been yielded.
+    is_voice_members_pause = is_voice_members_pause_params(getattr(request, "params", None))
     admission = getattr(heartbeat_service, "admission", None)
     user_admitted = False
     cron_user_admitted = False
@@ -2784,10 +2901,19 @@ async def _process_team_message_stream(
                     )
                     query = turn.text if isinstance(turn.text, str) else query
                 followup_payload = _deliverable(turn, query)
+                # Only voice follow-ups opt in; typed input keeps the original calls.
+                voice_kwargs = {"voice": True} if is_voice_request else {}
                 await _begin_team_round()
-                success, reason = await team_manager.interact(
+                success, reason = await _interact_team(
+                    team_manager,
                     session_id,
                     followup_payload,
+                    voice=is_voice_request,
+                )
+                logger.info(
+                    "[TeamHelpers][DispatchTrace] direct_followup_result channel_id=%s session_id=%s request_id=%s success=%s reason=%s query=%s",
+                    _resolve_channel_id(channel_id), session_id, rid, success, reason,
+                    _safe_query_preview(query),
                 )
                 if not success:
                     logger.warning(
@@ -2804,6 +2930,7 @@ async def _process_team_message_stream(
                             session_id,
                             followup_payload,
                             initial_reason=reason,
+                            **voice_kwargs,
                         )
                         success = boundary_result.success
                         reason = boundary_result.reason
@@ -2822,6 +2949,7 @@ async def _process_team_message_stream(
                             session_id,
                             followup_payload,
                             initial_reason=reason,
+                            **voice_kwargs,
                         )
                         success = boundary_result.success
                         reason = boundary_result.reason
@@ -2855,6 +2983,11 @@ async def _process_team_message_stream(
                             )
                     elif not success and _is_followup_delivery_boundary_reason(reason):
                         reason = reason or "gate_closed"
+                    logger.warning(
+                        "[TeamHelpers][DispatchTrace] followup_terminal_decision channel_id=%s session_id=%s request_id=%s success=%s first_request=%s reason=%s",
+                        _resolve_channel_id(channel_id), session_id, rid, success,
+                        is_first_request, reason,
+                    )
                     if not success and not is_first_request:
                         await _finish_round_submission(accepted=False)
                         final_reason = reason or ""
@@ -3018,6 +3151,13 @@ async def _process_team_message_stream(
             await startup.aclose()
             await _finish_round_submission(accepted=True)
 
+        # 语音成员级暂停的答复跟踪：leader final 落地后静默满
+        # _VOICE_PAUSE_QUIET_SECONDS 才结束请求（见下方 timeout 分支），
+        # 工具链期间不触发。stream task 本身继续存活——与有界心跳轮
+        # 相同的生命周期，仅释放本请求的 waiter。
+        voice_pause_answered = False
+        voice_pause_tool_pending = False
+        voice_pause_last_event_at = time.monotonic()
         try:
             if is_bounded_round and request_queue is not None:
                 cron_round_state = new_cron_team_round_state()
@@ -3057,8 +3197,55 @@ async def _process_team_message_stream(
                         )
                         if isinstance(event, dict) and event.get("event_type") == "team.error":
                             break
+                        if is_voice_members_pause and isinstance(event, dict):
+                            voice_pause_last_event_at = time.monotonic()
+                            _pause_event_type = str(event.get("event_type") or "")
+                            if (
+                                _pause_event_type == "chat.processing_status"
+                                and event.get("is_complete") is True
+                            ):
+                                # 终态信号（team 完成/空闲/leader 出错/流关闭）
+                                # 只在终态广播，直接结束请求。
+                                logger.info(
+                                    "[TeamHelpers] voice members-pause round reached terminal status, "
+                                    "ending request: channel_id=%s session_id=%s request_id=%s",
+                                    _resolve_channel_id(channel_id),
+                                    session_id,
+                                    rid,
+                                )
+                                break
+                            if str(event.get("role") or "") == "leader":
+                                if _pause_event_type == "chat.final":
+                                    # 一个 turn 可能因工具打断产生多个 leader
+                                    # final，只有最后一个之后才会静默；这里
+                                    # 只标记，结束与否交给静默窗口判断。
+                                    voice_pause_answered = True
+                                    voice_pause_tool_pending = False
+                                elif _pause_event_type in _VOICE_PAUSE_TOOL_EVENT_TYPES:
+                                    # 工具链仍在推进：结果与后续模型调用
+                                    # 都会再来，本轮答复尚未真正落地。
+                                    voice_pause_tool_pending = True
                     except asyncio.TimeoutError:
                         if not team_manager.has_stream_task(session_id):
+                            break
+                        if (
+                            is_voice_members_pause
+                            and voice_pause_answered
+                            and not voice_pause_tool_pending
+                            and time.monotonic() - voice_pause_last_event_at
+                            >= _VOICE_PAUSE_QUIET_SECONDS
+                        ):
+                            # 答复已完整投递且队列静默：结束本请求，finally
+                            # 释放 waiter，下一句语音挂自己的 waiter 走请求
+                            # 级流式，而不是作为 deferred follow-up 骑在
+                            # 本轮流上（outcome=unknown、回复迟到）。
+                            logger.info(
+                                "[TeamHelpers] voice members-pause round answered and quiet, "
+                                "ending request: channel_id=%s session_id=%s request_id=%s",
+                                _resolve_channel_id(channel_id),
+                                session_id,
+                                rid,
+                            )
                             break
                         continue
                 # Drain any events that were enqueued by

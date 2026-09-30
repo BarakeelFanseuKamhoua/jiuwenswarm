@@ -28,7 +28,13 @@ import {
 } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
-import { useChatStore, useHarnessStore, useSessionStore, useTodoStore } from '../../stores';
+import {
+  useChatStore,
+  useHarnessStore,
+  useSessionStore,
+  useTodoStore,
+  useWorkspaceStore,
+} from '../../stores';
 import {
   AgentMode,
   MediaItem,
@@ -43,14 +49,18 @@ import type { HumanShareCommand } from '../../stores/sessionStore';
 import type { AgentGroupIdentity } from '../../features/agentManagement';
 import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
-import { InputArea, type InputAreaHandle } from './InputArea';
+import {
+  InputArea,
+  type InputAreaHandle,
+  type InputAreaRealtimeVoiceControl,
+} from './InputArea';
 import ChatOverviewIcon from '../../assets/chat-overview.svg?react';
 import PanelCollapseIcon from '../../assets/panel-collapse.svg?react';
 import lineUpIcon from '../../assets/lineUp.svg';
 import beeFlyingIcon from '../../assets/bee-flying.webp';
 import beeStaticIcon from '../../assets/bee-static.png';
 import homeBanner from '../../assets/home-banner.svg';
-import { NEW_CONVERSATION_ID } from '../../multi-session/state/newConversationLifecycle';
+import { NEW_CONVERSATION_ID, createConversationTitle } from '../../multi-session/state/newConversationLifecycle';
 import loadSendIcon from '../../assets/load-send.svg';
 import editIcon from '../../assets/edit.svg';
 import deleteIcon from '../../assets/delete.svg';
@@ -58,6 +68,7 @@ import moveIcon from '../../assets/move.svg';
 import restartIcon from '../../assets/restart.svg';
 import ShareExportIcon from '../../assets/share-export.svg?react';
 import { InlineQuestionCard } from './InlineQuestionCard';
+import { VoiceMirrorControl, VoiceMirrorReadOnlyNotice } from './VoiceMirrorControl';
 import { InteractionSlot } from '../InteractionSlot';
 import { GoalBar } from '../GoalBar';
 import { HarnessProgressBar } from './HarnessProgressBar';
@@ -84,7 +95,13 @@ import {
   type DesktopLocalFilesEventDetail,
   type LocalFilePick,
 } from '../../features/workspace/localFilePicker';
-import { useDesktopLocalFilePickerReady, useWelcomeBubblePosition } from '../../hooks';
+import {
+  useDesktopLocalFilePickerReady,
+  useRealtimeVoice,
+  useWelcomeBubblePosition,
+  type VoiceCommand,
+  type VoiceCommandBatch,
+} from '../../hooks';
 import { ApplicationPluginTaskRuntimes } from '../../applicationPlugins/ApplicationPluginOutlet';
 import { generateUuidV4 } from '../../utils/uuid';
 
@@ -108,6 +125,7 @@ interface ChatPanelProps {
   continuedFromSessionId?: string | null;
   onOpenContinuedFromSession?: (sourceSessionId: string) => void;
   onInputIntent?: (sessionId: string) => void;
+  onEnsureVoiceSession?: () => Promise<string>;
   onPersistMedia: (
     content: string,
     mediaItems: MediaItem[],
@@ -127,8 +145,15 @@ interface ChatPanelProps {
     files?: Record<string, unknown>;
   }>;
   onDiscardMedia?: (sessionId: string, path: string) => Promise<unknown>;
-  onInterrupt: (newInput?: string) => void;
+  onInterrupt: (
+    newInput?: string,
+    options?: { addUserMessage?: boolean; voiceDisplayText?: string }
+  ) => void | Promise<void>;
   onCancel: () => void;
+  onVoiceControl: (
+    command: 'pause_task' | 'resume_task',
+    options?: { waitForCompletion?: boolean; voiceDisplayText?: string; voice?: boolean }
+  ) => void | Promise<void>;
   onSwitchMode: (mode: AgentMode) => void;
   isProcessing: boolean;
   onUserAnswer: (
@@ -967,6 +992,32 @@ function HumanShareCard({ commands, onShare }: { commands: HumanShareCommand[]; 
   );
 }
 
+/**
+ * Send a spoken pause instruction through the normal chat.send stream.
+ *
+ * The AgentServer pauses the teammates and keeps the leader live, so the
+ * leader confirms the pause in this very turn instead of merging it into the
+ * next instruction. Like every other spoken command, the turn content is the
+ * structured dispatch template (dispatchText) while voiceDisplayText keeps
+ * the transcribed utterance for history and the leader note.
+ */
+async function sendSpokenPause(
+  onSendMessage: ChatPanelProps['onSendMessage'],
+  dispatchText: string,
+  displayText: string,
+): Promise<void> {
+  try {
+    await onSendMessage(dispatchText, undefined, {
+      addUserMessage: false,
+      voiceDisplayText: displayText,
+      voicePauseMembers: true,
+    });
+  } catch (error) {
+    // sendMessage has already surfaced the failure to the user.
+    console.warn('[DispatchTrace] voice_spoken_pause_failed', error);
+  }
+}
+
 const SCROLL_BOTTOM_THRESHOLD_PX = 40;
 const LOAD_OLDER_THRESHOLD_PX = 8;
 const VISIBILITY_RESTORE_SCROLL_SUPPRESS_MS = 300;
@@ -1038,11 +1089,13 @@ export const ChatPanel = React.memo(function ChatPanel({
   continuedFromSessionId = null,
   onOpenContinuedFromSession,
   onInputIntent,
+  onEnsureVoiceSession,
   onPersistMedia,
   onPersistDocuments,
   onDiscardMedia,
   onInterrupt,
   onCancel,
+  onVoiceControl,
   onSwitchMode,
   isProcessing,
   onUserAnswer,
@@ -1096,6 +1149,438 @@ export const ChatPanel = React.memo(function ChatPanel({
   useEffect(() => {
     setAgentGroupDeletedNoticeOpen(agentGroupUnavailable);
   }, [agentGroupUnavailable, activeSessionId]);
+  const realtimeVoiceSessionId = mode === 'team'
+    && activeSessionId
+    && activeSessionId !== NEW_CONVERSATION_ID
+    ? activeSessionId
+    : undefined;
+  const [realtimeVoiceError, setRealtimeVoiceError] = useState('');
+  const [voiceStartRequested, setVoiceStartRequested] = useState(false);
+  const [isPreparingVoice, setIsPreparingVoice] = useState(false);
+  const [isVoiceTurnPending, setIsVoiceTurnPending] = useState(false);
+  const speechPausePromiseRef = useRef<Promise<boolean> | null>(null);
+  const speechInputDisplayedRef = useRef(false);
+  const speechStartedAtRef = useRef<number | null>(null);
+  // Cached across the commands of one voice turn: the first command settles
+  // whether this turn interrupted a running Leader (pausedForSpeech). Later
+  // commands in the same turn must reuse that verdict instead of re-reading
+  // speechPausePromiseRef, which the first command already cleared — otherwise
+  // a multi-command turn would split across onInterrupt and onSendMessage.
+  const turnPausedForSpeechRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    speechPausePromiseRef.current = null;
+    speechInputDisplayedRef.current = false;
+    speechStartedAtRef.current = null;
+    turnPausedForSpeechRef.current = null;
+    setIsVoiceTurnPending(false);
+  }, [realtimeVoiceSessionId]);
+  const handleRealtimeVoiceSpeechStarted = useCallback(() => {
+    speechInputDisplayedRef.current = false;
+    speechStartedAtRef.current = Date.now();
+    turnPausedForSpeechRef.current = null;
+    console.info('[DispatchTrace] voice_speech_started', {
+      sessionId: realtimeVoiceSessionId,
+      isProcessing,
+      ts: new Date().toISOString(),
+    });
+    // An earlier utterance's pause that no command has claimed yet still owns
+    // the Team: while it is in flight, a second pause finds nothing to pause
+    // and fails. Keep that pause instead of replacing it, otherwise whoever
+    // settles this turn sees the failed one and never resumes the Team.
+    const heldPause = speechPausePromiseRef.current;
+    if (!isProcessing && !heldPause) return;
+    const requestPause = () => Promise.resolve()
+      .then(() => onVoiceControl('pause_task', { waitForCompletion: true, voice: true }))
+      .then(() => {
+        console.info('[DispatchTrace] voice_pause_control_resolved', {
+          sessionId: realtimeVoiceSessionId,
+          ts: new Date().toISOString(),
+        });
+        return true;
+      })
+      .catch((error) => {
+        console.error('Failed to pause Team before processing voice input:', error);
+        return false;
+      });
+    speechPausePromiseRef.current = heldPause
+      ? heldPause.then((paused) => (paused ? true : isProcessing ? requestPause() : false))
+      : requestPause();
+  }, [isProcessing, onVoiceControl]);
+  const handleRealtimeVoiceTranscriptCompleted = useCallback((text: string) => {
+    const voiceSessionId = realtimeVoiceSessionId;
+    if (!speechPausePromiseRef.current || !voiceSessionId || speechInputDisplayedRef.current) return;
+    useChatStore.getState().addMessage(voiceSessionId, {
+      id: `user-voice-${Date.now()}`,
+      role: 'user',
+      content: text,
+      timestamp: new Date(speechStartedAtRef.current ?? Date.now()).toISOString(),
+    });
+    speechInputDisplayedRef.current = true;
+    setIsVoiceTurnPending(true);
+  }, [realtimeVoiceSessionId]);
+  const handleRealtimeVoiceCommand = useCallback(async (command: VoiceCommand) => {
+    const voiceSessionId = realtimeVoiceSessionId;
+    const isActionableCommand = command.name === 'submit_task'
+      || command.name === 'supplement_task'
+      || command.name === 'cancel_task'
+      || command.name === 'get_task_status'
+      || command.name === 'ask_leader'
+      || command.name === 'resume_task';
+
+    // One voice turn may dispatch several commands serially (a turn can mix
+    // supplement_task + submit_task). Only the first command reads the
+    // per-turn pause snapshot; later commands reuse the cached verdict so a
+    // multi-command turn stays on one dispatch channel instead of splitting
+    // across onInterrupt (first) and onSendMessage (rest).
+    let pausedForSpeech: boolean;
+    let pausePromise: Promise<boolean> | null = null;
+    if (turnPausedForSpeechRef.current === null) {
+      pausePromise = speechPausePromiseRef.current;
+      speechPausePromiseRef.current = null;
+      pausedForSpeech = Boolean(pausePromise);
+      turnPausedForSpeechRef.current = pausedForSpeech;
+    } else {
+      pausedForSpeech = turnPausedForSpeechRef.current;
+    }
+
+    // Normally voice.transcript displays the user's own words before Qwen's
+    // acknowledgement finishes. Keep this fallback for providers that omit a
+    // completed-transcription event. Build the user bubble only once per turn.
+    // The bubble always shows the transcribed utterance (command.text), never
+    // the structured dispatch_text template that is sent to the Leader.
+    if (voiceSessionId && !speechInputDisplayedRef.current) {
+      useChatStore.getState().addMessage(voiceSessionId, {
+        id: `user-voice-${Date.now()}`,
+        role: 'user',
+        content: command.text,
+        timestamp: new Date(speechStartedAtRef.current ?? Date.now()).toISOString(),
+      });
+      speechInputDisplayedRef.current = true;
+      setIsVoiceTurnPending(true);
+    }
+    if (voiceSessionId) {
+      const sessionState = useSessionStore.getState();
+      const session = sessionState.currentSession?.session_id === voiceSessionId
+        ? sessionState.currentSession
+        : sessionState.sessions.find((item) => item.session_id === voiceSessionId);
+      const currentTitle = session?.display_title?.trim() || session?.title?.trim() || '';
+      const placeholderTitle = t('chat.realtimeVoiceSessionTitle');
+      if (currentTitle === placeholderTitle) {
+        const nextTitle = createConversationTitle(command.summary || command.text).slice(0, 100);
+        if (nextTitle && nextTitle !== placeholderTitle) {
+          void useWorkspaceStore.getState().renameSession(voiceSessionId, nextTitle).catch((error) => {
+            console.error('Failed to update realtime voice session title:', error);
+          });
+        }
+      }
+    }
+    if (pausePromise) {
+      const paused = await pausePromise;
+      if (!paused) {
+        pausedForSpeech = false;
+        turnPausedForSpeechRef.current = false;
+      }
+    }
+    if (isActionableCommand) {
+      if (pausedForSpeech) {
+        try {
+          await onInterrupt(command.dispatchText, {
+            addUserMessage: false,
+            // command.text is the transcribed utterance; team mode reroutes
+            // this interrupt into a chat.send, so restore it as user history
+            // instead of the dispatch template in new_input/content.
+            voiceDisplayText: command.text,
+          });
+        } finally {
+          speechStartedAtRef.current = null;
+          setIsVoiceTurnPending(false);
+        }
+        return;
+      }
+      onSendMessage(command.dispatchText, undefined, {
+        addUserMessage: false,
+        // command.text is the transcribed utterance; restore it as the
+        // user-history record so refresh shows it, not the dispatch template.
+        voiceDisplayText: command.text,
+      });
+      speechStartedAtRef.current = null;
+      return;
+    }
+    if (voiceSessionId && !pausedForSpeech) {
+      useChatStore.getState().addMessage(voiceSessionId, {
+        id: `user-voice-control-${Date.now()}`,
+        role: 'user',
+        content: command.text,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (command.name === 'pause_task') {
+      await sendSpokenPause(onSendMessage, command.dispatchText, command.text);
+    }
+    if (pausedForSpeech) {
+      speechStartedAtRef.current = null;
+      setIsVoiceTurnPending(false);
+    } else {
+      speechStartedAtRef.current = null;
+    }
+  }, [onInterrupt, onSendMessage, realtimeVoiceSessionId, t]);
+  const handleRealtimeVoiceCommandBatch = useCallback(async (batch: VoiceCommandBatch) => {
+    const batchStartedAt = performance.now();
+    console.info('[DispatchTrace] voice_command_batch_received', {
+      sessionId: realtimeVoiceSessionId,
+      callIds: batch.callIds,
+      commandCount: batch.commands.length,
+      text: batch.text,
+      ts: new Date().toISOString(),
+    });
+    const voiceSessionId = realtimeVoiceSessionId;
+    if (batch.replayed) {
+      // An earlier utterance whose realtime response was cut off by the next
+      // one, re-dispatched after that turn finished. It owns neither the live
+      // speech-start pause nor the live turn's bubble, so leave those refs to
+      // whatever turn is in progress and dispatch it on its own.
+      if (voiceSessionId) {
+        useChatStore.getState().addMessage(voiceSessionId, {
+          id: `user-voice-replay-${Date.now()}`,
+          role: 'user',
+          content: batch.text,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      // When every live turn after the cut-off one dispatched nothing, the
+      // speech-start pause is still held and this replay is what resumes it.
+      const heldPause = speechPausePromiseRef.current;
+      speechPausePromiseRef.current = null;
+      const pausedForReplay = heldPause ? await heldPause : false;
+      try {
+        if (batch.commands.length > 0 && batch.commands.every((item) => item.name === 'pause_task')) {
+          await sendSpokenPause(onSendMessage, batch.dispatchText, batch.text);
+        } else if (pausedForReplay) {
+          await onInterrupt(batch.dispatchText, {
+            addUserMessage: false,
+            voiceDisplayText: batch.text,
+          });
+        } else {
+          onSendMessage(batch.dispatchText, undefined, {
+            addUserMessage: false,
+            voiceDisplayText: batch.text,
+          });
+        }
+      } finally {
+        if (heldPause) {
+          speechStartedAtRef.current = null;
+          setIsVoiceTurnPending(false);
+        }
+      }
+      return;
+    }
+    let pausedForSpeech: boolean;
+    let pausePromise: Promise<boolean> | null = null;
+    if (turnPausedForSpeechRef.current === null) {
+      pausePromise = speechPausePromiseRef.current;
+      speechPausePromiseRef.current = null;
+      pausedForSpeech = Boolean(pausePromise);
+      turnPausedForSpeechRef.current = pausedForSpeech;
+    } else {
+      pausedForSpeech = turnPausedForSpeechRef.current;
+    }
+    if (voiceSessionId) {
+      const sessionState = useSessionStore.getState();
+      const session = sessionState.currentSession?.session_id === voiceSessionId
+        ? sessionState.currentSession
+        : sessionState.sessions.find((item) => item.session_id === voiceSessionId);
+      const currentTitle = session?.display_title?.trim() || session?.title?.trim() || '';
+      const placeholderTitle = t('chat.realtimeVoiceSessionTitle');
+      if (currentTitle === placeholderTitle) {
+        const nextTitle = createConversationTitle(batch.summary || batch.text).slice(0, 100);
+        if (nextTitle && nextTitle !== placeholderTitle) {
+          void useWorkspaceStore.getState().renameSession(voiceSessionId, nextTitle).catch((error) => {
+            console.error('Failed to update realtime voice session title:', error);
+          });
+        }
+      }
+    }
+    if (pausePromise) {
+      console.info('[DispatchTrace] voice_batch_wait_pause_begin', {
+        sessionId: realtimeVoiceSessionId,
+        ts: new Date().toISOString(),
+      });
+      const paused = await pausePromise;
+      console.info('[DispatchTrace] voice_batch_wait_pause_end', {
+        sessionId: realtimeVoiceSessionId,
+        paused,
+        elapsedMs: Math.round(performance.now() - batchStartedAt),
+        ts: new Date().toISOString(),
+      });
+      if (!paused) {
+        pausedForSpeech = false;
+        turnPausedForSpeechRef.current = false;
+      }
+    }
+    // The user bubble shows the transcribed utterance (batch.text). The
+    // structured dispatch_text template is for the Leader only — it carries
+    // the unified intent blocks and must never surface as a user-facing
+    // bubble. Add the bubble ourselves and suppress the one sendMessage /
+    // onInterrupt would otherwise build from the template text.
+    if (voiceSessionId && !speechInputDisplayedRef.current) {
+      useChatStore.getState().addMessage(voiceSessionId, {
+        id: `user-voice-${Date.now()}`,
+        role: 'user',
+        content: batch.text,
+        timestamp: new Date(speechStartedAtRef.current ?? Date.now()).toISOString(),
+      });
+      speechInputDisplayedRef.current = true;
+      setIsVoiceTurnPending(true);
+    }
+    // A spoken pause rides the normal chat.send stream: the AgentServer parks
+    // the teammates while the leader stays live, so the leader confirms the
+    // pause in this turn and the utterance reaches history and trajectory.
+    const isPauseOnlyBatch = batch.commands.length > 0
+      && batch.commands.every((item) => item.name === 'pause_task');
+    if (pausedForSpeech && isPauseOnlyBatch) {
+      console.info('[DispatchTrace] voice_batch_pause_already_applied', {
+        sessionId: realtimeVoiceSessionId,
+        ts: new Date().toISOString(),
+      });
+      try {
+        await sendSpokenPause(onSendMessage, batch.dispatchText, batch.text);
+      } finally {
+        speechStartedAtRef.current = null;
+        setIsVoiceTurnPending(false);
+      }
+      return;
+    }
+    if (pausedForSpeech) {
+      try {
+        console.info('[DispatchTrace] voice_batch_dispatch_interrupt_begin', {
+          sessionId: realtimeVoiceSessionId,
+          ts: new Date().toISOString(),
+        });
+        await onInterrupt(batch.dispatchText, {
+          addUserMessage: false,
+          // batch.text is the transcribed utterance; team mode reroutes this
+          // interrupt into a chat.send, so restore it as user history instead
+          // of the dispatch template in new_input/content.
+          voiceDisplayText: batch.text,
+        });
+        console.info('[DispatchTrace] voice_batch_dispatch_interrupt_end', {
+          sessionId: realtimeVoiceSessionId,
+          elapsedMs: Math.round(performance.now() - batchStartedAt),
+          ts: new Date().toISOString(),
+        });
+      } finally {
+        speechStartedAtRef.current = null;
+        setIsVoiceTurnPending(false);
+      }
+      return;
+    }
+    // A spoken pause rides chat.send (sendSpokenPause above) so the live
+    // leader can confirm it; everything else — including resume — dispatches
+    // the template through the standard chat.send path. interrupt's cancel
+    // tears down the whole team and interrupt's supplement is a non-streaming
+    // RPC that can't carry recovered member output (useWebSocket.supplement
+    // already degrades to sendMessage in team mode), so only the paused
+    // speech-start case may use onInterrupt.
+    if (isPauseOnlyBatch) {
+      await sendSpokenPause(onSendMessage, batch.dispatchText, batch.text);
+      speechStartedAtRef.current = null;
+      return;
+    }
+    onSendMessage(batch.dispatchText, undefined, {
+      addUserMessage: false,
+      // batch.text is the transcribed utterance; the AgentServer restores it as
+      // the user-history record so refresh shows it instead of the dispatch
+      // template that ``content`` (batch.dispatchText) carries to the Leader.
+      voiceDisplayText: batch.text,
+    });
+    console.info('[DispatchTrace] voice_batch_dispatch_chat_send', {
+      sessionId: realtimeVoiceSessionId,
+      elapsedMs: Math.round(performance.now() - batchStartedAt),
+      ts: new Date().toISOString(),
+    });
+    speechStartedAtRef.current = null;
+  }, [onInterrupt, onSendMessage, realtimeVoiceSessionId, t]);
+  const handleRealtimeVoiceError = useCallback((message: string) => {
+    speechStartedAtRef.current = null;
+    setIsVoiceTurnPending(false);
+    setRealtimeVoiceError(message);
+  }, []);
+  const handleRealtimeVoiceTurnCompletedWithoutCommand = useCallback(async () => {
+    // The turn (filler, noise, a sentence fragment) dispatched nothing, so no
+    // command will resume the Team its speech-start barge-in paused. Resume
+    // it here, otherwise the Team stays paused and the spinner never stops.
+    const pausePromise = speechPausePromiseRef.current;
+    speechPausePromiseRef.current = null;
+    speechStartedAtRef.current = null;
+    turnPausedForSpeechRef.current = null;
+    setIsVoiceTurnPending(false);
+    console.info('[DispatchTrace] voice_turn_completed_without_command', {
+      sessionId: realtimeVoiceSessionId,
+      heldPause: Boolean(pausePromise),
+      ts: new Date().toISOString(),
+    });
+    if (!pausePromise || !(await pausePromise)) return;
+    // A newer utterance started meanwhile and took its own pause; it owns
+    // the Team's run state now.
+    if (speechPausePromiseRef.current) return;
+    try {
+      await onVoiceControl('resume_task');
+    } catch (error) {
+      console.error('Failed to resume Team after a voice turn without command:', error);
+    }
+  }, [onVoiceControl, realtimeVoiceSessionId]);
+  const realtimeVoice = useRealtimeVoice({
+    sessionId: realtimeVoiceSessionId,
+    enabled: mode === 'team',
+    onVoiceCommand: handleRealtimeVoiceCommand,
+    onVoiceCommandBatch: handleRealtimeVoiceCommandBatch,
+    onSpeechStarted: handleRealtimeVoiceSpeechStarted,
+    onTranscriptCompleted: handleRealtimeVoiceTranscriptCompleted,
+    onTurnCompletedWithoutCommand: handleRealtimeVoiceTurnCompletedWithoutCommand,
+    onError: handleRealtimeVoiceError,
+  });
+  useEffect(() => {
+    if (!voiceStartRequested || !realtimeVoiceSessionId || realtimeVoice.isActive) return;
+    setVoiceStartRequested(false);
+    void realtimeVoice.start();
+  }, [realtimeVoice.isActive, realtimeVoice.start, realtimeVoiceSessionId, voiceStartRequested]);
+  const handleToggleRealtimeVoice = useCallback(async () => {
+    setRealtimeVoiceError('');
+    if (realtimeVoice.isActive) {
+      await realtimeVoice.toggleMicrophone();
+      return;
+    }
+    if (realtimeVoiceSessionId) {
+      await realtimeVoice.start();
+      return;
+    }
+    if (!onEnsureVoiceSession) return;
+    setIsPreparingVoice(true);
+    setVoiceStartRequested(true);
+    try {
+      await realtimeVoice.preparePlayback();
+      await onEnsureVoiceSession();
+    } catch (error) {
+      setVoiceStartRequested(false);
+      setRealtimeVoiceError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsPreparingVoice(false);
+    }
+  }, [onEnsureVoiceSession, realtimeVoice, realtimeVoiceSessionId]);
+  const realtimeVoiceControl = useMemo<InputAreaRealtimeVoiceControl>(() => ({
+    controller: realtimeVoice,
+    error: realtimeVoiceError,
+    isPreparing: isPreparingVoice,
+    canStart: Boolean(realtimeVoiceSessionId || onEnsureVoiceSession),
+    onToggle: handleToggleRealtimeVoice,
+  }), [
+    handleToggleRealtimeVoice,
+    isPreparingVoice,
+    onEnsureVoiceSession,
+    realtimeVoice,
+    realtimeVoiceError,
+    realtimeVoiceSessionId,
+  ]);
   const hasHarnessProgress = useHarnessStore(
     (s) => mode === 'auto_harness' && (s.runtimes[activeSessionId ?? '']?.stageResults.length ?? 0) > 0,
   );
@@ -1117,6 +1602,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   const stickToBottomUntilStableRef = useRef(false);
   const [isSending, setIsSending] = React.useState(false);
   const isDesktopAttachmentDropEnabled = useDesktopLocalFilePickerReady();
+  const [voiceMirrorSource, setVoiceMirrorSource] = React.useState<string | null>(null);
   const hasTimelineContent = messages.length > 0 || toolExecutionOrder.length > 0;
   const hasConversation = Boolean(isHistoryRestoring || historyPager || hasTimelineContent);
   const isGroupCreateWelcome = welcomeVariant === 'group-create';
@@ -1843,6 +2329,12 @@ export const ChatPanel = React.memo(function ChatPanel({
                   : <PanelBottomClose size={16} strokeWidth={2} aria-hidden />}
               </button>
             )}
+            {activeSessionId && (
+              <VoiceMirrorControl
+                sessionId={activeSessionId}
+                onBindingChange={setVoiceMirrorSource}
+              />
+            )}
             {shouldShowShareExport && (
               <button
                 type="button"
@@ -1915,6 +2407,15 @@ export const ChatPanel = React.memo(function ChatPanel({
           </div>
         </div>
       )}
+      {!shouldShowChatHeader && activeSessionId && (
+        <div className="voice-mirror-launcher">
+          <VoiceMirrorControl
+            sessionId={activeSessionId}
+            compact
+            onBindingChange={setVoiceMirrorSource}
+          />
+        </div>
+      )}
       {hasHarnessProgress && (
         <div
           className="sticky top-0 z-10 px-3 pt-2 bg-bg/95 backdrop-blur-sm"
@@ -1951,6 +2452,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                 <>
                   <MessageList
                     messages={messages}
+                    processingOverride={isVoiceTurnPending}
                     renderAfterMessage={renderAfterMessage}
                     canLoadOlderHistory={canRequestOlderHistory}
                     onLoadOlderHistory={historyOnLoadMore}
@@ -2014,31 +2516,36 @@ export const ChatPanel = React.memo(function ChatPanel({
                 <AgentActivityCard isProcessing={isProcessing} onSendTask={handleSendMessage} onContinueQueuedSessionMessages={onContinueQueuedSessionMessages} />
                 <InterruptResultBubble />
                 <InteractionSlot onSubmit={onUserAnswer} />
-                <InputArea
-                  ref={inputAreaRef}
-                  onSubmit={handleSendMessage}
-                  onEnsureSession={onEnsureSession}
-                  onForkSession={onForkSession}
-                  onInputIntent={onInputIntent}
-                  onPersistMedia={onPersistMedia}
-                  onPersistDocuments={onPersistDocuments}
-                  onDiscardMedia={onDiscardMedia}
-                  onInterrupt={onInterrupt}
-                  onCancel={onCancel}
-                  onSwitchMode={onSwitchMode}
-                  isProcessing={isProcessing}
-                  autoFocusKey={autoFocusKey}
-                  onNavigateToSkills={onNavigateToSkills}
-                  onNavigateToAgents={onNavigateToAgents}
-                  onAgentGroupIdentityChange={setTeamGroupIdentity}
-                  permissionProfile={permissionProfile}
-                  onSavePermission={onSavePermission}
-                  onSetGoal={onSetGoal}
-                  onPauseGoal={onPauseGoal}
-                  onResumeGoal={onResumeGoal}
-                  onRefreshGoal={onRefreshGoal}
-                  onClearGoal={onClearGoal}
-                />
+                {voiceMirrorSource ? (
+                  <VoiceMirrorReadOnlyNotice source={voiceMirrorSource} />
+                ) : (
+                  <InputArea
+                    ref={inputAreaRef}
+                    onSubmit={handleSendMessage}
+                    onEnsureSession={onEnsureSession}
+                    onForkSession={onForkSession}
+                    onInputIntent={onInputIntent}
+                    realtimeVoiceControl={realtimeVoiceControl}
+                    onPersistMedia={onPersistMedia}
+                    onPersistDocuments={onPersistDocuments}
+                    onDiscardMedia={onDiscardMedia}
+                    onInterrupt={onInterrupt}
+                    onCancel={onCancel}
+                    onSwitchMode={onSwitchMode}
+                    isProcessing={isProcessing}
+                    autoFocusKey={autoFocusKey}
+                    onNavigateToSkills={onNavigateToSkills}
+                    onNavigateToAgents={onNavigateToAgents}
+                    onAgentGroupIdentityChange={setTeamGroupIdentity}
+                    permissionProfile={permissionProfile}
+                    onSavePermission={onSavePermission}
+                    onSetGoal={onSetGoal}
+                    onPauseGoal={onPauseGoal}
+                    onResumeGoal={onResumeGoal}
+                    onRefreshGoal={onRefreshGoal}
+                    onClearGoal={onClearGoal}
+                  />
+                )}
               </div>
               {isGroupCreateWelcome && (
                 <div className="chat-welcome__capabilities" data-testid="chat-panel-welcome-capabilities">
@@ -2089,32 +2596,37 @@ export const ChatPanel = React.memo(function ChatPanel({
               onClearGoal={onClearGoal}
             />
           )}
-          <InputArea
-            ref={inputAreaRef}
-            onSubmit={handleSendMessage}
-            onEnsureSession={onEnsureSession}
-            onForkSession={onForkSession}
-            onInputIntent={onInputIntent}
-            onPersistMedia={onPersistMedia}
-            onPersistDocuments={onPersistDocuments}
-            onDiscardMedia={onDiscardMedia}
-            onInterrupt={onInterrupt}
-            onCancel={onCancel}
-            onSwitchMode={onSwitchMode}
-            isProcessing={isProcessing}
-            autoFocusKey={autoFocusKey}
-            onNavigateToSkills={onNavigateToSkills}
-            onNavigateToAgents={onNavigateToAgents}
-            onAgentGroupIdentityChange={setTeamGroupIdentity}
-            permissionProfile={permissionProfile}
-            onSavePermission={onSavePermission}
-            onSetGoal={onSetGoal}
-            onPauseGoal={onPauseGoal}
-            onResumeGoal={onResumeGoal}
-            onRefreshGoal={onRefreshGoal}
-            onClearGoal={onClearGoal}
-            onDrainTaskQueueIfIdle={onDrainTaskQueueIfIdle}
-          />
+          {voiceMirrorSource ? (
+            <VoiceMirrorReadOnlyNotice source={voiceMirrorSource} />
+          ) : (
+            <InputArea
+              ref={inputAreaRef}
+              onSubmit={handleSendMessage}
+              onEnsureSession={onEnsureSession}
+              onForkSession={onForkSession}
+              onInputIntent={onInputIntent}
+              realtimeVoiceControl={realtimeVoiceControl}
+              onPersistMedia={onPersistMedia}
+              onPersistDocuments={onPersistDocuments}
+              onDiscardMedia={onDiscardMedia}
+              onInterrupt={onInterrupt}
+              onCancel={onCancel}
+              onSwitchMode={onSwitchMode}
+              isProcessing={isProcessing}
+              autoFocusKey={autoFocusKey}
+              onNavigateToSkills={onNavigateToSkills}
+              onNavigateToAgents={onNavigateToAgents}
+              onAgentGroupIdentityChange={setTeamGroupIdentity}
+              permissionProfile={permissionProfile}
+              onSavePermission={onSavePermission}
+              onSetGoal={onSetGoal}
+              onPauseGoal={onPauseGoal}
+              onResumeGoal={onResumeGoal}
+              onRefreshGoal={onRefreshGoal}
+              onClearGoal={onClearGoal}
+              onDrainTaskQueueIfIdle={onDrainTaskQueueIfIdle}
+            />
+          )}
         </div>
       )}
       <div className="chat-ai-disclaimer" data-testid="chat-panel-ai-disclaimer">

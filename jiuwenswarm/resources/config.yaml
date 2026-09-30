@@ -19,6 +19,11 @@ setup_guide:
 auto_recap:
   enabled: true
 
+# Leader 实时语音播报配置。
+# reply_mode: full = 忠实朗读完整汇报；brief = 概括成1～2句后朗读。
+voice:
+  reply_mode: full
+
 a2ui:
   enabled: false
   protocol_version: "0.8"

@@ -108,7 +108,13 @@ export interface InterruptResultPayload {
   new_input?: string;
   merged_input?: string;
   paused_task?: string;
-  has_active_task?: boolean; // 是否有活跃任务，false 表示任务已完成
+  has_active_task?: boolean;  // 是否有活跃任务，false 表示任务已完成
+  settled?: boolean;
+  operation_id?: string;
+  // 语音口令暂停团队后落库的成员状态（后端静默置为 paused，没有 status_changed 事件）
+  team_members?: Array<{ member_id: string; status: string }>;
+  /** Voice pause only: the confirmation shown and spoken in the paused Leader's place. */
+  voice_reply?: string;
 }
 
 /**

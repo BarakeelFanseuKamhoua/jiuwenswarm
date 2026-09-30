@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
+from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm, _VOICE_PAUSE_REPLY
 from jiuwenswarm.server.runtime.agent_adapter.interface import (
     _is_ask_user_answer_resume,
     _should_record_user_history,
@@ -27,18 +27,63 @@ class _InterruptHarness(JiuWenSwarm):
     async def process_interrupt_for_test(self, request: AgentRequest):
         return await getattr(self, "_process_interrupt")(request)
 
+    async def apply_voice_team_pause_state_for_test(
+        self, request: AgentRequest, *, session_id: str, params: dict
+    ):
+        return await getattr(self, "_apply_voice_team_pause_state")(
+            request, session_id=session_id, params=params,
+        )
+
 
 class _FakeTeamManager:
-    def __init__(self, pause_result: bool = True, cancel_result: bool = True) -> None:
+    def __init__(
+        self,
+        pause_result: bool = True,
+        cancel_result: bool = True,
+        *,
+        already_paused: bool = False,
+        member_statuses: list[dict[str, str]] | None = None,
+        members_pause_result: bool = True,
+        resume_result: list[str] | None = None,
+    ) -> None:
         self.pause_result = pause_result
         self.cancel_result = cancel_result
+        self.already_paused = already_paused
+        self.member_statuses = member_statuses or []
+        self.members_pause_result = members_pause_result
+        self.resume_result = resume_result if resume_result is not None else []
         self.pause_calls: list[tuple[str, str]] = []
+        self.pause_voice_flags: list[bool] = []
         self.cancel_calls: list[tuple[str, str]] = []
         self.cancel_dispositions: list[str | None] = []
+        self.leader_notes: list[tuple[str, str]] = []
+        self.members_pause_calls: list[str] = []
+        self.resume_calls: list[str] = []
 
-    async def pause_session_runtime(self, session_id: str, reason: str = "") -> bool:
+    async def pause_session_runtime(
+        self, session_id: str, reason: str = "", *, voice: bool = False,
+    ) -> bool:
         self.pause_calls.append((session_id, reason))
+        self.pause_voice_flags.append(voice)
         return self.pause_result
+
+    async def pause_session_members(self, session_id: str) -> bool:
+        self.members_pause_calls.append(session_id)
+        return self.members_pause_result
+
+    async def resume_session_members(self, session_id: str) -> list[str]:
+        self.resume_calls.append(session_id)
+        return list(self.resume_result)
+
+    async def is_runtime_paused(self, session_id: str) -> bool:
+        return self.already_paused
+
+    async def add_leader_note(self, session_id: str, text: str) -> bool:
+        self.leader_notes.append((session_id, text))
+        return True
+
+    async def read_member_statuses(self, session_id: str) -> list[dict[str, str]]:
+        return list(self.member_statuses)
 
     async def cancel_session_runtime(
         self,
@@ -437,6 +482,132 @@ def _ask_user_answer_resume_request(answers: list[dict] | None = None) -> AgentR
     )
 
 
+def _build_voice_pause_request(text: str) -> AgentRequest:
+    request = _build_team_interrupt_request("pause")
+    request.params["voice"] = True
+    request.params["voice_display_text"] = text
+    return request
+
+
+def _patch_team_pause(monkeypatch: pytest.MonkeyPatch, claw: _InterruptHarness, manager: _FakeTeamManager):
+    history: list[dict] = []
+
+    async def _fake_cancel_session_task(session_id: str, reason: str = "", wait_timeout: float | None = None) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.get_team_manager",
+        lambda channel_id=None: manager,
+    )
+    monkeypatch.setattr(claw.session_manager_for_test, "cancel_session_task", _fake_cancel_session_task)
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface.append_history_record",
+        lambda **kwargs: history.append(kwargs),
+    )
+    return history
+
+
+@pytest.mark.asyncio
+async def test_spoken_team_pause_reaches_leader_and_returns_member_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claw = _InterruptHarness()
+    members = [{"member_id": "analyst", "status": "paused"}]
+    manager = _FakeTeamManager(pause_result=True, member_statuses=members)
+    history = _patch_team_pause(monkeypatch, claw, manager)
+
+    response = await claw.process_interrupt_for_test(_build_voice_pause_request("先停一下手头的报表任务。"))
+
+    assert response.payload["success"] is True
+    assert response.payload["team_members"] == members
+    assert manager.pause_voice_flags == [True]
+    assert len(manager.leader_notes) == 1
+    session_id, note = manager.leader_notes[0]
+    assert session_id == "team-session-1"
+    assert "先停一下手头的报表任务。" in note
+    assert [record["role"] for record in history] == ["user", "assistant"]
+    assert response.payload["voice_reply"] == history[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_spoken_pause_on_already_paused_team_still_reaches_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(pause_result=False, already_paused=True)
+    history = _patch_team_pause(monkeypatch, claw, manager)
+
+    response = await claw.process_interrupt_for_test(_build_voice_pause_request("先停一下手头的报表任务。"))
+
+    assert response.payload["success"] is True
+    assert response.payload["message"] == "团队已暂停"
+    assert response.payload["team_members"] == []
+    assert response.payload["voice_reply"]
+    assert len(manager.leader_notes) == 1
+    assert [record["role"] for record in history] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_barge_in_pause_on_already_paused_team_succeeds_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(pause_result=False, already_paused=True)
+    history = _patch_team_pause(monkeypatch, claw, manager)
+    request = _build_team_interrupt_request("pause")
+    request.params["voice"] = True
+
+    response = await claw.process_interrupt_for_test(request)
+
+    assert response.payload["success"] is True
+    assert response.payload["message"] == "团队已暂停"
+    assert manager.leader_notes == []
+    assert history == []
+    assert "voice_reply" not in response.payload
+
+
+@pytest.mark.asyncio
+async def test_spoken_pause_without_team_runtime_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(pause_result=False, already_paused=False)
+    _patch_team_pause(monkeypatch, claw, manager)
+
+    response = await claw.process_interrupt_for_test(_build_voice_pause_request("先停一下手头的报表任务。"))
+
+    assert response.payload["success"] is False
+    assert "team_members" not in response.payload
+    assert "voice_reply" not in response.payload
+    assert manager.leader_notes == []
+
+
+@pytest.mark.asyncio
+async def test_button_team_pause_does_not_queue_leader_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(pause_result=True, member_statuses=[{"member_id": "analyst", "status": "paused"}])
+    _patch_team_pause(monkeypatch, claw, manager)
+
+    response = await claw.process_interrupt_for_test(_build_team_interrupt_request("pause"))
+
+    assert response.payload["success"] is True
+    assert "team_members" not in response.payload
+    assert "voice_reply" not in response.payload
+    assert manager.pause_voice_flags == [False]
+    assert manager.leader_notes == []
+
+
+def _patch_members_pause_manager(
+    monkeypatch: pytest.MonkeyPatch, manager: _FakeTeamManager
+) -> None:
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.get_team_manager",
+        lambda channel_id=None: manager,
+    )
+
+
 @pytest.mark.asyncio
 async def test_deliver_control_input_delta_chunks_are_not_persisted_but_merged_into_empty_final(
     monkeypatch: pytest.MonkeyPatch,
@@ -653,3 +824,87 @@ async def test_deliver_control_input_merged_final_does_not_leak_ask_user_interru
         f"merged final leaked ask_user_interrupt source: {extra}"
     )
 
+
+@pytest.mark.asyncio
+async def test_voice_members_pause_parks_members_and_notes_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spoken pause keeps the leader live; the note asks it to just confirm."""
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(members_pause_result=True)
+    _patch_members_pause_manager(monkeypatch, manager)
+    request = _build_team_interrupt_request("pause")
+
+    reply = await claw.apply_voice_team_pause_state_for_test(
+        request,
+        session_id="team-session-1",
+        params={"voice_pause_members": True, "voice_display_text": "把报表任务先停一停。"},
+    )
+
+    assert reply is None
+    assert manager.members_pause_calls == ["team-session-1"]
+    assert manager.resume_calls == []
+    assert len(manager.leader_notes) == 1
+    session_id, note = manager.leader_notes[0]
+    assert session_id == "team-session-1"
+    assert "把报表任务先停一停。" in note
+    assert "不要分配" in note
+    assert "等待" in note
+
+
+@pytest.mark.asyncio
+async def test_voice_members_pause_without_runtime_returns_fallback_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to pause: confirm and let the caller end the turn, not build a team."""
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(members_pause_result=False)
+    _patch_members_pause_manager(monkeypatch, manager)
+    request = _build_team_interrupt_request("pause")
+
+    reply = await claw.apply_voice_team_pause_state_for_test(
+        request,
+        session_id="team-session-1",
+        params={"voice_pause_members": True, "voice_display_text": "把报表任务先停一停。"},
+    )
+
+    assert reply == _VOICE_PAUSE_REPLY
+    assert manager.leader_notes == []
+
+
+@pytest.mark.asyncio
+async def test_voice_members_pause_without_transcript_still_pauses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause without a transcript parks the members; the note needs no quote."""
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(members_pause_result=True)
+    _patch_members_pause_manager(monkeypatch, manager)
+    request = _build_team_interrupt_request("pause")
+
+    reply = await claw.apply_voice_team_pause_state_for_test(
+        request, session_id="team-session-1", params={"voice_pause_members": True},
+    )
+
+    assert reply is None
+    assert manager.members_pause_calls == ["team-session-1"]
+    assert manager.leader_notes == []
+
+
+@pytest.mark.asyncio
+async def test_team_turn_resumes_paused_members_before_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The message after a spoken pause restarts the held-down members first."""
+    claw = _InterruptHarness()
+    manager = _FakeTeamManager(resume_result=["analyst"])
+    _patch_members_pause_manager(monkeypatch, manager)
+    request = _build_team_interrupt_request("pause")
+
+    reply = await claw.apply_voice_team_pause_state_for_test(
+        request, session_id="team-session-1", params={},
+    )
+
+    assert reply is None
+    assert manager.resume_calls == ["team-session-1"]
+    assert manager.members_pause_calls == []

@@ -1953,7 +1953,23 @@ body.workspace-resize-active iframe {
     width: 16px;
     height: 16px;
     flex-shrink: 0;
-    color: var(--color-text-meta);
+    color: var(--color-feedback-success);
+  }
+
+  .completed-work-chip__icon.is-partial {
+    color: var(--color-feedback-warning);
+  }
+
+  .completed-work-chip__icon.is-interrupted {
+    color: var(--color-feedback-warning);
+  }
+
+  .completed-work-chip.is-interrupted .completed-work-chip__label {
+    color: var(--color-feedback-warning);
+  }
+
+  .completed-work-chip__icon.is-error {
+    color: var(--color-feedback-danger);
   }
 
   .completed-work-chip__icon svg {

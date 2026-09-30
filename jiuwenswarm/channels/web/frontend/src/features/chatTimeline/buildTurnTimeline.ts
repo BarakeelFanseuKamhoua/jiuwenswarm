@@ -686,6 +686,7 @@ function accumulateToolOutcomes(
 export type TurnWorkMeta = {
   turnId: number;
   completed: boolean;
+  interrupted: boolean;
   hasWork: boolean;
   firstWorkKey: string | null;
   startMs: number;
@@ -736,6 +737,7 @@ function emptyTurnMeta(turnId: number, partial?: Partial<TurnWorkMeta>): TurnWor
   return {
     turnId,
     completed: false,
+    interrupted: false,
     hasWork: false,
     firstWorkKey: null,
     startMs: Number.NaN,
@@ -765,6 +767,7 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
         item.turnId,
         emptyTurnMeta(item.turnId, {
           completed: !(item.isLastTurn && isProcessing),
+          interrupted: Boolean(prev?.interrupted),
           hasWork: item.hasWork || Boolean(prev?.hasWork),
           firstWorkKey: prev?.firstWorkKey ?? null,
           startMs: item.startMs,
@@ -779,6 +782,27 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
           outcomeTone: prev?.outcomeTone ?? 'neutral',
         })
       );
+      continue;
+    }
+    if (item.type === 'message') {
+      if (item.message.finishReason === 'interrupted') {
+        const prev = map.get(item.turnId);
+        if (prev) {
+          prev.interrupted = true;
+          prev.hasWork = true;
+          if (!prev.firstWorkKey) {
+            prev.firstWorkKey = item.key;
+            prev.showAvatar = item.showAvatar;
+          }
+        } else {
+          map.set(item.turnId, emptyTurnMeta(item.turnId, {
+            interrupted: true,
+            hasWork: true,
+            firstWorkKey: item.key,
+            showAvatar: item.showAvatar,
+          }));
+        }
+      }
       continue;
     }
     if (item.type !== 'reasoning' && item.type !== 'toolGroup') {

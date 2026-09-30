@@ -95,6 +95,7 @@ _PG_POST_START_READY_MAX_SLEEP = 2.0
 _PG_POST_START_READY_BACKOFF = 1.45
 _PG_POST_START_LOG_EVERY_SEC = 5.0
 _TEAM_STREAM_EXIT_GRACE_TIMEOUT_SEC = 1.5
+_RUNNER_PAUSE_TIMEOUT_SEC = 60.0
 # Bound each frontend waiter's event backlog.  Producers await a free slot, so
 # a slow or disconnected TUI consumer cannot make the process retain every
 # event emitted by a long-running team session.
@@ -362,6 +363,14 @@ class TeamManager:
         self._active_pause_tasks: dict[str, asyncio.Task] = {}
         self._active_team_names: dict[str, str] = {}
         self._pending_team_names: dict[str, str] = {}
+        # Set while a runtime is being activated and released only when the
+        # runtime has emitted its ready/commit transition.  Follow-up messages
+        # wait on this barrier instead of treating ``pending`` as interactive.
+        self._runtime_ready_events: dict[str, asyncio.Event] = {}
+        # Input of the round whose runtime activation is still pending. The
+        # runtime has not admitted it yet, so a voice pause landing in that
+        # window hands it to the leader's next round instead of dropping it.
+        self._pending_round_queries: dict[str, str] = {}
         # session_id → list of (request_id, asyncio.Queue) waiters
         self._pending_waiters: dict[str, list[tuple[str, asyncio.Queue]]] = {}
         # A bounded automated round temporarily owns event delivery for the
@@ -1323,6 +1332,11 @@ class TeamManager:
 
     async def prepare_runtime_activation(self, session_id: str, team_name: str) -> None:
         self._assert_session_not_deleting(session_id)
+        ready = self._runtime_ready_events.get(session_id)
+        if ready is None:
+            ready = asyncio.Event()
+            self._runtime_ready_events[session_id] = ready
+        ready.clear()
         if self._is_distributed_mode(get_config()):
             async with self._distributed_switch_lock:
                 await self._wait_same_session_runner_runtime_released(session_id)
@@ -1462,10 +1476,21 @@ class TeamManager:
                 reason=reason,
             )
 
+    def remember_pending_round_query(self, session_id: str, query: Any) -> None:
+        """Keep the input of a round about to activate until it is admitted."""
+        if isinstance(query, str) and query.strip():
+            self._pending_round_queries[session_id] = query
+        else:
+            self._pending_round_queries.pop(session_id, None)
+
     def commit_runtime_ready(self, session_id: str, team_name: str) -> None:
         self._active_team_names[session_id] = team_name
         self._pending_team_names.pop(session_id, None)
+        self._pending_round_queries.pop(session_id, None)
         self._initialized_sessions.add(session_id)
+        ready = self._runtime_ready_events.get(session_id)
+        if ready is not None:
+            ready.set()
         logger.info(
             "[TeamManager] commit_runtime_ready session_id=%s team_name=%s active=%s pending=%s",
             session_id,
@@ -1476,6 +1501,35 @@ class TeamManager:
 
     def clear_pending_runtime(self, session_id: str) -> None:
         self._pending_team_names.pop(session_id, None)
+        self._pending_round_queries.pop(session_id, None)
+        # Wake requests waiting for startup so they can re-evaluate the
+        # runtime and cold-start after a failed activation instead of waiting
+        # for the full readiness timeout.
+        ready = self._runtime_ready_events.get(session_id)
+        if ready is not None and not self.is_runtime_active(session_id):
+            ready.set()
+
+    async def wait_for_runtime_ready(
+        self,
+        session_id: str,
+        *,
+        timeout_sec: float = 60.0,
+    ) -> bool:
+        """Wait for the pending Team runtime to become interactive."""
+        if self.is_runtime_active(session_id):
+            return True
+        event = self._runtime_ready_events.get(session_id)
+        if event is None:
+            return self.is_runtime_active(session_id)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout_sec))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[TeamManager] runtime_ready wait timed out: session_id=%s pending=%s",
+                session_id, self.is_runtime_pending(session_id),
+            )
+            return self.is_runtime_active(session_id)
+        return self.is_runtime_active(session_id)
 
     def clear_active_runtime(self, session_id: str) -> None:
         removed = self._active_team_names.pop(session_id, None)
@@ -1529,6 +1583,11 @@ class TeamManager:
 
     async def has_resumable_runtime(self, session_id: str) -> bool:
         return await self._resolve_resumable_runner_entry(session_id) is not None
+
+    async def is_runtime_paused(self, session_id: str) -> bool:
+        """True when the session's Runner pool entry is parked in PAUSED."""
+        resolved = await self._resolve_resumable_runner_entry(session_id)
+        return resolved is not None and getattr(resolved[1], "state", None) == RuntimeState.PAUSED
 
     async def session_has_runtime(self, session_id: str) -> bool:
         return (
@@ -1760,7 +1819,21 @@ class TeamManager:
                 request_metadata,
             )
 
-    async def interact(self, session_id: str, user_input: Any) -> tuple[bool, str | None]:
+    async def interact(
+        self, session_id: str, user_input: Any, *, voice: bool = False,
+    ) -> tuple[bool, str | None]:
+        """Deliver ``user_input`` to the session's live team runtime.
+
+        ``voice=True`` marks a voice follow-up: AgentCore holds it while the
+        run cycle is starting (``runtime_starting``), and a stopped harness
+        owned by a live stream task is kept rather than torn down.
+        """
+        started_at = time.monotonic()
+        runtime_active_before = self.is_runtime_active(session_id)
+        logger.info(
+            "[TeamManager][InteractTrace] begin session_id=%s runtime_active_before=%s input=%s",
+            session_id, runtime_active_before, _safe_payload_preview(user_input),
+        )
         try:
             if not self.is_runtime_active(session_id):
                 restored = await self.wait_for_resumable_runtime(session_id)
@@ -1780,6 +1853,12 @@ class TeamManager:
                 )
                 return False, "not_active"
 
+            logger.info(
+                "[TeamManager][InteractTrace] dispatch_state session_id=%s team=%s runtime_active=%s active_team_names=%s",
+                session_id, team_name, self.is_runtime_active(session_id),
+                list(self._active_team_names),
+            )
+
             # Last stop before the message enters the team runner interact path.
             server_logger.info(
                 "[AgentServer] team message entering runner interact: session_id=%s team=%s payload=%s",
@@ -1787,10 +1866,21 @@ class TeamManager:
                 team_name,
                 _safe_payload_preview(user_input),
             )
+            runner_started_at = time.monotonic()
+            # Only voice passes the flag: other callers keep the original call.
+            voice_kwargs = {"voice": True} if voice else {}
             result = await Runner.interact_agent_team(
                 user_input,
                 team_name=team_name,
                 session_id=session_id,
+                **voice_kwargs,
+            )
+            logger.info(
+                "[TeamManager][InteractTrace] runner_return session_id=%s team=%s result_type=%s result_bool=%s reason=%s runner_elapsed_ms=%.1f total_elapsed_ms=%.1f",
+                session_id, team_name, type(result).__name__, bool(result),
+                getattr(result, "reason", None),
+                (time.monotonic() - runner_started_at) * 1000,
+                (time.monotonic() - started_at) * 1000,
             )
             if not result:
                 reason = getattr(result, "reason", None) or "runner_failed"
@@ -1800,10 +1890,59 @@ class TeamManager:
                     team_name,
                     reason,
                 )
+                reason_text = str(reason).lower()
+                if (
+                    "nativeharness already stopped" in reason_text
+                    or "gate_closed" in reason_text
+                    or "gate closed" in reason_text
+                ):
+                    # Runner can retain a PAUSED pool entry after its underlying
+                    # NativeHarness has already stopped. Such an entry is not
+                    # resumable: retrying interact only targets the same dead
+                    # runtime until the follow-up delivery timeout expires.
+                    # Remove it and clear the initialized marker so TeamHelpers
+                    # can immediately reclassify this turn as a cold start while
+                    # preserving persisted team data.
+                    async with self._get_lifecycle_lock(session_id):
+                        # Voice: a live stream task owns this entry — another
+                        # spoken command has just resumed it (RESUME_FROM_PAUSE
+                        # re-opens the gate before kernel.start rebuilds the
+                        # stopped harness) or the run cycle is closing. Tearing
+                        # down here kills that round together with the input it
+                        # carries; the caller retries until the harness is
+                        # rebuilt or the stream exits.
+                        stream_task = self._stream_tasks.get(session_id)
+                        if voice and stream_task is not None and not stream_task.done():
+                            logger.info(
+                                "[TeamManager] interact hit stopped harness while a stream "
+                                "owns the runtime; keeping it: session_id=%s team=%s reason=%s",
+                                session_id,
+                                team_name,
+                                reason,
+                            )
+                            return False, reason
+
+                        await self._stop_runner_team_runtime(
+                            session_id,
+                            team_name,
+                            "stale-resumable-interact",
+                        )
+                        await self._stop_runner_team_agent_transport(session_id)
+                        await self._finalize_runtime_cleanup(
+                            session_id,
+                            "stale-resumable-interact",
+                        )
                 return False, reason
+            logger.info(
+                "[TeamManager][InteractTrace] success session_id=%s team=%s total_elapsed_ms=%.1f",
+                session_id, team_name, (time.monotonic() - started_at) * 1000,
+            )
             return True, None
         except Exception as exc:
-            logger.error("[TeamManager] interact failed: session_id=%s, error=%s", session_id, exc)
+            logger.exception(
+                "[TeamManager][InteractTrace] exception session_id=%s runtime_active_before=%s elapsed_ms=%.1f error=%s",
+                session_id, runtime_active_before, (time.monotonic() - started_at) * 1000, exc,
+            )
             return False, "exception"
 
     # TeamSkillEvolutionRail accessors.
@@ -3029,14 +3168,19 @@ class TeamManager:
                 stopped_count += 1
         return stopped_count
 
-    async def pause_session_runtime(self, session_id: str, reason: str = "") -> bool:
+    async def pause_session_runtime(
+        self, session_id: str, reason: str = "", *, voice: bool = False,
+    ) -> bool:
         """Pause the current team runtime for this session.
 
         Team runtimes are persistent. The current implementation pauses by
         tearing down the foreground stream task and parking the Runner-owned
         runtime in paused state so a later `chat.send` can resume it.
+
+        ``voice=True`` marks a voice barge-in (see ``Runner.pause_agent_team``).
         """
         async with self._get_lifecycle_lock(session_id):
+            _pause_total_t0 = time.perf_counter()
             has_stream_task = session_id in self._stream_tasks
             has_local_team_runtime = self._has_local_team_runtime(session_id)
             has_team_runtime = (
@@ -3046,7 +3190,30 @@ class TeamManager:
                 or self.is_runtime_pending(session_id)
             )
             if not has_stream_task and not has_team_runtime:
+                logger.info(
+                    "[DispatchTrace] team_pause_no_runtime session_id=%s reason=%s "
+                    "has_stream_task=%s has_local_team=%s active=%s pending=%s",
+                    session_id, reason, has_stream_task, has_local_team_runtime,
+                    self.is_runtime_active(session_id), self.is_runtime_pending(session_id),
+                )
                 return False
+
+            logger.info(
+                "[DispatchTrace] team_pause_state session_id=%s reason=%s "
+                "has_stream_task=%s has_local_team=%s active=%s pending=%s "
+                "stream_tasks=%s monitors=%s",
+                session_id, reason, has_stream_task, has_local_team_runtime,
+                self.is_runtime_active(session_id), self.is_runtime_pending(session_id),
+                len(self._stream_tasks), len(self._team_monitors),
+            )
+            # A voice barge-in can land while the previous utterance's round
+            # is still activating: the runtime has not admitted its input, and
+            # tearing the stream down below would drop it without a trace.
+            unadmitted_query = (
+                self._pending_round_queries.get(session_id)
+                if voice and self.is_runtime_pending(session_id)
+                else None
+            )
 
             # 如果 cancel 请求已到达，中止 pause 并让 cancel 执行
             if self._cancel_requested.get(session_id):
@@ -3083,14 +3250,61 @@ class TeamManager:
                     # pause record, emits WORKFLOW_PAUSED while the workflow
                     # handler is still alive, and parks the relaunch ticket.
                     await self._pause_swarmflow_runs(session_id)
+                    logger.info(
+                        "[DispatchTrace] team_pause_swarmflow_done session_id=%s elapsed_sec=%.3f",
+                        session_id, time.perf_counter() - _pause_total_t0,
+                    )
 
                     # 注册当前 pause 任务，供 cancel 抢占取消
                     self._active_pause_tasks[session_id] = asyncio.current_task()
                     try:
-                        runner_paused = await Runner.pause_agent_team(
-                            team_name=team_name,
-                            session_id=session_id,
+                        _pause_call_t0 = time.perf_counter()
+                        logger.info(
+                            "[TeamManager][pause-resume] 调用Runner.pause_agent_team前: "
+                            "session_id=%s team_name=%s (此调用内部含native_harness.pause→await ack; "
+                            "A改动后应在<=60s内返回(超时降级abort),改前会卡到网关RPC超时~10min)",
+                            session_id, team_name,
                         )
+                        logger.info(
+                            "[DispatchTrace] runner_pause_call_start session_id=%s team_name=%s "
+                            "elapsed_sec=%.3f",
+                            session_id, team_name, time.perf_counter() - _pause_total_t0,
+                        )
+                        runner_paused = await asyncio.wait_for(
+                            Runner.pause_agent_team(
+                                team_name=team_name,
+                                session_id=session_id,
+                                **({"voice": True} if voice else {}),
+                            ),
+                            timeout=_RUNNER_PAUSE_TIMEOUT_SEC,
+                        )
+                        _pause_call_dt = time.perf_counter() - _pause_call_t0
+                        logger.info(
+                            "[DispatchTrace] runner_pause_call_end session_id=%s team_name=%s "
+                            "runner_paused=%s elapsed_sec=%.3f total_elapsed_sec=%.3f",
+                            session_id, team_name, runner_paused, _pause_call_dt,
+                            time.perf_counter() - _pause_total_t0,
+                        )
+                        logger.info(
+                            "[TeamManager][pause-resume] Runner.pause_agent_team返回: "
+                            "session_id=%s team_name=%s runner_paused=%s 耗时=%.2fs "
+                            "(>60s=A超时降级未生效/SDK未加载; 60s附近=触发降级abort,正常<1s)",
+                            session_id, team_name, runner_paused, _pause_call_dt,
+                        )
+                        if _pause_call_dt >= 55.0:
+                            logger.warning(
+                                "[TeamManager][pause-resume] !!!pause调用接近/超60s: "
+                                "session_id=%s 耗时=%.2fs runner_paused=%s "
+                                "→ 判定: SDK层native_harness.pause触发了A超时降级abort(若未生效则仍卡在网关RPC超时). "
+                                "次轮round已被abort丢弃, 需chat.send重新发起.",
+                                session_id, _pause_call_dt, runner_paused,
+                            )
+                        elif _pause_call_dt >= 5.0:
+                            logger.info(
+                                "[TeamManager][pause-resume] pause调用耗时偏长(>=5s): "
+                                "session_id=%s 耗时=%.2fs (可能在等round迭代边界,未达降级阈值)",
+                                session_id, _pause_call_dt,
+                            )
                     except asyncio.CancelledError:
                         logger.info(
                             "[TeamManager] %s pause aborted: cancelled by cancel request, session_id=%s",
@@ -3103,6 +3317,39 @@ class TeamManager:
                             )
                         await self._finalize_runtime_cleanup(session_id, "pause aborted")
                         return False
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "[DispatchTrace] team_pause_timeout session_id=%s team_name=%s timeout_sec=%.1f",
+                            session_id, team_name, _RUNNER_PAUSE_TIMEOUT_SEC,
+                        )
+                        # A timed-out native pause is not resumable.  Tear down
+                        # the stale runtime so the queued chat.send can cold
+                        # start a clean Team instead of reusing a dead gate.
+                        try:
+                            await asyncio.wait_for(
+                                self._stop_runner_team_runtime(
+                                    session_id, team_name, "pause-timeout"
+                                ),
+                                timeout=10.0,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[TeamManager] timed-out runtime stop failed: session_id=%s team_name=%s",
+                                session_id, team_name,
+                                exc_info=True,
+                            )
+                        await self._finalize_runtime_cleanup(
+                            session_id, "pause-timeout", workflow_disposition="pause"
+                        )
+                        return False
+                    except Exception as exc:
+                        logger.exception(
+                            "[DispatchTrace] team_pause_runner_error session_id=%s team_name=%s "
+                            "elapsed_sec=%.3f error_type=%s",
+                            session_id, team_name, time.perf_counter() - _pause_call_t0,
+                            type(exc).__name__,
+                        )
+                        raise
                     finally:
                         self._active_pause_tasks.pop(session_id, None)
 
@@ -3114,22 +3361,180 @@ class TeamManager:
                         exc,
                     )
 
+            if team_name and not runner_paused:
+                # Do not tear down the only foreground stream when AgentCore
+                # did not actually park its runtime.  Reporting a successful
+                # pause here leaves the browser and Runner in opposite states
+                # and guarantees that the next round cannot resume cleanly.
+                logger.warning(
+                    "[TeamManager] %spause rejected by Runner; keeping current "
+                    "stream active: session_id=%s team_name=%s",
+                    reason,
+                    session_id,
+                    team_name,
+                )
+                return False
+
             if runner_paused:
+                logger.info(
+                    "[DispatchTrace] team_pause_wait_stream_begin session_id=%s elapsed_sec=%.3f",
+                    session_id, time.perf_counter() - _pause_total_t0,
+                )
                 await self._wait_for_stream_task_exit(session_id)
+                logger.info(
+                    "[DispatchTrace] team_pause_wait_stream_end session_id=%s elapsed_sec=%.3f",
+                    session_id, time.perf_counter() - _pause_total_t0,
+                )
 
             # Pause parks the runtime in place (resumable via a later chat.send),
             # so running workflows may still continue — do NOT finalize them.
             await self._cleanup_runtime_locals(session_id, finalize_workflows=False)
+            logger.info(
+                "[DispatchTrace] team_pause_cleanup_done session_id=%s elapsed_sec=%.3f",
+                session_id, time.perf_counter() - _pause_total_t0,
+            )
             self.clear_active_runtime(session_id)
             self.clear_pending_runtime(session_id)
+            # The foreground ``run_agent_team_streaming`` round has ended at
+            # this point.  Keep the Runner pool entry parked, but make the next
+            # ``chat.send`` start a fresh streaming round.  That round is what
+            # drives AgentCore's RESUME_FROM_PAUSE path and re-attaches the
+            # monitor/event delivery used by the web client.  Leaving this
+            # marker set incorrectly routes the next input through
+            # ``interact_agent_team`` even though no stream is left to consume
+            # the resumed output; a team interrupted during bootstrap can then
+            # remain stuck with only its Leader and no visible way to finish
+            # creating members.
+            self.clear_session_initialized(session_id)
 
+        if unadmitted_query and runner_paused:
+            requeued = await self.add_leader_note(session_id, unadmitted_query)
+            logger.info(
+                "[TeamManager][pause-resume] requeued unadmitted round input: "
+                "session_id=%s queued=%s",
+                session_id, requeued,
+            )
+
+        _pause_total_dt = time.perf_counter() - _pause_total_t0
         logger.info(
-            "[TeamManager] %steam session paused: session_id=%s runner_paused=%s",
+            "[TeamManager][pause-resume] %steam session paused: session_id=%s "
+            "runner_paused=%s pause整体耗时=%.2fs (含Runner.pause+stream_task_exit+cleanup)",
             reason,
             session_id,
             runner_paused,
+            _pause_total_dt,
         )
         return True
+
+    async def add_leader_note(self, session_id: str, text: str) -> bool:
+        """Queue ``text`` as a user turn for the paused leader's next round.
+
+        A voice pause is executed by the gateway, not by the leader, so the
+        instruction would otherwise never enter the leader's context or the
+        trajectory. The note is admitted before whatever message resumes the
+        team. Returns False when no parked runtime can take it.
+        """
+        team_name = self._lookup_session_team_name(session_id)
+        if not team_name or not text:
+            return False
+        try:
+            return bool(await Runner.add_agent_team_leader_note(
+                text, team_name=team_name, session_id=session_id,
+            ))
+        except Exception:
+            logger.warning(
+                "[TeamManager] add leader note failed: session_id=%s team_name=%s",
+                session_id, team_name, exc_info=True,
+            )
+            return False
+
+    async def pause_session_members(self, session_id: str) -> bool:
+        """Voice "pause the tasks": park the teammates, keep the leader live.
+
+        A running team pauses its members in place. A team the speech-start
+        barge-in already parked is held so its next resume brings back only
+        the leader; ``resume_session_members`` restarts the members later.
+        Returns False when no runtime of this session can take it.
+        """
+        team_name = self._lookup_session_team_name(session_id)
+        if not team_name:
+            return False
+        try:
+            if await self.is_runtime_paused(session_id):
+                held = bool(await Runner.hold_agent_team_members_on_start(
+                    team_name=team_name, session_id=session_id,
+                ))
+                logger.info(
+                    "[TeamManager] voice members pause held for resume: session_id=%s team_name=%s held=%s",
+                    session_id, team_name, held,
+                )
+                return held
+            paused = bool(await Runner.pause_agent_team_members(
+                team_name=team_name, session_id=session_id,
+            ))
+            logger.info(
+                "[TeamManager] voice members paused: session_id=%s team_name=%s paused=%s",
+                session_id, team_name, paused,
+            )
+            return paused
+        except Exception:
+            logger.warning(
+                "[TeamManager] voice members pause failed: session_id=%s team_name=%s",
+                session_id, team_name, exc_info=True,
+            )
+            return False
+
+    async def resume_session_members(self, session_id: str) -> list[str]:
+        """Restart teammates a voice members-only pause held down; ``[]`` if none."""
+        team_name = self._lookup_session_team_name(session_id)
+        if not team_name:
+            return []
+        try:
+            if not await Runner.agent_team_members_paused(team_name=team_name, session_id=session_id):
+                return []
+            restarted = list(await Runner.resume_agent_team_members(
+                team_name=team_name, session_id=session_id,
+            ) or [])
+        except Exception:
+            logger.warning(
+                "[TeamManager] voice members resume failed: session_id=%s team_name=%s",
+                session_id, team_name, exc_info=True,
+            )
+            return []
+        logger.info(
+            "[TeamManager] voice members resumed: session_id=%s team_name=%s restarted=%s",
+            session_id, team_name, restarted,
+        )
+        return restarted
+
+    async def read_member_statuses(self, session_id: str) -> list[dict[str, str]]:
+        """Return ``[{member_id, status}]`` for the session's teammates from the DB.
+
+        Used after a pause: the monitor is torn down and the members are
+        marked paused silently, so clients need the settled statuses pushed.
+        """
+        team_name = self._lookup_session_team_name(session_id)
+        if not team_name:
+            return []
+        from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import (
+            TeamMonitorHandler,
+        )
+
+        try:
+            members = await TeamMonitorHandler.get_member_list_from_db(
+                team_name, exclude_leader=True,
+            ) or []
+        except Exception:
+            logger.warning(
+                "[TeamManager] read member statuses failed: session_id=%s team_name=%s",
+                session_id, team_name, exc_info=True,
+            )
+            return []
+        return [
+            {"member_id": str(m["member_id"]), "status": str(getattr(m["status"], "value", m["status"]))}
+            for m in members
+            if m.get("member_id")
+        ]
 
     async def _cancel_stream_task(self, session_id: str, reason: str) -> None:
         """Cancel one stream task while serializing its lifecycle operations."""

@@ -154,9 +154,9 @@ name = "aiologic"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "sniffio", marker = "python_full_version < '3.13'" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
-    { name = "wrapt", marker = "python_full_version < '3.13'" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+    { name = "wrapt" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a8/13/50b91a3ea6b030d280d2654be97c48b6ed81753a50286ee43c646ba36d3c/aiologic-0.16.0.tar.gz", hash = "sha256:c267ccbd3ff417ec93e78d28d4d577ccca115d5797cdbd16785a551d9658858f", size = 225952, upload-time = "2025-11-27T23:48:41.195Z" }
 wheels = [
@@ -745,7 +745,7 @@ name = "clr-loader"
 version = "0.2.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "sys_platform == 'win32'" },
+    { name = "cffi" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/18/24/c12faf3f61614b3131b5c98d3bf0d376b49c7feaa73edca559aeb2aee080/clr_loader-0.2.10.tar.gz", hash = "sha256:81f114afbc5005bafc5efe5af1341d400e22137e275b042a8979f3feb9fc9446", size = 83605, upload-time = "2026-01-03T23:13:06.984Z" }
 wheels = [
@@ -780,7 +780,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", marker = "python_full_version < '3.12'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/58/01/1253e6698a07380cd31a736d248a3f2a50a7c88779a1813da27503cadc2a/contourpy-1.3.3.tar.gz", hash = "sha256:083e12155b210502d0bca491432bb04d56dc3432f95a979b429f2848c3dbe880", size = 13466174, upload-time = "2025-07-26T12:03:12.549Z" }
 wheels = [
@@ -848,7 +848,7 @@ resolution-markers = [
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", marker = "python_full_version >= '3.12'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/83/5a/a55177dd22553a277388e8a1b3220e92de91bacb28356cdc73caa240121d/contourpy-1.4.0.tar.gz", hash = "sha256:20156f5a1ac4f8ce02656e39a61e82164a3d359796dc8026f75b062783d500e1", size = 13323726, upload-time = "2026-09-11T19:05:05.808Z" }
 wheels = [
@@ -1035,8 +1035,8 @@ name = "culsans"
 version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiologic", marker = "python_full_version < '3.13'" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "aiologic" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/e3/49afa1bc180e0d28008ec6bcdf82a4072d1c7a41032b5b759b60814ca4b0/culsans-0.11.0.tar.gz", hash = "sha256:0b43d0d05dce6106293d114c86e3fb4bfc63088cfe8ff08ed3fe36891447fe33", size = 107546, upload-time = "2025-12-31T23:15:38.196Z" }
 wheels = [
@@ -2415,7 +2415,7 @@ name = "macholib"
 version = "1.16.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "altgraph", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "altgraph" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/10/2f/97589876ea967487978071c9042518d28b958d87b17dceb7cdc1d881f963/macholib-1.16.4.tar.gz", hash = "sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362", size = 59427, upload-time = "2025-11-22T08:28:38.373Z" }
 wheels = [
@@ -2962,7 +2962,7 @@ wheels = [
 [[package]]
 name = "openjiuwen"
 version = "0.1.18"
-source = { git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc#9e3390195a9ea15235b2b5f7412cb2aa440622cc" }
+source = { git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio#8666c4e229291b0e4cb4115c73f6e14c2e6f8963" }
 dependencies = [
     { name = "agentdescent" },
     { name = "aiofiles" },
@@ -3644,6 +3644,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pyaudio"
+version = "0.2.14"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/1d/8878c7752febb0f6716a7e1a52cb92ac98871c5aa522cba181878091607c/PyAudio-0.2.14.tar.gz", hash = "sha256:78dfff3879b4994d1f4fc6485646a57755c6ee3c19647a491f790a0895bd2f87", size = 47066, upload-time = "2023-11-07T07:11:48.806Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/f0/b0eab89eafa70a86b7b566a4df2f94c7880a2d483aa8de1c77d335335b5b/PyAudio-0.2.14-cp311-cp311-win32.whl", hash = "sha256:506b32a595f8693811682ab4b127602d404df7dfc453b499c91a80d0f7bad289", size = 144624, upload-time = "2023-11-07T07:11:36.94Z" },
+    { url = "https://files.pythonhosted.org/packages/82/d8/f043c854aad450a76e476b0cf9cda1956419e1dacf1062eb9df3c0055abe/PyAudio-0.2.14-cp311-cp311-win_amd64.whl", hash = "sha256:bbeb01d36a2f472ae5ee5e1451cacc42112986abe622f735bb870a5db77cf903", size = 164070, upload-time = "2023-11-07T07:11:38.579Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/45/8d2b76e8f6db783f9326c1305f3f816d4a12c8eda5edc6a2e1d03c097c3b/PyAudio-0.2.14-cp312-cp312-win32.whl", hash = "sha256:5fce4bcdd2e0e8c063d835dbe2860dac46437506af509353c7f8114d4bacbd5b", size = 144750, upload-time = "2023-11-07T07:11:40.142Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/6a/d25812e5f79f06285767ec607b39149d02aa3b31d50c2269768f48768930/PyAudio-0.2.14-cp312-cp312-win_amd64.whl", hash = "sha256:12f2f1ba04e06ff95d80700a78967897a489c05e093e3bffa05a84ed9c0a7fa3", size = 164126, upload-time = "2023-11-07T07:11:41.539Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/77/66cd37111a87c1589b63524f3d3c848011d21ca97828422c7fde7665ff0d/PyAudio-0.2.14-cp313-cp313-win32.whl", hash = "sha256:95328285b4dab57ea8c52a4a996cb52be6d629353315be5bfda403d15932a497", size = 150982, upload-time = "2024-11-20T19:12:12.404Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/8b/7f9a061c1cc2b230f9ac02a6003fcd14c85ce1828013aecbaf45aa988d20/PyAudio-0.2.14-cp313-cp313-win_amd64.whl", hash = "sha256:692d8c1446f52ed2662120bcd9ddcb5aa2b71f38bda31e58b19fb4672fffba69", size = 173655, upload-time = "2024-11-20T19:12:13.616Z" },
+]
+
+[[package]]
 name = "pybase64"
 version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4046,7 +4060,7 @@ name = "pyobjc-framework-cocoa"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-core" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/02/a3/16ca9a15e77c061a9250afbae2eae26f2e1579eb8ca9462ae2d2c71e1169/pyobjc_framework_cocoa-12.1.tar.gz", hash = "sha256:5556c87db95711b985d5efdaaf01c917ddd41d148b1e52a0c66b1a2e2c5c1640", size = 2772191, upload-time = "2025-11-14T10:13:02.069Z" }
 wheels = [
@@ -4061,8 +4075,8 @@ name = "pyobjc-framework-quartz"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/94/18/cc59f3d4355c9456fc945eae7fe8797003c4da99212dd531ad1b0de8a0c6/pyobjc_framework_quartz-12.1.tar.gz", hash = "sha256:27f782f3513ac88ec9b6c82d9767eef95a5cf4175ce88a1e5a65875fee799608", size = 3159099, upload-time = "2025-11-14T10:21:24.31Z" }
 wheels = [
@@ -4077,8 +4091,8 @@ name = "pyobjc-framework-security"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/80/aa/796e09a3e3d5cee32ebeebb7dcf421b48ea86e28c387924608a05e3f668b/pyobjc_framework_security-12.1.tar.gz", hash = "sha256:7fecb982bd2f7c4354513faf90ba4c53c190b7e88167984c2d0da99741de6da9", size = 168044, upload-time = "2025-11-14T10:22:06.334Z" }
 wheels = [
@@ -4093,8 +4107,8 @@ name = "pyobjc-framework-uniformtypeidentifiers"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/65/b8/dd9d2a94509a6c16d965a7b0155e78edf520056313a80f0cd352413f0d0b/pyobjc_framework_uniformtypeidentifiers-12.1.tar.gz", hash = "sha256:64510a6df78336579e9c39b873cfcd03371c4b4be2cec8af75a8a3d07dff607d", size = 17030, upload-time = "2025-11-14T10:23:02.222Z" }
 wheels = [
@@ -4106,8 +4120,8 @@ name = "pyobjc-framework-webkit"
 version = "12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "pyobjc-framework-cocoa", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/14/10/110a50e8e6670765d25190ca7f7bfeecc47ec4a8c018cb928f4f82c56e04/pyobjc_framework_webkit-12.1.tar.gz", hash = "sha256:97a54dd05ab5266bd4f614e41add517ae62cdd5a30328eabb06792474b37d82a", size = 284531, upload-time = "2025-11-14T10:23:40.287Z" }
 wheels = [
@@ -4417,7 +4431,7 @@ name = "pythonnet"
 version = "3.0.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "clr-loader", marker = "sys_platform == 'win32'" },
+    { name = "clr-loader" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9a/d6/1afd75edd932306ae9bd2c2d961d603dc2b52fcec51b04afea464f1f6646/pythonnet-3.0.5.tar.gz", hash = "sha256:48e43ca463941b3608b32b4e236db92d8d40db4c58a75ace902985f76dac21cf", size = 239212, upload-time = "2024-12-13T08:30:44.393Z" }
 wheels = [
@@ -4570,7 +4584,7 @@ name = "qtpy"
 version = "2.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "packaging", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "packaging" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/70/01/392eba83c8e47b946b929d7c46e0f04b35e9671f8bb6fc36b6f7945b4de8/qtpy-2.4.3.tar.gz", hash = "sha256:db744f7832e6d3da90568ba6ccbca3ee2b3b4a890c3d6fbbc63142f6e4cdf5bb", size = 66982, upload-time = "2025-02-11T15:09:25.759Z" }
 wheels = [
@@ -4881,8 +4895,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "jeepney", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -5789,6 +5803,9 @@ test = [
 tui = [
     { name = "workswarm-tui" },
 ]
+voice = [
+    { name = "pyaudio" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -5873,11 +5890,11 @@ requires-dist = [
     { name = "mutagen", specifier = ">=1.47.0,<2" },
     { name = "mutagen", marker = "extra == 'harmony'", specifier = ">=1.47.0" },
     { name = "numpy", specifier = ">=1.24.0,<3" },
-    { name = "openjiuwen", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc" },
-    { name = "openjiuwen", marker = "extra == 'harmony'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc" },
-    { name = "openjiuwen", extras = ["claude"], marker = "extra == 'claude'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc" },
-    { name = "openjiuwen", extras = ["codex"], marker = "extra == 'codex'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc" },
-    { name = "openjiuwen", extras = ["postgres", "zmq"], marker = "extra == 'distribute'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=9e3390195a9ea15235b2b5f7412cb2aa440622cc" },
+    { name = "openjiuwen", git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio" },
+    { name = "openjiuwen", marker = "extra == 'harmony'", git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio" },
+    { name = "openjiuwen", extras = ["claude"], marker = "extra == 'claude'", git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio" },
+    { name = "openjiuwen", extras = ["codex"], marker = "extra == 'codex'", git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio" },
+    { name = "openjiuwen", extras = ["postgres", "zmq"], marker = "extra == 'distribute'", git = "https://gitcode.com/openJiuwen/agent-core.git?branch=feature%2Fduplex_audio" },
     { name = "opentelemetry-api", specifier = ">=1.28.0,<1.42" },
     { name = "opentelemetry-api", marker = "extra == 'harmony'", specifier = ">=1.28.0" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.28.0,<1.42" },
@@ -5896,6 +5913,7 @@ requires-dist = [
     { name = "prompt-toolkit", specifier = ">=3.0,<4.0" },
     { name = "protobuf", specifier = ">=5.29.5,<7" },
     { name = "psutil", specifier = ">=7.2.2,<8" },
+    { name = "pyaudio", marker = "extra == 'voice'", specifier = ">=0.2.14" },
     { name = "pydantic", specifier = ">=2.0,<3.0" },
     { name = "pydantic", marker = "extra == 'harmony'", specifier = ">=2.0" },
     { name = "pyinstaller", marker = "extra == 'dev'", specifier = ">=6.0.0" },
@@ -5933,7 +5951,7 @@ requires-dist = [
     { name = "wecom-aibot-sdk", marker = "extra == 'harmony'", specifier = ">=1.0.5" },
     { name = "workswarm-tui", marker = "extra == 'tui'", directory = "packages/jiuwenswarm-tui" },
 ]
-provides-extras = ["harmony", "a2a", "ssh", "desktop", "dev", "tui", "distribute", "claude", "codex", "shell-ast", "test"]
+provides-extras = ["harmony", "a2a", "ssh", "desktop", "voice", "dev", "tui", "distribute", "claude", "codex", "shell-ast", "test"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -13,6 +13,7 @@ import math
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Optional
@@ -2371,10 +2372,13 @@ class AgentWebSocketServer:
         """Dispatch an already-parsed request. Used by Front after CONTROL_READY."""
         if request.req_method == ReqMethod.CHAT_SEND:
             server_logger.info(
-                "[AgentServer] chat input received: request_id=%s session_id=%s channel_id=%s query=%s",
+                "[AgentServer][DispatchTrace] chat input received: request_id=%s session_id=%s channel_id=%s mode=%s team_name=%s is_stream=%s query=%s",
                 request.request_id,
                 request.session_id,
                 request.channel_id,
+                (request.params or {}).get("mode") if isinstance(request.params, dict) else None,
+                (request.params or {}).get("team_name") if isinstance(request.params, dict) else None,
+                request.is_stream,
                 preview_text(_request_query_text(request)),
             )
 
@@ -2767,6 +2771,15 @@ class AgentWebSocketServer:
                 sid = request.session_id or "default"
                 intent = request.params.get("intent", "cancel") if isinstance(request.params, dict) else "cancel"
                 cleanup_after_cancel = self._is_client_disconnect_cancel_request(request)
+                _cancel_t0 = time.perf_counter()
+                logger.info(
+                    "[DispatchTrace] agent_cancel_begin request_id=%s intent=%s session_id=%s "
+                    "channel_id=%s wait_for_completion=%s operation_id=%s active_stream_entries=%s",
+                    request.request_id, intent, sid, request.channel_id,
+                    (request.params or {}).get("wait_for_completion") if isinstance(request.params, dict) else None,
+                    (request.params or {}).get("operation_id") if isinstance(request.params, dict) else None,
+                    len(self._session_stream_tasks.get(sid, {})),
+                )
 
                 # 只有 cancel/supplement 才取消流式任务
                 # pause/resume 不取消，因为任务仍在运行（pause 在 checkpoint 阻塞，resume 解除阻塞）
@@ -2828,16 +2841,39 @@ class AgentWebSocketServer:
                             )
                             async with send_lock:
                                 await send_wire_payload(ws, wire)
+                logger.info(
+                    "[DispatchTrace] agent_cancel_end request_id=%s intent=%s session_id=%s "
+                    "elapsed_sec=%.3f",
+                    request.request_id, intent, sid,
+                    time.perf_counter() - _cancel_t0,
+                )
                 return
             await self._ensure_auto_team_binding_for_chat(request)
             # chat.send 入口采集隐式反馈：用户在推荐后的文本回复关联到最近推荐。
             # best-effort，失败绝不影响主 chat 流（见方法实现）。
             if request.req_method == ReqMethod.CHAT_SEND:
                 await self._try_record_implicit_feedback(request)
+            _request_t0 = time.perf_counter()
+            logger.info(
+                "[DispatchTrace] agent_request_execution_begin request_id=%s method=%s "
+                "session_id=%s is_stream=%s",
+                request.request_id,
+                getattr(request.req_method, "value", request.req_method),
+                request.session_id,
+                request.is_stream,
+            )
             if request.is_stream:
                 await self._handle_stream(ws, request, send_lock)
             else:
                 await self._handle_unary(ws, request, send_lock)
+            logger.info(
+                "[DispatchTrace] agent_request_execution_end request_id=%s method=%s "
+                "session_id=%s elapsed_sec=%.3f",
+                request.request_id,
+                getattr(request.req_method, "value", request.req_method),
+                request.session_id,
+                time.perf_counter() - _request_t0,
+            )
         except asyncio.CancelledError:
             # 流式任务被 interrupt 取消，正常退出无需报错
             logger.info(
@@ -4062,6 +4098,12 @@ class AgentWebSocketServer:
             send_lock,
         )
         runtime_stream: Any | None = None
+        stream_started_at = time.monotonic()
+        logger.info(
+            "[AgentServer][StreamTrace] begin request_id=%s session_id=%s channel_id=%s mode=%s",
+            request.request_id, session_id, request.channel_id,
+            (request.params or {}).get("mode") if isinstance(request.params, dict) else None,
+        )
 
         async def _send_control_event(event: RuntimeEvent) -> None:
             await self._send_runtime_event(
@@ -4087,6 +4129,13 @@ class AgentWebSocketServer:
                     await _send_control_event(event)
                     continue
                 outcome_tracker.observe(event)
+                if event.event_type in {"chat.error", "chat.final", "processing_status", "team.completed"} or event.is_complete:
+                    logger.info(
+                        "[AgentServer][StreamTrace] event request_id=%s session_id=%s seq=%s event_type=%s is_complete=%s payload_keys=%s",
+                        request.request_id, session_id, chunk_count, event.event_type,
+                        event.is_complete,
+                        sorted(event.payload.keys()) if isinstance(event.payload, dict) else type(event.payload).__name__,
+                    )
                 if event.event_type == "chat.ask_user_question":
                     payload = event.payload if isinstance(event.payload, dict) else {}
                     await self._persist_repeated_session_question(
@@ -4167,9 +4216,9 @@ class AgentWebSocketServer:
                         request.request_id,
                     )
         logger.info(
-            "[AgentWebSocketServer] 流式响应已发送: request_id=%s 共 %s 个 chunk",
-            request.request_id,
-            chunk_count,
+            "[AgentWebSocketServer][StreamTrace] end request_id=%s session_id=%s chunks=%s outcome=%s error=%s elapsed_ms=%.1f",
+            request.request_id, session_id, chunk_count, resume_outcome, resume_error,
+            (time.monotonic() - stream_started_at) * 1000,
         )
 
     async def _persist_repeated_session_question(
@@ -5045,6 +5094,12 @@ class AgentWebSocketServer:
             else metadata.get("mode")
         )
         _, _, canonical_mode = resolve_agent_request_mode(effective_mode)
+        logger.info(
+            "[AgentServer][TeamBindingTrace] inspect session_id=%s request_id=%s canonical_mode=%s metadata_team=%s metadata_template=%s requested_group=%s",
+            session_id, request.request_id, canonical_mode,
+            metadata.get("team_name"), metadata.get("team_template_id"),
+            params.get("agent_group_name"),
+        )
         if not self._is_team_metadata_mode({"mode": canonical_mode}):
             return None
 
@@ -5054,6 +5109,11 @@ class AgentWebSocketServer:
             template_id = str(metadata.get("team_template_id") or "").strip()
             if template_id:
                 params.setdefault("team_template_id", template_id)
+            logger.info(
+                "[AgentServer][TeamBindingTrace] reuse session_id=%s request_id=%s team_name=%s runtime_snapshot=%s",
+                session_id, request.request_id, existing_team_name,
+                self._active_team_session_map().get(existing_team_name),
+            )
             return existing_team_name
         return None
 
@@ -10961,9 +11021,32 @@ class AgentWebSocketServer:
         payload 格式与 AgentResponse.payload 一致，
         可含 event_type 等字段供 Gateway 转为 Message 派发到 Channel。
         """
+        payload = msg.get("payload") if isinstance(msg, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        event_type = str(payload.get("event_type") or "").strip()
+        source = str(payload.get("source") or "").strip()
+        if not source and isinstance(msg.get("metadata"), dict):
+            source = str(msg["metadata"].get("source") or "").strip()
+        diagnostic = (
+            "request_id=%s session_id=%s channel_id=%s event_type=%s "
+            "source=%s is_complete=%s response_kind=%s role=%s type=%s"
+        )
+        diagnostic_args = (
+            msg.get("request_id", ""),
+            msg.get("session_id", ""),
+            msg.get("channel_id", ""),
+            event_type,
+            source,
+            msg.get("is_complete", False),
+            str(msg.get("response_kind") or "").strip(),
+            payload.get("role", ""),
+            payload.get("type", ""),
+        )
         if self._current_ws is None or self._current_send_lock is None:
             logger.warning(
-                "[AgentWebSocketServer] send_push 失败: 无活跃 Gateway 连接"
+                "[AgentWebSocketServer] send_push 失败: 无活跃 Gateway 连接 "
+                + diagnostic,
+                *diagnostic_args,
             )
             return False
 
@@ -10978,25 +11061,32 @@ class AgentWebSocketServer:
                 sent_original = await send_wire_payload(self._current_ws, wire)
             if not sent_original:
                 logger.warning(
-                    "[AgentWebSocketServer] send_push 内容过大已降级为错误帧: channel_id=%s",
-                    msg.get("channel_id", ""),
+                    "[AgentWebSocketServer] send_push 内容过大已降级为错误帧: "
+                    + diagnostic,
+                    *diagnostic_args,
                 )
                 return False
             response_kind = str(msg.get("response_kind") or "").strip()
             if response_kind:
                 logger.info(
-                    "[AgentWebSocketServer] send_push response_kind wire sent: channel_id=%s kind=%s",
-                    msg.get("channel_id", ""),
+                    "[AgentWebSocketServer] send_push response_kind wire sent: "
+                    + diagnostic + " kind=%s",
+                    *diagnostic_args,
                     response_kind,
                 )
             else:
                 logger.info(
-                    "[AgentWebSocketServer] send_push 已发送(E2A wire): channel_id=%s",
-                    msg.get("channel_id", ""),
+                    "[AgentWebSocketServer] send_push 已发送(E2A wire): "
+                    + diagnostic,
+                    *diagnostic_args,
                 )
             return True
         except Exception as e:
-            logger.warning("[AgentWebSocketServer] send_push 失败: %s", e)
+            logger.warning(
+                "[AgentWebSocketServer] send_push 失败: %s " + diagnostic,
+                e,
+                *diagnostic_args,
+            )
             return False
 
     def get_agent(self):

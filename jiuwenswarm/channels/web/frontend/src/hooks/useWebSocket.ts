@@ -109,6 +109,7 @@ import {
 import {
   findActiveTeamLeaderMessage as findActiveTeamLeaderMessageInTurn,
 } from '../features/teamLeaderMessages';
+import { emitLeaderMessageCommitted } from '../features/leaderMessageCommitted';
 import { buildGoalCompletedContent } from '../components/GoalBar/goalCompletedMessage';
 import {
   stripUploadDocumentBlocks,
@@ -717,12 +718,25 @@ interface UseWebSocketReturn {
   interrupt: (
     sessionId: string,
     intent: InterruptIntent,
-    options?: { newInput?: string }
-  ) => Promise<boolean>;
-  pause: (sessionId: string) => Promise<void>;
+    options?: {
+      newInput?: string;
+      waitForCompletion?: boolean;
+      addUserMessage?: boolean;
+      voiceDisplayText?: string;
+      voice?: boolean;
+    }
+  ) => Promise<void>;
+  pause: (
+    sessionId: string,
+    options?: { waitForCompletion?: boolean; voiceDisplayText?: string; voice?: boolean }
+  ) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
-  supplement: (sessionId: string, newInput: string) => Promise<void>;
-  resume: (sessionId: string) => Promise<void>;
+  supplement: (
+    sessionId: string,
+    newInput: string,
+    options?: { addUserMessage?: boolean }
+  ) => Promise<void>;
+  resume: (sessionId: string, options?: { voiceDisplayText?: string }) => Promise<void>;
   switchMode: (sessionId: string, mode: AgentMode) => Promise<void>;
   disconnect: () => void;
   sendUserAnswer: (
@@ -1017,6 +1031,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   const pendingAgentGroupBindingRef = useRef<Map<string, { id: string; timer: number }>>(new Map());
   const groupBindingReconcileRef = useRef<Map<string, Promise<void>>>(new Map());
   const reconcileAgentGroupBindingRef = useRef<((sessionId: string) => Promise<void>) | null>(null);
+  // 语音 barge-in 已发起强暂停、但 AgentServer 尚未确认 runner 已停止的会话。
+  // 期间丢弃旧流迟到的正文，避免用户开口后页面仍继续追加上一轮输出。
+  const strongPausePendingRef = useRef<Set<string>>(new Set());
   // 已经为哪些计划审批落过正文气泡。同一个 request_id 可能被重复推送
   // （重连补发 / 历史恢复），去重后才不会出现两条一样的计划。
   const planBubbleRequestIdsRef = useRef<Set<string>>(new Set());
@@ -1438,11 +1455,18 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     return findActiveTeamLeaderMessageInTurn(messages, requestId);
   }, []);
 
-  const closeActiveTeamLeaderMessages = useCallback((sessionId: string) => {
+  const closeActiveTeamLeaderMessages = useCallback((
+    sessionId: string,
+    finishReason?: Message['finishReason'],
+  ) => {
     const messages = useChatStore.getState().getRuntime(sessionId)?.messages ?? [];
     for (const msg of messages) {
       if (msg.id.startsWith('team-leader-') && msg.isStreaming) {
-        useChatStore.getState().updateMessage(sessionId, msg.id, { isStreaming: false });
+        useChatStore.getState().updateMessage(sessionId, msg.id, {
+          isStreaming: false,
+          completedAt: new Date().toISOString(),
+          ...(finishReason ? { finishReason } : {}),
+        });
       }
     }
   }, []);
@@ -1891,6 +1915,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       if (!stripUploadDocumentBlocks(content).trim() && !hasMedia) return false;
 
       const currentMode = useSessionStore.getState().getRuntime(sessionId)?.mode;
+      strongPausePendingRef.current.delete(sessionId);
       const unsupportedEvolutionMode = unsupportedEvolutionModeMessage(content, currentMode ?? 'agent');
       if (unsupportedEvolutionMode) {
         useChatStore.getState().addMessage(sessionId, {
@@ -1945,14 +1970,16 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       // pruneEnabledExtensions）兜底重新核对一遍"我的插件/我的MCP里已连接的"，避免把早就失效的
       // 名字发给后端；被摘掉的项同步从 sessionStore 里移除，让"+"扩展面板的开关同步变回关闭。
       const extensionPayload = buildExtensionSendPayload(sessionId);
-      useChatStore.getState().addMessage(sessionId, {
-        id: prefixedMessageId('user-'),
-        role: 'user',
-        content: stripUploadDocumentBlocks(content) || content.replace(/\n*【上传文档[\s\S]*$/, '').trim() || content,
-        mediaItems,
-        timestamp: new Date().toISOString(),
-        ...(selectedSkillsForRequest.length > 0 ? { skills: selectedSkillsForRequest } : {}),
-      });
+      if (options?.addUserMessage !== false) {
+        useChatStore.getState().addMessage(sessionId, {
+          id: prefixedMessageId('user-'),
+          role: 'user',
+          content: stripUploadDocumentBlocks(content) || content.replace(/\n*【上传文档[\s\S]*$/, '').trim() || content,
+          mediaItems,
+          timestamp: new Date().toISOString(),
+          ...(selectedSkillsForRequest.length > 0 ? { skills: selectedSkillsForRequest } : {}),
+        });
+      }
       // 发送后清空输入栏已选技能（一次性语义）；插件/MCP 是会话期间持续启用，不在这里清
       if (selectedSkills.length > 0) {
         useSessionStore.getState().clearSelectedSkills(sessionId);
@@ -2029,9 +2056,25 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         const outgoingMode = resolveOutgoingMode(sessionId, currentMode);
         const sessionMetadata = useSessionStore.getState().getRuntime(sessionId)?.metadata;
         const sessionRt = useSessionStore.getState().getRuntime(sessionId);
+        const chatSendStartedAt = performance.now();
+        console.info('[DispatchTrace] websocket_chat_send_begin', {
+          sessionId,
+          contentLength: outgoingContent.length,
+          voiceDisplayText: Boolean(options?.voiceDisplayText),
+          ts: new Date().toISOString(),
+        });
         await request('chat.send', {
           session_id: sessionId,
           content: outgoingContent,
+          // voice_display_text carries the transcribed utterance (what the user
+          // actually said) alongside the Leader-facing dispatch template in
+          // ``content``. The AgentServer restores it as the user-history record
+          // so refreshing the page shows the utterance, not the [语音请求]
+          // machine template that was sent to the Leader.
+          ...(options?.voiceDisplayText ? { voice_display_text: options.voiceDisplayText } : {}),
+          // A spoken "pause the tasks": the AgentServer parks the teammates and
+          // keeps the leader live so it confirms the pause in this very turn.
+          ...(options?.voicePauseMembers ? { voice_pause_members: true } : {}),
           ...(outgoingMediaItems ? { media_items: outgoingMediaItems } : {}),
           ...(outgoingFiles ? { files: outgoingFiles } : {}),
           mode: outgoingMode,
@@ -2052,6 +2095,11 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             : {}),
         });
         clearConnectionPresentationForUserAction(sessionId);
+        console.info('[DispatchTrace] websocket_chat_send_accepted', {
+          sessionId,
+          elapsedMs: Math.round(performance.now() - chatSendStartedAt),
+          ts: new Date().toISOString(),
+        });
         if (sessionMetadata) {
           useSessionStore.getState().setSessionMetadata(sessionId, null);
         }
@@ -2106,6 +2154,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
       const currentSessionState = useSessionStore.getState();
       const currentRuntime = currentSessionState.getRuntime(sessionId);
+      strongPausePendingRef.current.delete(sessionId);
       const workContext = getSessionWorkContext(sessionId);
       const currentMode = currentRuntime?.mode;
       const agentSelectionIntent =
@@ -2215,22 +2264,79 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     async (
       sessionId: string,
       intent: InterruptIntent,
-      options?: { newInput?: string }
+      options?: {
+      newInput?: string;
+      waitForCompletion?: boolean;
+      addUserMessage?: boolean;
+      voiceDisplayText?: string;
+      voice?: boolean;
+    }
     ) => {
       const newInput = options?.newInput;
+      const waitForCompletion = options?.waitForCompletion === true;
+      const operationId = waitForCompletion
+        ? `interrupt-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        : undefined;
+      let stopWaitingForCompletion: (() => void) | undefined;
+      const completionPromise = operationId
+        ? new Promise<void>((resolve, reject) => {
+            let stopListening = () => {};
+            const timeoutId = window.setTimeout(() => {
+              stopListening();
+              reject(new Error(t('network.interruptFailed')));
+            }, 75000);
+            stopListening = webClient.on<InterruptResultPayload>(
+              'chat.interrupt_result',
+              ({ payload }) => {
+                if (payload.operation_id !== operationId || payload.settled !== true) return;
+                window.clearTimeout(timeoutId);
+                stopListening();
+                if (payload.success) {
+                  resolve();
+                } else {
+                  reject(new Error(payload.message || t('network.interruptFailed')));
+                }
+              }
+            );
+            stopWaitingForCompletion = () => {
+              window.clearTimeout(timeoutId);
+              stopListening();
+            };
+          })
+        : undefined;
+      if (waitForCompletion && intent === 'pause') {
+        strongPausePendingRef.current.add(sessionId);
+        flushPendingStreamDelta(sessionId);
+        closeActiveTeamLeaderMessages(sessionId, 'interrupted');
+        useChatStore.getState().setPaused(sessionId, true);
+        useChatStore.getState().setProcessing(sessionId, false);
+        useChatStore.getState().setThinking(sessionId, false);
+      } else if (intent === 'resume' || intent === 'cancel') {
+        strongPausePendingRef.current.delete(sessionId);
+      }
       if (intent === 'supplement' && newInput) {
+        // A voice barge-in first performs a settled Team pause.  Its follow-up
+        // must reopen event delivery before the replacement turn starts;
+        // otherwise the strong-pause guard would discard every delta/final
+        // emitted by the recovered runtime.
+        strongPausePendingRef.current.delete(sessionId);
         resetContextCompressionTurn(sessionId);
         userInputVersionRef.current += 1;
         stopAllTts();
         if (useSessionStore.getState().getRuntime(sessionId)?.mode === 'team') {
           closeActiveTeamLeaderMessages(sessionId);
         }
-        useChatStore.getState().addMessage(sessionId, {
-          id: prefixedMessageId('user-'),
-          role: 'user',
-          content: newInput,
-          timestamp: new Date().toISOString(),
-        });
+        if (options?.addUserMessage !== false) {
+          useChatStore.getState().addMessage(sessionId, {
+            id: prefixedMessageId('user-'),
+            role: 'user',
+            content: newInput,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        useChatStore.getState().setPaused(sessionId, false);
+        useChatStore.getState().setProcessing(sessionId, true);
+        useChatStore.getState().setThinking(sessionId, true);
       }
       try {
         const params: Record<string, unknown> = {
@@ -2257,27 +2363,64 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         }
         if (intent === 'supplement') {
           params.new_input = newInput ?? '';
+          // Restore the transcribed utterance as user-history content so refresh
+          // shows it instead of the [语音请求] dispatch template in new_input.
+          if (options?.voiceDisplayText) params.voice_display_text = options.voiceDisplayText;
           const selectedModel = useSessionStore.getState().getEffectiveModelName(sessionId);
           if (selectedModel) params.model_name = selectedModel;
         }
+        if (waitForCompletion && operationId) {
+          params.wait_for_completion = true;
+          params.operation_id = operationId;
+        }
+        // Realtime-voice barge-in: the AgentServer opts into voice pause
+        // semantics (no parking a starting round, fast member teardown).
+        if (options?.voice) params.voice = true;
+        // A spoken pause carries its transcript so the AgentServer records it in
+        // history and hands it to the Leader's next round.
+        if (intent === 'pause' && options?.voice && options.voiceDisplayText?.trim()) {
+          params.voice_display_text = options.voiceDisplayText.trim();
+        }
+        const interruptStartedAt = performance.now();
+        console.info('[DispatchTrace] websocket_chat_interrupt_send', {
+          sessionId,
+          intent,
+          waitForCompletion: Boolean(waitForCompletion),
+          operationId,
+          ts: new Date().toISOString(),
+        });
         await request('chat.interrupt', params);
         if (intent === 'supplement' || intent === 'resume') {
           clearConnectionPresentationForUserAction(sessionId);
         }
+        console.info('[DispatchTrace] websocket_chat_interrupt_response', {
+          sessionId,
+          intent,
+          elapsedMs: Math.round(performance.now() - interruptStartedAt),
+          ts: new Date().toISOString(),
+        });
         if (intent === 'supplement') {
           // 成功发出后才消费 explicit-entry 标记（与 sendMessage 一致），失败时保留以便重试。
           consumePlanEntryMark(sessionId, String(params.mode));
         }
-        return true;
+        if (completionPromise) {
+          await completionPromise;
+        }
       } catch (error) {
+        stopWaitingForCompletion?.();
+        if (waitForCompletion && intent === 'pause') {
+          strongPausePendingRef.current.delete(sessionId);
+          useChatStore.getState().setPaused(sessionId, false);
+        }
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.interruptFailed'));
-        return false;
+        if (waitForCompletion) throw error;
       }
     },
     [
       closeActiveTeamLeaderMessages,
       clearConnectionPresentationForUserAction,
+      flushPendingStreamDelta,
       request,
       resetContextCompressionTurn,
       t,
@@ -2286,12 +2429,13 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
   // 暂停 - 显式暂停当前任务
   const pause = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, options?: { waitForCompletion?: boolean; voice?: boolean; voiceDisplayText?: string }) => {
       try {
-        await interrupt(sessionId, 'pause');
+        await interrupt(sessionId, 'pause', options);
       } catch (error) {
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.pauseFailed'));
+        if (options?.waitForCompletion) throw error;
       }
     },
     [interrupt, t]
@@ -2300,10 +2444,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   const cancel = useCallback(
     async (sessionId: string) => {
       try {
-        const succeeded = await interrupt(sessionId, 'cancel');
-        if (succeeded) {
-          useSubagentStore.getState().markRunningSubagentsCancelled(sessionId);
-        }
+        await interrupt(sessionId, 'cancel');
+        useSubagentStore.getState().markRunningSubagentsCancelled(sessionId);
       } catch (error) {
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.cancelFailed'));
@@ -2313,29 +2455,53 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   );
 
   const supplement = useCallback(
-    async (sessionId: string, newInput: string) => {
+    async (sessionId: string, newInput: string, options?: { addUserMessage?: boolean; voiceDisplayText?: string }) => {
       try {
-        await interrupt(sessionId, 'supplement', { newInput });
+        const currentMode = useSessionStore.getState().getRuntime(sessionId)?.mode;
+        if (currentMode === 'team') {
+          // Team pause tears down the foreground stream while parking the
+          // AgentCore runtime.  Resume it through the normal streaming
+          // ``chat.send`` path so RESUME_FROM_PAUSE can rebuild event delivery.
+          // ``chat.interrupt(intent=supplement)`` is a non-streaming control RPC
+          // and cannot carry the recovered Leader/member output.
+          await sendMessage(newInput, sessionId, [], {
+            addUserMessage: options?.addUserMessage,
+            voiceDisplayText: options?.voiceDisplayText,
+          });
+          return;
+        }
+        await interrupt(sessionId, 'supplement', {
+          newInput,
+          addUserMessage: options?.addUserMessage,
+          voiceDisplayText: options?.voiceDisplayText,
+        });
       } catch (error) {
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.supplementFailed'));
       }
     },
-    [interrupt, t]
+    [interrupt, sendMessage, t]
   );
 
   // 恢复 - 恢复暂停的任务
   const resume = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, options?: { voiceDisplayText?: string }) => {
       try {
+        const currentMode = useSessionStore.getState().getRuntime(sessionId)?.mode;
         await interrupt(sessionId, 'resume');
+        if (currentMode === 'team' && options?.voiceDisplayText?.trim()) {
+          await sendMessage(options.voiceDisplayText.trim(), sessionId, [], {
+            addUserMessage: false,
+            voiceDisplayText: options.voiceDisplayText,
+          });
+        }
         useChatStore.getState().setPaused(sessionId, false);
       } catch (error) {
         const webError = error as WebError;
         onErrorRef.current?.(webError.message || t('network.resumeFailed'));
       }
     },
-    [interrupt, t]
+    [interrupt, sendMessage, t]
   );
 
   // 切换模式
@@ -2922,6 +3088,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (handleTaskInputReceipt('chat.delta', payload)) return;
           const sessionId = resolveEventSessionId(payload);
           if (!sessionId) return;
+        if (strongPausePendingRef.current.has(sessionId)) return;
 
         // 页面刷新后收到活跃事件时恢复执行状态；已暂停会话的迟到事件不得重新拉起 processing
         const activityRuntime = useChatStore.getState().getRuntime(sessionId);
@@ -3129,8 +3296,9 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (!sessionId) return;
         // 主动推荐来源的 reasoning 不进 session 全局 reasoningSegments——否则会并入
         // 上一轮 turn（segment 无 messageId 绑定，按 startedAt 排序），把上一条
-        // 用户消息的思考状态从"已完成"污染成"已完成 N 次思考" streak chip。
+        // 用户消息的思考状态从“已完成”污染成“已完成 N 次思考” streak chip。
         if (isProactiveRecommendationPayload(payload)) return;
+        if (strongPausePendingRef.current.has(sessionId)) return;
 
         // 页面刷新后收到活跃事件时恢复执行状态；已暂停会话的迟到事件不得重新拉起 processing
         const activityRuntime = useChatStore.getState().getRuntime(sessionId);
@@ -3214,6 +3382,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           }
         }
         if (!sessionId) return;
+        if (strongPausePendingRef.current.has(sessionId)) return;
         // cron 最终结果（非占位）广播到达：自动跳转到执行会话，加载完整历史
         // （含用户消息、agent 回复、session 标题），避免用户手动点击左侧 session。
         // handleRestoreSession 通过队列异步执行，不会干扰当前消息处理。
@@ -3493,20 +3662,32 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           if (teamSplit) {
             useChatStore.getState().clearStreamSplit(sessionId);
             if (shouldCollapseTurnFinal(teamMessages, content, 'team', finalAction)) {
+              const committedMessageId = prefixedMessageId('team-leader-');
               useChatStore.getState().collapseTurnFinal(sessionId, {
                 kind: 'team',
                 content,
-                finalId: prefixedMessageId('team-leader-'),
+                finalId: committedMessageId,
                 timestampIso: iso,
+              });
+              emitLeaderMessageCommitted({
+                sessionId,
+                messageId: committedMessageId,
+                content,
               });
               return;
             }
             if (finalAction.type === 'append') {
+              const committedMessageId = prefixedMessageId('team-leader-');
               useChatStore.getState().addMessage(sessionId, {
-                id: prefixedMessageId('team-leader-'),
+                id: committedMessageId,
                 role: 'system',
                 content: `team.leader:${JSON.stringify({ content, timestamp: Date.parse(iso) || Date.now() })}`,
                 timestamp: iso,
+              });
+              emitLeaderMessageCommitted({
+                sessionId,
+                messageId: committedMessageId,
+                content,
               });
               return;
             }
@@ -3516,13 +3697,24 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
                 isStreaming: false,
                 timestamp: iso,
               });
+              emitLeaderMessageCommitted({
+                sessionId,
+                messageId: teamLeaderMessageToFinalize.id,
+                content,
+              });
               return;
             }
+            const committedMessageId = prefixedMessageId('team-leader-');
             useChatStore.getState().addMessage(sessionId, {
-              id: prefixedMessageId('team-leader-'),
+              id: committedMessageId,
               role: 'system',
               content: `team.leader:${JSON.stringify({ content, timestamp: Date.parse(iso) || Date.now() })}`,
               timestamp: iso,
+            });
+            emitLeaderMessageCommitted({
+              sessionId,
+              messageId: committedMessageId,
+              content,
             });
             return;
           }
@@ -3533,14 +3725,25 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               isStreaming: false,
               timestamp: iso,
             });
+            emitLeaderMessageCommitted({
+              sessionId,
+              messageId: teamLeaderMessageToFinalize.id,
+              content,
+            });
             return;
           }
 
+          const committedMessageId = prefixedMessageId('team-leader-');
           useChatStore.getState().addMessage(sessionId, {
-            id: prefixedMessageId('team-leader-'),
+            id: committedMessageId,
             role: 'system',
             content: `team.leader:${JSON.stringify({ content, timestamp })}`,
             timestamp: new Date().toISOString(),
+          });
+          emitLeaderMessageCommitted({
+            sessionId,
+            messageId: committedMessageId,
+            content,
           });
           return;
         }
@@ -4753,11 +4956,26 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
         if (resultPayload.intent === 'pause') {
           if (resultPayload.success) {
+            // 带 team_members 说明后端确认团队已停在可恢复边界；此时网关侧可能已没有
+            // 活跃流（has_active_task=false），但任务并未完成，仍应显示为已暂停。
+            const settledTeamMembers = Array.isArray(resultPayload.team_members)
+              ? resultPayload.team_members
+              : undefined;
+            const pausedState = hasActiveTask || settledTeamMembers !== undefined;
             useChatStore.getState().setPaused(
               sessionId,
-              hasActiveTask,
-              hasActiveTask ? resultPayload.paused_task : undefined,
+              pausedState,
+              pausedState ? resultPayload.paused_task : undefined,
             );
+            settledTeamMembers?.forEach((member) => {
+              if (member?.member_id && member.status) {
+                useSessionStore.getState().updateTeamMemberStatus(
+                  sessionId,
+                  member.member_id,
+                  member.status,
+                );
+              }
+            });
             useChatStore.getState().setProcessing(sessionId, false);
             useChatStore.getState().setThinking(sessionId, false);
             // 暂停时生成已被掐断，思考段收不到后续 delta/final 兜底：这里显式收尾，
@@ -4774,6 +4992,20 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             // isStreaming 不经过 currentStreamId 收尾，这里同 cancel 分支一样显式
             // 关闭还在 streaming 的 team-leader 消息，避免光标永久闪烁（bug001）。
             closeActiveTeamLeaderMessages(sessionId);
+            // A spoken pause is answered by the backend in the parked Leader's
+            // place; show it as the Leader's reply and let the voice speak it.
+            const voiceReply = resultPayload.voice_reply?.trim();
+            if (voiceReply) {
+              const replyMessageId = `team-leader-voice-pause-${resultPayload.operation_id || Date.now()}`;
+              const replyTimestamp = new Date().toISOString();
+              useChatStore.getState().addMessage(sessionId, {
+                id: replyMessageId,
+                role: 'system',
+                content: `team.leader:${JSON.stringify({ content: voiceReply, timestamp: Date.now() })}`,
+                timestamp: replyTimestamp,
+              });
+              emitLeaderMessageCommitted({ sessionId, messageId: replyMessageId, content: voiceReply });
+            }
           }
         } else if (resultPayload.intent === 'resume') {
           if (resultPayload.success) {

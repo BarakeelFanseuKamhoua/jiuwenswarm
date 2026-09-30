@@ -1013,6 +1013,7 @@ function AppContent({
     pause,
     cancel,
     supplement,
+    resume,
     sendUserAnswer,
     setGoalObjective,
     pauseGoal,
@@ -1597,8 +1598,8 @@ function AppContent({
       const response = await request<Session>('session.get_metadata', {
         session_id: targetSessionId,
       });
-      const { queued_session_messages: queuedMessages, ...session } = response;
-      if ((session as unknown as Record<string, unknown>).archived === true) {
+      const { queued_session_messages: queuedMessages, ...fetched } = response;
+      if ((fetched as unknown as Record<string, unknown>).archived === true) {
         if (sessionIdRef.current === targetSessionId) {
           navigate({ kind: 'chat-new' }, { replace: true });
         }
@@ -1618,6 +1619,13 @@ function AppContent({
             }))
         );
       }
+      // The Gateway counts a paused Team as busy, but a paused session is not
+      // running anything: keep it settled, as chat.processing_status does,
+      // otherwise the pause leaves a spinner that nothing ever clears.
+      const session = fetched.is_processing
+        && useChatStore.getState().getRuntime(targetSessionId)?.isPaused
+        ? { ...fetched, is_processing: false }
+        : fetched;
       upsertSessionMetadata(session, { setCurrent: sessionIdRef.current === targetSessionId });
       useWorkspaceStore.getState().upsertSession(session);
       // is_processing 由 Gateway 在 session.get_metadata 响应入队前读取当前
@@ -3022,7 +3030,7 @@ function AppContent({
           queueOrAddGoalObjectiveMessage(newSid, messageContent);
           setGoalObjective(newSid, messageContent);
         } else {
-          const sent = await sendMessage(messageContent, newSid, mediaItems);
+          const sent = await sendMessage(content, newSid, mediaItems, options);
           if (!sent) {
             useChatStore.getState().setInputValue(newSid, messageContent);
           }
@@ -3044,7 +3052,7 @@ function AppContent({
       return;
     }
     disposeInFlightHistoryHandles(currentSessionId);
-    const sent = await sendMessage(content, currentSessionId, mediaItems);
+    const sent = await sendMessage(content, currentSessionId, mediaItems, options);
     if (sent) {
       const sessionState = useSessionStore.getState();
       const session =
@@ -3056,6 +3064,86 @@ function AppContent({
       useChatStore.getState().setInputValue(currentSessionId, content);
     }
   }, [disposeInFlightHistoryHandles, mode, navigate, request, sendMessage, setGoalObjective, t]);
+
+  const handleEnsureVoiceSession = useCallback(async (): Promise<string> => {
+    const currentSessionId = sessionIdRef.current;
+    if (currentSessionId && currentSessionId !== NEW_CONVERSATION_ID) {
+      return currentSessionId;
+    }
+    if (creatingSessionRef.current) {
+      throw new Error(t('chat.realtimeVoiceSessionCreating'));
+    }
+
+    creatingSessionRef.current = true;
+    useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, true);
+    const newRuntime = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID);
+    const runtimeSettings = {
+      mode: newRuntime?.mode ?? mode,
+      selectedModelName: useSessionStore.getState().getEffectiveModelName(NEW_CONVERSATION_ID),
+      projectDir: newRuntime?.projectDirectory ?? null,
+    };
+    const baseWorkContext = getWorkContextForSession(NEW_CONVERSATION_ID);
+    const preservedProject = newConversationProjectRef.current;
+    const workContext = {
+      project_id: baseWorkContext.project_id || preservedProject?.project_id,
+      project_dir: baseWorkContext.project_dir || preservedProject?.project_dir,
+      work_mode: useWorkspaceStore.getState().workMode,
+    };
+
+    try {
+      const createParams: Record<string, unknown> = {
+        create_token: generateUuidV4(),
+        mode: runtimeSettings.mode,
+        is_swarm: runtimeSettings.mode === 'team',
+        title: t('chat.realtimeVoiceSessionTitle'),
+        work_mode: workContext.work_mode,
+      };
+      const previousSession = newConversationPreviousSessionRef.current;
+      if (previousSession) {
+        createParams.previous_session_id = previousSession.sessionId;
+        createParams.previous_mode = previousSession.mode;
+      }
+      if (runtimeSettings.selectedModelName) createParams.model_name = runtimeSettings.selectedModelName;
+      if (workContext.project_id) createParams.project_id = workContext.project_id;
+      if (workContext.project_dir) createParams.project_dir = workContext.project_dir;
+
+      const created = await createConversationSession(request, createParams);
+      const newSid = created.session_id;
+      const createdSession = registerCreatedConversation(
+        newSid,
+        runtimeSettings,
+        Date.now(),
+        t('chat.realtimeVoiceSessionTitle'),
+        {
+          project_id: created.project_id || workContext.project_id,
+          project_dir: created.project_dir || workContext.project_dir,
+          work_mode: created.work_mode || workContext.work_mode,
+        },
+      );
+      const pendingSkills = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID)?.selectedSkills ?? [];
+      pendingSkills.forEach(skill => useSessionStore.getState().addSelectedSkill(newSid, skill));
+      useSessionStore.getState().clearSelectedSkills(NEW_CONVERSATION_ID);
+      useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
+      useChatStore.getState().setProcessing(newSid, false);
+      useWorkspaceStore.getState().upsertSession(
+        { ...createdSession, is_processing: false },
+        { isNew: true },
+      );
+      sessionIdsCreatedInThisPageRef.current.add(newSid);
+      sessionIdRef.current = newSid;
+      setSessionId(newSid);
+      navigate({ kind: 'chat-session', sessionId: newSid }, { replace: true });
+      newConversationProjectRef.current = null;
+      newConversationPreviousSessionRef.current = null;
+      return newSid;
+    } catch (error) {
+      useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
+      useChatStore.getState().setThinking(NEW_CONVERSATION_ID, false);
+      throw error;
+    } finally {
+      creatingSessionRef.current = false;
+    }
+  }, [mode, navigate, request, t]);
 
   const handlePersistMedia = useCallback((content: string, mediaItems: MediaItem[]) => {
     const currentSessionId = sessionIdRef.current;
@@ -3091,12 +3179,15 @@ function AppContent({
     });
   }, [sendStructuredChatContent]);
 
-  const handleInterrupt = useCallback((newInput?: string) => {
+  const handleInterrupt = useCallback(async (
+    newInput?: string,
+    options?: { addUserMessage?: boolean; voiceDisplayText?: string },
+  ) => {
     const currentSessionId = sessionIdRef.current;
     if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID) return;
     const trimmed = newInput?.trim();
     if (!trimmed) return;
-    void supplement(currentSessionId, trimmed);
+    await supplement(currentSessionId, trimmed, options);
   }, [supplement]);
 
   const handleCancel = useCallback(() => {
@@ -3120,6 +3211,19 @@ function AppContent({
     void cancel(currentSessionId);
     if (isGoalActive) void pauseGoal(currentSessionId);
   }, [cancel, mode, pause, pauseGoal]);
+
+  const handleVoiceControl = useCallback(async (
+    command: 'pause_task' | 'resume_task',
+    options?: { waitForCompletion?: boolean; voiceDisplayText?: string; voice?: boolean }
+  ) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId || currentSessionId === NEW_CONVERSATION_ID) return;
+    if (command === 'pause_task') {
+      await pause(currentSessionId, options);
+    } else if (command === 'resume_task') {
+      await resume(currentSessionId, { voiceDisplayText: options?.voiceDisplayText });
+    }
+  }, [pause, resume]);
 
   /**
    * 删除目标：active 时除了清目标，还要顺带结束当前会话输出——复用停止按钮同一套中断调用
@@ -3691,7 +3795,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                   } as CSSProperties}
                   data-testid="app-chat-surface"
                 >
-<SingleAgentSurface
+                  <SingleAgentSurface
                     activeView={chatSurfaceView}
                     chat={(
                       <ChatPanel
@@ -3701,11 +3805,13 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                         continuedFromSessionId={continuedFromSessionId}
                         onOpenContinuedFromSession={handleOpenContinuedFromSession}
                         onInputIntent={handleSessionInputIntent}
+                        onEnsureVoiceSession={handleEnsureVoiceSession}
                         onPersistMedia={handlePersistMedia}
                         onPersistDocuments={handlePersistDocuments}
                         onDiscardMedia={handleDiscardMedia}
                         onInterrupt={handleInterrupt}
                         onCancel={handleCancel}
+                        onVoiceControl={handleVoiceControl}
                         onSwitchMode={handleSwitchMode}
                         isProcessing={isProcessing}
                         onUserAnswer={handleUserAnswer}

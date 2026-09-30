@@ -321,6 +321,14 @@ class WebClient {
       try {
         options.onRequestId?.(id);
         this.ws!.send(JSON.stringify(message));
+        if (method === 'chat.send' || method === 'chat.interrupt') {
+          console.info('[DispatchTrace] browser_ws_frame_sent', {
+            requestId: id,
+            method,
+            sessionId: params?.session_id,
+            ts: new Date().toISOString(),
+          });
+        }
       } catch (error) {
         window.clearTimeout(timeoutId);
         this.pending.delete(id);

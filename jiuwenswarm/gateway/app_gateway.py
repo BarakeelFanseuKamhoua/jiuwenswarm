@@ -2168,6 +2168,14 @@ async def _run(
         path=web_path,
     )
     web_channel = WebChannel(web_config, _DummyBus(), agent_client=client)
+    from jiuwenswarm.gateway.voice_mirror import VoiceMirrorRegistry
+
+    voice_mirror_registry = VoiceMirrorRegistry(web_channel)
+    web_channel.on_disconnect(voice_mirror_registry.cleanup_ws)
+    from jiuwenswarm.voice.web_session import WebVoiceSessionManager
+
+    voice_session_manager = WebVoiceSessionManager(web_channel)
+    web_channel.on_disconnect(voice_session_manager.cleanup_ws)
 
     # 注入 Git diff 监控注册表(设计文档阶段10):
     # 1. 让 ``_mark_git_watcher_dirty`` 能通过 ``channel.git_watcher_registry`` 唤醒轮询
@@ -2209,6 +2217,8 @@ async def _run(
             cron_controller=cron_controller,
             heartbeat_controller=heartbeat_controller,
             updater_service=updater_service,
+            voice_mirror_registry=voice_mirror_registry,
+            voice_session_manager=voice_session_manager,
         )
     )
 
@@ -2302,6 +2312,7 @@ async def _run(
     )
 
     tui_channel = TuiChannel(TuiChannelConfig(enabled=True), _DummyBus())
+    tui_channel.set_voice_mirror_registry(voice_mirror_registry)
     tui_norm_and_forward = _make_norm_and_forward(
         CLI_FORWARD_REQ_METHODS,
         CLI_FORWARD_NO_LOCAL_HANDLER_METHODS,

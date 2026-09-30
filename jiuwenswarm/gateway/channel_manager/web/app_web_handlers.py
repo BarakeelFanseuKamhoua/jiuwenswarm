@@ -1549,6 +1549,8 @@ class WebHandlersBindParams:
     cron_controller: Any = None
     heartbeat_controller: Any = None
     updater_service: UpdaterService | None = None
+    voice_mirror_registry: Any = None
+    voice_session_manager: Any = None
 
 
 _CONTAINER_FILE_API_METHODS = (
@@ -1930,6 +1932,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     cron_controller = bind.cron_controller
     heartbeat_controller = bind.heartbeat_controller
     updater_service = bind.updater_service
+    voice_mirror_registry = bind.voice_mirror_registry
+    voice_session_manager = bind.voice_session_manager
 
     from jiuwenswarm.common.schema.message import Message, EventType
 
@@ -5118,6 +5122,136 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     # 注意：commands.list 是本地 handler，刻意不加入 _FORWARD_REQ_METHODS（否则会被
     # 转发到 AgentServer 与本地 handler 冲突）。静态元数据本地返回最快、依赖最少。
     channel.register_method("commands.list", _commands_list)
+
+    async def _voice_mirror_bind(ws, req_id, params, session_id, user_id=None):
+        if voice_mirror_registry is None:
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error="voice mirror is unavailable",
+                code="NOT_AVAILABLE",
+            )
+            return
+        try:
+            binding = await voice_mirror_registry.bind(
+                ws,
+                voice_session_id=params.get("voice_session_id"),
+                web_session_id=params.get("session_id") or session_id,
+                user_id=user_id,
+            )
+        except ValueError as exc:
+            await channel.send_response(
+                ws, req_id, ok=False, error=str(exc), code="BAD_REQUEST",
+            )
+            return
+        await channel.send_response(
+            ws,
+            req_id,
+            ok=True,
+            payload={
+                "bound": True,
+                "read_only": True,
+                "voice_session_id": binding.voice_session_id,
+                "web_session_id": binding.web_session_id,
+            },
+        )
+
+    async def _voice_mirror_unbind(ws, req_id, params, session_id):
+        if voice_mirror_registry is not None:
+            await voice_mirror_registry.unbind(ws)
+        await channel.send_response(
+            ws,
+            req_id,
+            ok=True,
+            payload={"bound": False, "read_only": True},
+        )
+
+    async def _voice_session_start(ws, req_id, params, session_id):
+        if voice_session_manager is None:
+            await channel.send_response(
+                ws, req_id, ok=False, error="voice service is unavailable",
+                code="NOT_AVAILABLE",
+            )
+            return
+        try:
+            await voice_session_manager.start(ws, session_id, params)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[voice.session.start] failed")
+            await channel.send_response(
+                ws, req_id, ok=False, error=str(exc), code="VOICE_START_FAILED",
+            )
+            return
+        await channel.send_response(
+            ws, req_id, ok=True,
+            payload={"started": True, "session_id": session_id},
+        )
+
+    async def _voice_session_audio(ws, req_id, params, session_id):
+        if voice_session_manager is None:
+            await channel.send_response(
+                ws, req_id, ok=False, error="voice service is unavailable",
+                code="NOT_AVAILABLE",
+            )
+            return
+        try:
+            await voice_session_manager.append_audio(
+                ws, session_id, str(params.get("audio") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            await channel.send_response(
+                ws, req_id, ok=False, error=str(exc), code="VOICE_AUDIO_FAILED",
+            )
+            return
+        await channel.send_response(ws, req_id, ok=True, payload={"accepted": True})
+
+    async def _voice_session_leader_reply(ws, req_id, params, session_id):
+        if voice_session_manager is None:
+            await channel.send_response(
+                ws, req_id, ok=False, error="voice service is unavailable",
+                code="NOT_AVAILABLE",
+            )
+            return
+        await voice_session_manager.leader_reply(
+            ws, session_id, str(params.get("text") or ""),
+        )
+        await channel.send_response(ws, req_id, ok=True, payload={"accepted": True})
+
+    async def _voice_session_team_info(ws, req_id, params, session_id):
+        if voice_session_manager is None:
+            await channel.send_response(
+                ws, req_id, ok=False, error="voice service is unavailable",
+                code="NOT_AVAILABLE",
+            )
+            return
+        try:
+            changed = await voice_session_manager.update_team_info(
+                ws, session_id, params.get("team_info"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            await channel.send_response(
+                ws, req_id, ok=False, error=str(exc), code="VOICE_TEAM_INFO_FAILED",
+            )
+            return
+        await channel.send_response(
+            ws, req_id, ok=True, payload={"accepted": True, "changed": changed},
+        )
+
+    async def _voice_session_stop(ws, req_id, params, session_id):
+        if voice_session_manager is not None:
+            await voice_session_manager.stop(ws, session_id)
+        await channel.send_response(
+            ws, req_id, ok=True,
+            payload={"started": False, "session_id": session_id},
+        )
+
+    channel.register_method("voice.mirror.bind", _voice_mirror_bind)
+    channel.register_method("voice.mirror.unbind", _voice_mirror_unbind)
+    channel.register_method("voice.session.start", _voice_session_start)
+    channel.register_method("voice.session.audio", _voice_session_audio)
+    channel.register_method("voice.session.leader_reply", _voice_session_leader_reply)
+    channel.register_method("voice.session.team_info", _voice_session_team_info)
+    channel.register_method("voice.session.stop", _voice_session_stop)
 
     channel.register_method("chat.send", _chat_send)
     channel.register_method("media.persist", _media_persist)

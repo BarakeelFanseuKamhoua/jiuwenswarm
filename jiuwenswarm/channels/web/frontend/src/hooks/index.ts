@@ -4,6 +4,12 @@
 
 export { useWebSocket, mergePersistedGoalCompletionMessages, stampGoalObjectiveMessages } from './useWebSocket';
 export { useSpeechRecognition, useSpeechSynthesis } from './useSpeech';
+export {
+  useRealtimeVoice,
+  type VoiceCommand,
+  type VoiceCommandBatch,
+  type VoiceCommandName,
+} from './useRealtimeVoice';
 export { useDesktopLocalFilePickerReady } from './useDesktopLocalFilePickerReady';
 export {
   useMediaQuery,

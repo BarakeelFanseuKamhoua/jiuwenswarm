@@ -45,6 +45,7 @@ from jiuwenswarm.server.runtime.session.session_history import (
     collapse_file_content_blocks,
 )
 from jiuwenswarm.server.runtime.agent_adapter.user_turn import TEAM_USER_TURN_KEY, UserTurn
+from jiuwenswarm.server.runtime.agent_adapter.voice_request import is_voice_request_params
 from jiuwenswarm.server.runtime.agent_adapter.statusline_setup_agent import (
     STATUSLINE_SETUP_SYSTEM_PROMPT,
     build_statusline_setup_dispatch,
@@ -234,6 +235,30 @@ def _permission_card_ids_from_answers(answers: list[dict]) -> list[str]:
     return [card_id]
 
 
+def _voice_pause_leader_note(text: str) -> str:
+    """Frame a spoken pause instruction for the leader's next round."""
+    return f"【语音指令】{text}（系统已据此暂停团队，该指令已执行完毕，无需再处理。）"
+
+
+# Spoken reply to a voice pause the gateway executed on the leader's behalf:
+# the paused leader cannot answer, so this closes the user's turn instead.
+_VOICE_PAUSE_REPLY = "已暂停团队的所有任务，等待你的下一步指令。"
+
+
+def _voice_members_pause_leader_note(text: str) -> str:
+    """Frame a spoken members-only pause for the leader's current round.
+
+    Unlike ``_voice_pause_leader_note`` the leader stays live here: the note
+    asks it to confirm the pause to the user in this very turn instead of
+    queueing the instruction for a round that may never come.
+    """
+    return (
+        f"【语音指令】{text}"
+        "（系统已暂停全部成员任务并保留现场，该指令已执行完毕。"
+        "请直接简要告知用户任务已暂停，不要分配或推进任何任务，等待用户下一条指令。）"
+    )
+
+
 def _history_user_content(params: Any, query: Any) -> Any:
     """返回写入历史记录的用户消息内容.
 
@@ -243,21 +268,33 @@ def _history_user_content(params: Any, query: Any) -> Any:
     进入 plan 的那一轮同理：``query`` 前面被拼了一段 <system-reminder>，历史里
     要还原成用户原文，否则重新加载会话会把提示词当成用户提问显示出来。
 
+    语音指令同理：``query`` 是 ``render_voice_batch`` 生成的调度模板
+    （``[语音请求 ...]`` + ``意图N 动作：`` 块 + 调度脚注），是给 Leader 看的
+    机器指令，绝不能作为用户气泡落盘——这里优先用前端透传的 ``voice_display_text``
+    （用户转写原文）还原，否则刷新后会显示成结构化调度模板。
+
     Gateway 可能已把 ``@path`` 展开成 ``<file-content>`` 正文；历史只保留 ``@path``，
     避免 transcript 膨胀，也不影响当轮已发给模型的内联内容。
     """
     content: Any
     if not isinstance(params, dict):
         content = query
-    elif params.get("is_supplement"):
-        supplement_input = params.get("supplement_input")
-        if isinstance(supplement_input, str) and supplement_input.strip():
-            content = supplement_input
-        else:
-            content = query
     else:
-        original_query = params.get(PLAN_REMINDER_ORIGINAL_QUERY_KEY)
-        content = original_query if isinstance(original_query, str) else query
+        # voice_display_text（用户转写原话）优先级最高：它跨 supplement / plan /
+        # 普通 chat.send 三条路径都是同一个"用户实际说了什么"的真相，而 query 在
+        # 这三条路径里分别被包装成提示词模板 / 加 system-reminder / 调度模板。
+        voice_display = params.get("voice_display_text")
+        if isinstance(voice_display, str) and voice_display.strip():
+            content = voice_display
+        elif params.get("is_supplement"):
+            supplement_input = params.get("supplement_input")
+            if isinstance(supplement_input, str) and supplement_input.strip():
+                content = supplement_input
+            else:
+                content = query
+        else:
+            original_query = params.get(PLAN_REMINDER_ORIGINAL_QUERY_KEY)
+            content = original_query if isinstance(original_query, str) else query
 
     if isinstance(content, str):
         return collapse_file_content_blocks(content)
@@ -2663,16 +2700,31 @@ class JiuWenSwarm:
         Returns:
             AgentResponse 包含 interrupt_result 事件数据
         """
+        _interrupt_t0 = time.perf_counter()
         intent = request.params.get("intent", "cancel")
         session_id = self._session_manager.get_session_id(request.session_id)
         is_team_mode = is_team_params(request.params if isinstance(request.params, dict) else None)
+        logger.info(
+            "[DispatchTrace] agent_interrupt_begin request_id=%s intent=%s session_id=%s "
+            "channel_id=%s is_team=%s wait_for_completion=%s operation_id=%s",
+            request.request_id, intent, session_id, request.channel_id, is_team_mode,
+            (request.params or {}).get("wait_for_completion") if isinstance(request.params, dict) else None,
+            (request.params or {}).get("operation_id") if isinstance(request.params, dict) else None,
+        )
 
         if is_team_mode:
-            return await self._process_team_interrupt(
+            response = await self._process_team_interrupt(
                 request=request,
                 intent=intent,
                 session_id=session_id,
             )
+            logger.info(
+                "[DispatchTrace] agent_interrupt_end request_id=%s intent=%s ok=%s "
+                "elapsed_sec=%.3f payload=%s",
+                request.request_id, intent, response.ok, time.perf_counter() - _interrupt_t0,
+                response.payload if isinstance(response.payload, dict) else type(response.payload).__name__,
+            )
+            return response
 
         adapter = self._ensure_adapter(mode=self._adapter_mode_for_request(request))
 
@@ -2713,17 +2765,24 @@ class JiuWenSwarm:
         intent: str,
         success: bool,
         message: str,
+        team_members: list[dict[str, str]] | None = None,
+        voice_reply: str | None = None,
     ) -> AgentResponse:
+        payload: dict[str, Any] = {
+            "event_type": "chat.interrupt_result",
+            "intent": intent,
+            "success": success,
+            "message": message,
+        }
+        if team_members is not None:
+            payload["team_members"] = team_members
+        if voice_reply:
+            payload["voice_reply"] = voice_reply
         return AgentResponse(
             request_id=request.request_id,
             channel_id=request.channel_id,
             ok=True,
-            payload={
-                "event_type": "chat.interrupt_result",
-                "intent": intent,
-                "success": success,
-                "message": message,
-            },
+            payload=payload,
             metadata=request.metadata,
         )
 
@@ -2748,6 +2807,12 @@ class JiuWenSwarm:
 
         team_manager = get_team_manager(request.channel_id)
         reason = f"interrupt(intent={intent}): "
+        params = request.params if isinstance(request.params, dict) else {}
+        logger.info(
+            "[VoiceDispatch] team interrupt session=%s request=%s intent=%s voice_display=%s",
+            session_id, request.request_id, intent,
+            str(params.get("voice_display_text") or "")[:120],
+        )
 
         if intent == "resume":
             return self._build_interrupt_result_response(
@@ -2758,13 +2823,85 @@ class JiuWenSwarm:
             )
 
         if intent in {"pause", "cancel"}:
+            team_members: list[dict[str, str]] | None = None
+            voice_reply: str | None = None
             if intent == "pause":
-                paused = await team_manager.pause_session_runtime(session_id, reason=reason)
+                _pause_t0 = time.perf_counter()
+                logger.info(
+                    "[DispatchTrace] team_pause_begin request_id=%s session_id=%s "
+                    "wait_for_completion=%s",
+                    request.request_id, session_id,
+                    params.get("wait_for_completion"),
+                )
+                paused = await team_manager.pause_session_runtime(
+                    session_id,
+                    reason=reason,
+                    voice=is_voice_request_params(params),
+                )
+                logger.info(
+                    "[DispatchTrace] team_pause_manager_return request_id=%s session_id=%s "
+                    "paused=%s elapsed_sec=%.3f",
+                    request.request_id, session_id, paused, time.perf_counter() - _pause_t0,
+                )
                 await self._session_manager.cancel_session_task(
                     session_id,
                     reason,
                     wait_timeout=5.0,
                 )
+                logger.info(
+                    "[DispatchTrace] team_pause_session_cancel_done request_id=%s session_id=%s "
+                    "elapsed_sec=%.3f",
+                    request.request_id, session_id, time.perf_counter() - _pause_t0,
+                )
+                voice_text = params.get("voice_display_text")
+                voice_text = voice_text.strip() if isinstance(voice_text, str) else ""
+                is_voice = is_voice_request_params(params)
+                # A voice pause that lands on an already parked team still
+                # succeeds: another voice pause (the barge-in of this or an
+                # earlier utterance) got there first, and the team is exactly
+                # where this request wants it. Reporting failure would make
+                # the frontend skip the resume it owes that paused team.
+                if not paused and is_voice:
+                    paused = await team_manager.is_runtime_paused(session_id)
+                if voice_text:
+                    append_history_record(
+                        session_id=session_id,
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        role="user",
+                        content=_history_user_content(params, voice_text),
+                        timestamp=time.time(),
+                        channel_metadata=request.metadata,
+                        mode=params.get("mode", "unknown"),
+                    )
+                if paused and is_voice and voice_text:
+                    # The gateway executed this pause, not the leader. Hand the
+                    # instruction to the leader's next round so it knows why the
+                    # team stopped and the trajectory records it.
+                    noted = await team_manager.add_leader_note(
+                        session_id, _voice_pause_leader_note(voice_text),
+                    )
+                    logger.info(
+                        "[VoiceDispatch] pause leader note session=%s request=%s queued=%s",
+                        session_id, request.request_id, noted,
+                    )
+                    # Teammates are marked paused in the DB without a status
+                    # event; return the settled roster so the UI stops showing
+                    # them as running.
+                    team_members = await team_manager.read_member_statuses(session_id)
+                    # The leader is parked and cannot answer this turn; confirm
+                    # the pause in its place so the user is not left waiting.
+                    voice_reply = _VOICE_PAUSE_REPLY
+                    append_history_record(
+                        session_id=session_id,
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        role="assistant",
+                        event_type="chat.final",
+                        content=voice_reply,
+                        timestamp=time.time(),
+                        mode=params.get("mode", "unknown"),
+                    )
                 message = "团队已暂停" if paused else "当前没有可暂停的团队任务"
             else:
                 # 断连兜底（client_disconnect）→ pause_all 保账本（可冷启动续跑）；用户主动终止 → stop_all 落 seal。
@@ -2790,6 +2927,8 @@ class JiuWenSwarm:
                 intent=intent,
                 success=success,
                 message=message,
+                team_members=team_members,
+                voice_reply=voice_reply,
             )
 
         return self._build_interrupt_result_response(
@@ -2798,6 +2937,69 @@ class JiuWenSwarm:
             success=False,
             message=f"团队模式暂不支持中断意图: {intent}",
         )
+
+    async def _apply_voice_team_pause_state(
+        self,
+        request: AgentRequest,
+        *,
+        session_id: str,
+        params: dict[str, Any],
+    ) -> str | None:
+        """Settle voice members-pause state around a team chat.send.
+
+        A spoken "pause the tasks" (``voice_pause_members``) parks the
+        teammates and keeps the leader live, so the leader answers this turn
+        itself instead of merging the pause into the next instruction; the
+        leader note tells it the system already did the pausing.
+
+        Any other team message first restarts teammates an earlier spoken
+        pause held down. That state only ever comes from the voice path, so
+        sessions that never used a spoken pause are untouched.
+
+        Returns:
+            A fallback reply to stream back when no runtime could take the
+            pause (nothing to pause — do not let the utterance start a new
+            team), else ``None`` to continue into the leader's turn.
+        """
+        from jiuwenswarm.agents.harness.team import get_team_manager
+
+        team_manager = get_team_manager(request.channel_id)
+
+        if not params.get("voice_pause_members"):
+            # ``resume_session_members`` is looked up defensively: a manager
+            # without it (test doubles, an older deployment) simply has no
+            # members-only pause to undo, and this must never break the turn.
+            resume_members = getattr(team_manager, "resume_session_members", None)
+            if resume_members is not None:
+                restarted = await resume_members(session_id)
+                if restarted:
+                    logger.info(
+                        "[VoiceDispatch] members resumed before team turn: "
+                        "session=%s request=%s members=%s",
+                        session_id, request.request_id, restarted,
+                    )
+            return None
+
+        voice_text = str(params.get("voice_display_text") or "").strip()
+        _t0 = time.perf_counter()
+        paused_members = await team_manager.pause_session_members(session_id)
+        logger.info(
+            "[DispatchTrace] voice_members_pause request_id=%s session_id=%s "
+            "paused=%s elapsed_sec=%.3f",
+            request.request_id, session_id, paused_members,
+            time.perf_counter() - _t0,
+        )
+        if not paused_members:
+            return _VOICE_PAUSE_REPLY
+        if voice_text:
+            noted = await team_manager.add_leader_note(
+                session_id, _voice_members_pause_leader_note(voice_text),
+            )
+            logger.info(
+                "[VoiceDispatch] members pause leader note session=%s request=%s queued=%s",
+                session_id, request.request_id, noted,
+            )
+        return None
 
     async def _cancel_team_work_for_session(
         self,
@@ -3642,6 +3844,37 @@ class JiuWenSwarm:
                 "[JiuWenSwarm] Team模式 user turn: text=%s",
                 str(user_turn.text)[:100],
             )
+            # 语音"暂停任务"与语音暂停后的下一条消息都要在 runtime 激活前
+            # 落定成员状态（暂停/恢复），之后才进入 leader 的本轮。
+            members_pause_reply = await self._apply_voice_team_pause_state(
+                request, session_id=session_id, params=params,
+            )
+            if members_pause_reply is not None:
+                # 没有可暂停的 runtime：照旧给出确认并收尾，绝不让这条
+                # "暂停"话语作为新目标把团队建起来。
+                append_history_record(
+                    session_id=session_id,
+                    request_id=rid,
+                    channel_id=cid,
+                    role="assistant",
+                    event_type="chat.final",
+                    content=members_pause_reply,
+                    timestamp=time.time(),
+                    mode=params.get("mode", "unknown"),
+                )
+                yield AgentResponseChunk(
+                    request_id=rid,
+                    channel_id=cid,
+                    payload={"event_type": "chat.final", "content": members_pause_reply},
+                    is_complete=False,
+                )
+                yield AgentResponseChunk(
+                    request_id=rid,
+                    channel_id=cid,
+                    payload=None,
+                    is_complete=True,
+                )
+                return
 
         # cloud memory: before chat hook
         if memory_mode == "cloud":

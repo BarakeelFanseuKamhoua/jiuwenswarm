@@ -128,6 +128,8 @@ export interface Message {
   isStreaming?: boolean;
   /** 未收到工具/final 分段边界的集群输出；暂停只关闭光标，不移除此关联。 */
   teamStream?: { requestId?: string };
+  /** 消息停止生成的原因；未设置表示正常完成或仍由 isStreaming 决定。 */
+  finishReason?: 'completed' | 'interrupted';
   usageSummary?: UsageSummary;
   // Harness message flag for special styling
   isHarnessMessage?: boolean;
@@ -173,7 +175,12 @@ export interface Message {
 
 /** Selected queued message sent by the existing non-interrupting send button. */
 export interface ChatSendOptions {
-  queuedTaskId: string;
+  /** 由任务队列按钮发起的 steer 输入；存在时走 queued task 投递。 */
+  queuedTaskId?: string;
+  /** false 表示调用方自行展示用户气泡（如语音转写），不再追加 user 消息。 */
+  addUserMessage?: boolean;
+  voiceDisplayText?: string;
+  voicePauseMembers?: boolean;
 }
 
 export interface MessageForkPoint {
