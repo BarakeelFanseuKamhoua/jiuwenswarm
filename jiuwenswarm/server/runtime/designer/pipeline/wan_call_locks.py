@@ -75,6 +75,24 @@ def apply_keyframe_call_locks(
         return str(prompt or "").strip()[:6000]
 
 
+def _stamp_sent_prompt(cfg: dict[str, Any], approved: str, *, user_origin: bool) -> None:
+    """Keep saved surfaces honest with the text actually sent to the video API."""
+    text = str(approved or "").strip()
+    if not text:
+        return
+    cfg["prompt"] = text
+    generate = dict(cfg.get("generate") or {}) if isinstance(cfg.get("generate"), dict) else {}
+    generate["prompt"] = text
+    if user_origin:
+        generate["prompt_origin"] = "user"
+    cfg["generate"] = generate
+    cfg["last_wan_prompt"] = text[:4000]
+    cfg["last_approved_prompt"] = text[:4000]
+    packet = cfg.get("regenerate_packet")
+    if isinstance(packet, dict):
+        cfg["regenerate_packet"] = {**packet, "prompt": text[:4000]}
+
+
 def apply_wan_call_locks(
     prompt: str,
     *,
@@ -86,27 +104,49 @@ def apply_wan_call_locks(
 
     Style, wardrobe, and storyboard locks stay on the node. The video model
     receives who each image is, where they are, what they do, and what they say.
+
+    When generate.prompt_origin == user with a non-empty user prompt, that text
+    seeds action/camera instead of stale shot_action/camera beats.
     """
+    # Stamp/notes must mutate the caller's cfg. ensure_prior_clip_story_on_cfg
+    # returns a shallow copy — use that copy only as the director working view.
     cfg_map = cfg if isinstance(cfg, dict) else {}
+    director_cfg = cfg_map
     if isinstance(graph, dict):
         try:
             from jiuwenswarm.server.runtime.designer.pipeline.clip_story_state import (
                 ensure_prior_clip_story_on_cfg,
             )
 
-            cfg_map = ensure_prior_clip_story_on_cfg(cfg_map, graph)
+            director_cfg = ensure_prior_clip_story_on_cfg(cfg_map, graph)
         except Exception:  # noqa: BLE001
-            pass
+            director_cfg = cfg_map
     from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+        _pull_labeled,
         director_approve_video_prompt,
+        narrative_seed_from_user_prompt,
+        resolve_user_origin_prompt,
     )
 
-    approved, _notes = director_approve_video_prompt(
-        prompt,
-        cfg=cfg_map,
+    user_text = resolve_user_origin_prompt(cfg_map, prompt)
+    if user_text:
+        candidate = user_text
+        action = narrative_seed_from_user_prompt(user_text) or user_text
+        camera = _pull_labeled(user_text, ("camera move", "camera for shot", "camera"))
+    else:
+        candidate = prompt
+        action = str(director_cfg.get("shot_action") or "")
+        camera = str(director_cfg.get("camera") or "")
+
+    approved, notes = director_approve_video_prompt(
+        candidate,
+        cfg=director_cfg,
         graph=graph if isinstance(graph, dict) else {},
         shot_index=shot_index,
-        action=str(cfg_map.get("shot_action") or ""),
-        camera=str(cfg_map.get("camera") or ""),
+        action=action,
+        camera=camera,
     )
+    cfg_map["director_video_prompt_notes"] = list(notes)
+    cfg_map["director_video_prompt_approved"] = True
+    _stamp_sent_prompt(cfg_map, approved, user_origin=bool(user_text))
     return approved
