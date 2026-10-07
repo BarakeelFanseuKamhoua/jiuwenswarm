@@ -101,3 +101,36 @@ def test_user_origin_empty_falls_back_to_beat_path() -> None:
     # No user surface → storyboard path may rewrite toward beat.
     assert "kept_user_prompt" not in notes
     assert approved
+
+
+def test_packet_film_shot_beats_stale_generate_practice() -> None:
+    """Stale generate.prompt (prior Image-N) must not override Film-shot packet edit."""
+    stale_practice = _practice_prompt(f"holds a {_STALE_PROP}")
+    film_shot = (
+        f"Film shot 1 only. Camera Wide tracking from outside the {_USER_PROP}. "
+        f"Action: {_USER_ACTION}. "
+        "CLOTHING LOCK: Sam: grey coat. STRATEGY=compose_from_solo_refs. "
+        "SCENE SPECS: scene=workshop; views=['front', 'left'"
+    )
+    cfg = _cfg(origin="user", user_prompt=stale_practice)
+    cfg["generate"] = {"prompt": stale_practice, "prompt_origin": "user"}
+    cfg["prompt"] = film_shot
+    cfg["regenerate_packet"] = {"prompt": film_shot}
+    cfg["user_edit_prompt"] = film_shot
+    approved = apply_wan_call_locks("agent white narration", cfg=cfg, graph={}, shot_index=1)
+    assert _USER_PROP in approved
+    assert _STALE_PROP not in approved
+    # Durable user intent survives the stamp; last_wan is the sent body.
+    assert _USER_PROP in str(cfg.get("user_edit_prompt") or "")
+    assert _USER_PROP in str((cfg.get("regenerate_packet") or {}).get("prompt") or "")
+    assert _USER_PROP in str(cfg.get("last_wan_prompt") or "")
+
+
+def test_stamp_does_not_poison_packet_with_api_body() -> None:
+    user_prompt = _practice_prompt(f"raises a {_USER_PROP}")
+    cfg = _cfg(origin="user", user_prompt=user_prompt)
+    cfg["user_edit_prompt"] = user_prompt
+    apply_wan_call_locks("ignored", cfg=cfg, graph={}, shot_index=1)
+    assert (cfg.get("generate") or {}).get("prompt_origin") == "user"
+    assert str((cfg.get("regenerate_packet") or {}).get("prompt") or "") == user_prompt
+    assert str(cfg.get("user_edit_prompt") or "") == user_prompt

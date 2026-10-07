@@ -1015,24 +1015,46 @@ def _prompt_origin(cfg: dict[str, Any] | None) -> str:
 
 
 def resolve_user_origin_prompt(cfg: dict[str, Any] | None, fallback: str = "") -> str:
-    """Resolve toolbar/user prompt authority when generate.prompt_origin == user."""
+    """Resolve toolbar/user prompt authority for media calls.
+
+    Beat authority for user edits is the durable user surface — never the last
+    stamped API body (``last_wan_prompt`` / ``last_approved_prompt``). Prefer
+    ``user_edit_prompt`` and regenerate_packet (what the toolbar wrote) over
+    ``generate.prompt``, which is often a prior practice rewrite and would
+    silently drop Film-shot facts (e.g. \"blue car\").
+
+    A non-empty ``user_edit_prompt`` wins even if ``prompt_origin`` lagged behind
+    the toolbar write (image + video regenerate).
+    """
     cfg = cfg if isinstance(cfg, dict) else {}
+    edit = str(cfg.get("user_edit_prompt") or "").strip()
+    if edit:
+        return edit
     if _prompt_origin(cfg) != "user":
         return ""
     generate = cfg.get("generate") if isinstance(cfg.get("generate"), dict) else {}
     packet = cfg.get("regenerate_packet") if isinstance(cfg.get("regenerate_packet"), dict) else {}
     for candidate in (
-        generate.get("prompt"),
         packet.get("prompt"),
-        cfg.get("last_wan_prompt"),
-        cfg.get("last_approved_prompt"),
         cfg.get("prompt"),
+        generate.get("prompt"),
         fallback,
     ):
         text = str(candidate or "").strip()
         if text:
             return text
     return ""
+
+
+def resolve_still_call_prompt(cfg: dict[str, Any] | None, fallback: str = "") -> str:
+    """Still/image call authority: durable user text, else the LLM-supplied prompt.
+
+    No hard-coded practice rewrite. Never prefer ``last_wan`` / ``last_approved``.
+    """
+    user = resolve_user_origin_prompt(cfg, "")
+    if user:
+        return user
+    return str(fallback or "").strip()
 
 
 _LOCK_BANNER_LINE = re.compile(
@@ -1046,8 +1068,11 @@ def narrative_seed_from_user_prompt(prompt: str) -> str:
     text = str(prompt or "").strip()
     if not text:
         return ""
+    # Keep enough Film-shot narrative for prop/color edits (e.g. blue car) to
+    # survive rewrite into Image-N practice form.
+    _SEED_CAP = 1200
     if not _BAD_DIRECTIVE.search(text) and not _LOCK_BANNER_LINE.search(text):
-        return text[:500]
+        return text[:_SEED_CAP]
     chunks: list[str] = []
     for part in re.split(r"(?<=[.!?])\s+|\n+", text):
         line = part.strip().lstrip("-").strip()
@@ -1055,8 +1080,18 @@ def narrative_seed_from_user_prompt(prompt: str) -> str:
             continue
         if _BAD_DIRECTIVE.search(line) or _LOCK_BANNER_LINE.search(line):
             continue
-        chunks.append(line.rstrip("."))
-    return ". ".join(chunks).strip()[:500]
+        # Inline lock essays (same paragraph as Action:) — cut from the banner on.
+        cut = re.split(
+            r"(?i)\b(?:style\s*lock|costume\s*lock|clothing\s*lock|wardrobe\s*lock|"
+            r"positioning\s*lock|scene\s*specs|forbid|forbidden|already-?done|"
+            r"identity\s*sheets|strategy\s*=)\b",
+            line,
+            maxsplit=1,
+        )[0].strip(" ,;.—-")
+        if not cut or _BAD_DIRECTIVE.search(cut):
+            continue
+        chunks.append(cut.rstrip("."))
+    return ". ".join(chunks).strip()[:_SEED_CAP]
 
 
 def _compose_cfg_for_user_origin(cfg: dict[str, Any], *, camera: str) -> dict[str, Any]:
