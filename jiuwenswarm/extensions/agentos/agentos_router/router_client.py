@@ -25,6 +25,7 @@ from jiuwenswarm.extensions.agentos.agentos_router.agent_manager import (
 )
 from jiuwenswarm.extensions.agentos.agentos_router.agentos_authenticator import AgentOSAuthenticator
 from jiuwenswarm.extensions.agentos.auth.common import (
+    apply_auth_result_to_ws,
     extract_headers,
     extract_token,
     get_remote_addr,
@@ -217,14 +218,17 @@ class AgentOSRouterClient(AgentServerClient):
 
     async def on_connect(self, ws: Any) -> AuthResult | None:
         if self._auth_client is None:
-            # auth 未启用时回落使用握手头里的 X-User-Id，
-            # 否则 user_id 为空会跳过连接计数/延迟清理，导致 agent 泄漏不回收。
+            # auth 未启用：回落使用握手头里的 X-User-Id，并经
+            # apply_auth_result_to_ws 显式落盘，保证连接计数/延迟清理
+            # 与 chat 路由读取到同一身份。
             headers = {k.lower(): v for k, v in extract_headers(ws).items()}
             fallback_user_id = str(headers.get("x-user-id", "") or "").strip()
-            return AuthResult(
+            result = AuthResult(
                 success=True,
                 user_id=fallback_user_id,
             )
+            apply_auth_result_to_ws(ws, result)
+            return result
         token = extract_token(ws)
         headers = extract_headers(ws)
         context = AuthContext(
@@ -234,7 +238,11 @@ class AgentOSRouterClient(AgentServerClient):
             remote_addr=get_remote_addr(ws),
         )
         result = await self._auth_client.authenticate(context)
-        if not result.success:
+        if result.success:
+            # 用 IAM 鉴权身份覆写 ws 上的自报 X-User-Id，
+            # 连接事件上报与 chat 路由统一使用权威身份。
+            apply_auth_result_to_ws(ws, result)
+        else:
             close = getattr(ws, "close", None)
             if callable(close):
                 ret = close(code=1008, reason="unauthorized")

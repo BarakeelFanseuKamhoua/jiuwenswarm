@@ -29,6 +29,7 @@ from jiuwenswarm.extensions.agentos.agentos_router.router_client import (
     _is_ws_connect_retryable,
 )
 from jiuwenswarm.extensions.agentos.agentos_router import router_client
+from jiuwenswarm.extensions.agentos.auth.credential_authenticator import AuthResult
 from jiuwenswarm.extensions.yuanrong_frontend_client import SandboxInfo
 
 
@@ -1150,3 +1151,61 @@ async def test_agentos_extension_is_selected_independently(
     assert registry.third_agent is registered[0]
     assert registry.third_agent.get_third_agent() is registered[0].get_third_agent()
     await registered[0].shutdown()
+
+
+@pytest.mark.asyncio
+async def test_on_connect_applies_fallback_identity_to_ws() -> None:
+    client = _router_client(FakeYuanRongClient())
+
+    ws_no_header = SimpleNamespace(request_headers={})
+    result = await client.on_connect(ws_no_header)
+    assert result is not None and result.success
+    assert ws_no_header._gateway_user_id == ""
+
+    ws_with_header = SimpleNamespace(request_headers={"X-User-Id": "u1"})
+    result = await client.on_connect(ws_with_header)
+    assert result is not None and result.success
+    assert ws_with_header._gateway_user_id == "u1"
+
+
+@pytest.mark.asyncio
+async def test_on_connect_applies_iam_identity_over_self_reported_header() -> None:
+    class _StubAuthenticator:
+        async def authenticate(self, context: Any) -> AuthResult:
+            return AuthResult(success=True, user_id="iam-user", extensions={"role": "dev"})
+
+    client = _router_client(FakeYuanRongClient(), auth_client=_StubAuthenticator())
+    ws = SimpleNamespace(
+        path="/ws/tui?token=t",
+        request_headers={"X-User-Id": "spoofed", "Authorization": "Bearer t"},
+        remote_address=("1.2.3.4", 12345),
+    )
+    result = await client.on_connect(ws)
+    assert result is not None and result.success
+    assert ws._gateway_user_id == "iam-user"
+    assert ws._web_connection_user_id == "iam-user"
+    assert ws.auth_role == "dev"
+
+
+@pytest.mark.asyncio
+async def test_on_connect_auth_failure_closes_without_identity() -> None:
+    class _StubAuthenticator:
+        async def authenticate(self, context: Any) -> AuthResult:
+            return AuthResult(success=False, error="bad token")
+
+    client = _router_client(FakeYuanRongClient(), auth_client=_StubAuthenticator())
+    closed: list[int] = []
+
+    async def _close(code: int = 1000, reason: str = "") -> None:
+        closed.append(code)
+
+    ws = SimpleNamespace(
+        path="/ws/tui?token=bad",
+        request_headers={"X-User-Id": "spoofed"},
+        remote_address=("1.2.3.4", 1),
+        close=_close,
+    )
+    result = await client.on_connect(ws)
+    assert result is not None and not result.success
+    assert closed == [1008]
+    assert not hasattr(ws, "_gateway_user_id")  # 失败不落盘身份

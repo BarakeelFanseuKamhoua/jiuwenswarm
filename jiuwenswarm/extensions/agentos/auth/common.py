@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import time
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -12,9 +11,6 @@ from urllib.parse import parse_qs, urlparse
 from jiuwenswarm.extensions.agentos.auth.credential_authenticator import AuthResult
 
 _UNAUTHORIZED_BODY = b"Unauthorized\n"
-_HANDSHAKE_AUTH_TTL_S = 60.0
-# path|token -> (monotonic_ts, AuthResult)；供 process_request → connection_handler 传递身份
-_handshake_auth_cache: dict[str, tuple[float, AuthResult]] = {}
 
 
 def headers_to_dict(headers: Any) -> dict[str, str]:
@@ -85,27 +81,8 @@ def get_remote_addr(ws: Any) -> str:
     return ""
 
 
-def _handshake_cache_key(path: str, headers: Any) -> str:
-    token = extract_token_from_path_and_headers(path, headers) or ""
-    return f"{path}|{token}"
-
-
-def take_handshake_auth(path: str, headers: Any) -> AuthResult | None:
-    key = _handshake_cache_key(path, headers)
-    item = _handshake_auth_cache.pop(key, None)
-    if item is None:
-        return None
-    ts, result = item
-    if time.monotonic() - ts > _HANDSHAKE_AUTH_TTL_S:
-        return None
-    return result
-
-
 def apply_auth_result_to_ws(ws: Any, result: AuthResult) -> None:
-    """将鉴权身份挂到 ws，供后续路由等逻辑读取。
-
-    当前仅落盘返回值约定字段；完整身份贯通（注册中心 / 实例创建）后续再接。
-    """
+    """将鉴权身份挂到 ws，供连接事件上报与 chat 路由读取。"""
     ws.user_id = result.user_id
     setattr(ws, "_gateway_user_id", result.user_id)
     setattr(ws, "_web_connection_user_id", result.user_id or None)
