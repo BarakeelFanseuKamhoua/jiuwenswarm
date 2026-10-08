@@ -68,6 +68,9 @@ class ChannelManager(ABC):
         self._dispatch_diag_count: int = 0
         # Channel 连接事件订阅回调列表
         self._channel_event_callbacks: list[Callable[[ChannelEvent], Awaitable[None]]] = []
+        # 分发 task 强引用集合：事件循环仅持 task 弱引用，不持强引用可能被
+        # GC 中途回收导致事件丢失（对齐 router_client._background_tasks 做法）。
+        self._channel_event_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _resolve_app_id(channel: Any) -> str:
@@ -177,7 +180,26 @@ class ChannelManager(ABC):
             user_id=user_id,
         )
         for cb in self._channel_event_callbacks:
-            asyncio.create_task(cb(event))
+            task = asyncio.create_task(self._notify_channel_event(cb, event))
+            self._channel_event_tasks.add(task)
+            task.add_done_callback(self._channel_event_tasks.discard)
+
+    async def _notify_channel_event(
+        self,
+        cb: Callable[[ChannelEvent], Awaitable[None]],
+        event: ChannelEvent,
+    ) -> None:
+        """分发单个事件给订阅回调；异常兜底记日志，不静默丢失。"""
+        try:
+            await cb(event)
+        except Exception:
+            logger.exception(
+                "[ChannelManager] channel event callback error: "
+                "event_type=%s channel_type=%s user_id=%s",
+                event.event_type,
+                event.channel_type,
+                event.user_id,
+            )
 
     def _try_set_event_reporter(self, channel: Any) -> None:
         """若 channel 支持 set_channel_event_reporter，则注入上报回调。"""
