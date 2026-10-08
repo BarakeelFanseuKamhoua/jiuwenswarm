@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Large parameterized M08/M15 pipeline scenarios.
+"""Large parameterized edit-prompt-authority + shot-reference-scrub scenarios.
 
 Exercises real pipeline functions with synthetic generic props/cameras/shot
 indices — not product-specific café / cup prompts as the only cases.
@@ -244,7 +244,7 @@ def _assert_edit_scenario(index: int) -> None:
 
 
 @pytest.mark.parametrize("index", range(_EDIT_N))
-def test_m08_m15_edit_scenario(index: int) -> None:
+def test_user_edit_prompt_authority(index: int) -> None:
     _assert_edit_scenario(index)
 
 
@@ -353,5 +353,5 @@ def _assert_pipeline_scenario(index: int) -> None:
 
 
 @pytest.mark.parametrize("index", range(_PIPELINE_N))
-def test_m08_m15_whole_pipeline_scenario(index: int) -> None:
+def test_edit_prompt_authority_and_shot_scrub_pipeline(index: int) -> None:
     _assert_pipeline_scenario(index)

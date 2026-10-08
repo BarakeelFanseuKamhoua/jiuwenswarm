@@ -1,7 +1,7 @@
-# Designer: toolbar user prompt lost at regenerate (Film-shot → Image-N gate)
+﻿# Designer: toolbar user prompt lost at regenerate (Film-shot → Image-N gate)
 
 **Branch:** `0.2.8.beta1-A-P0-Fixes`  
-**Related:** M08 (`prompt_origin=user`), OTLP `graph_de2fd58779266f1b.otlp.jsonl` (family-car / blue-car regen)  
+**Related:** user-edit-prompt authority (`prompt_origin=user`), OTLP `graph_de2fd58779266f1b.otlp.jsonl` (family-car / blue-car regen)  
 **Status:** Fixed in code (this document describes problem + fix + trajectory delta)
 
 ---
@@ -172,8 +172,8 @@ pytest tests/unit_tests/designer/test_user_prompt_edit_scenarios.py::test_user_p
 pytest tests/unit_tests/designer/test_user_prompt_still_scenarios.py --no-cov
 # 20_000 resolve + 40_000 still pipeline + unit cases
 
-pytest tests/unit_tests/designer/test_m08_m15_pipeline_scenarios.py --no-cov
-# existing M08/M15 20k+40k
+pytest tests/unit_tests/designer/test_edit_prompt_authority_and_shot_scrub.py --no-cov
+# existing edit-prompt authority + shot-reference scrub 20k+40k
 ```
 
 ### Results (this session)
@@ -181,6 +181,6 @@ pytest tests/unit_tests/designer/test_m08_m15_pipeline_scenarios.py --no-cov
 | Suite | Count | Result | Time |
 |-------|------:|--------|------|
 | `test_user_prompt_edit_pipeline_scenario` | 40,000 | **passed** | 73.36s |
-| `test_user_prompt_edit_resolve_scenario` + `test_m08_m15_pipeline_scenarios` + `test_user_origin_wan_locks` | 80,007 | **passed** | 77.95s |
+| `test_user_prompt_edit_resolve_scenario` + `test_edit_prompt_authority_and_shot_scrub` + `test_user_origin_wan_locks` | 80,007 | **passed** | 77.95s |
 | (`test_user_origin_wan_locks` alone earlier) | 7 | **passed** | 0.39s |
 | `test_user_prompt_still_scenarios` (resolve+pipeline+units) | 60,002 | **passed** | ~43s |

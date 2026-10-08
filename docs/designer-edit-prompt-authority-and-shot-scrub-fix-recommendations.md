@@ -1,4 +1,4 @@
-﻿# Designer P0 fix recommendations — M08 (cup prompt) & M15 (shot delete / chat edit)
+﻿# Designer P0 fix recommendations — user-edit-prompt authority (cup prompt) & stale-shot-reference scrub (shot delete / chat edit)
 
 **Branch:** `0.2.8.beta1-A-P0-Fixes` @ `d164ad4`  
 **Repo:** `jiuwenswarm`  
@@ -7,7 +7,7 @@
 
 **Author:** [Expert D — fix recommendations](e76229e8-7112-41ab-8606-485411501dc8)
 
-**Prior findings:** [`designer-M08-M15-expert-findings.md`](./designer-M08-M15-expert-findings.md) (Experts A / B / C)
+**Prior findings:** [`designer-edit-prompt-authority-and-shot-scrub-expert-findings.md`](./designer-edit-prompt-authority-and-shot-scrub-expert-findings.md) (Experts A / B / C)
 
 ---
 
@@ -15,10 +15,10 @@
 
 | Case | User report | Consensus root cause | Confidence |
 |------|-------------|----------------------|------------|
-| **M08** | Shot 2: white cup → blue cup; UI/`config.prompt` show blue; video API stays white | Dual-authority prompt: toolbar writes blue surfaces; regenerate rebuilds API prompt from unchanged `shot_action` / `camera` via director | **0.90** |
-| **M15** | Delete shot 3; chat-edit shot 2 to close-up → `Document n_brief references missing shots: [3, 5]`; edit not saved | (1) Canvas delete leaves stale brief/`镜头 3`. (2) `_SHOT_REFERENCE` FP: `每个镜头 5 秒` → shot `5` | **0.88** |
+| **User-edit-prompt authority** | Shot 2: white cup → blue cup; UI/`config.prompt` show blue; video API stays white | Dual-authority prompt: toolbar writes blue surfaces; regenerate rebuilds API prompt from unchanged `shot_action` / `camera` via director | **0.90** |
+| **Stale-shot-reference scrub** | Delete shot 3; chat-edit shot 2 to close-up → `Document n_brief references missing shots: [3, 5]`; edit not saved | (1) Canvas delete leaves stale brief/`镜头 3`. (2) `_SHOT_REFERENCE` FP: `每个镜头 5 秒` → shot `5` | **0.88** |
 
-**Shared theme:** User-visible surfaces are not the generation/sync source of truth. Beat fields and documents are; the system prefers rewrite (M08) or reject (M15).
+**Shared theme:** User-visible surfaces are not the generation/sync source of truth. Beat fields and documents are; the system prefers rewrite (user-edit-prompt authority) or reject (stale-shot-reference scrub).
 
 ---
 
@@ -26,10 +26,10 @@
 
 ### Goals
 
-1. **M08:** When `prompt_origin=user` (toolbar edit), the **video API body** must reflect that edit (blue cup), not stale white `shot_action` / `camera`.
-2. **M08:** Preserve director locks for storyboard/agent runs (non-user origin).
-3. **M15:** Canvas shot delete must not permanently block later chat content edits via stale brief refs.
-4. **M15:** Duration idioms like `每个镜头 5 秒` must not be treated as shot indices.
+1. **user-edit-prompt authority:** When `prompt_origin=user` (toolbar edit), the **video API body** must reflect that edit (blue cup), not stale white `shot_action` / `camera`.
+2. **user-edit-prompt authority:** Preserve director locks for storyboard/agent runs (non-user origin).
+3. **stale-shot-reference scrub:** Canvas shot delete must not permanently block later chat content edits via stale brief refs.
+4. **stale-shot-reference scrub:** Duration idioms like `每个镜头 5 秒` must not be treated as shot indices.
 5. **Honesty:** After success, UI / saved config / documents must not disagree with what the pipeline accepted.
 6. **Fail-closed where it still matters:** No silent continuity redirects onto unrelated surviving shots; no corrupt partial saves.
 
@@ -44,7 +44,7 @@
 
 ---
 
-## Recommended fix — M08
+## Recommended fix — User-edit-prompt authority
 
 ### Choke points (confirmed)
 
@@ -64,7 +64,7 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 
 **Decisive gate:** `apply_wan_call_locks` → `director_approve_video_prompt` (not `build_clip_prompt` alone).
 
-### Preferred — M08-A: Honor `prompt_origin=user` in director / WAN lock gate
+### Preferred — edit-prompt-A: Honor `prompt_origin=user` in director / WAN lock gate
 
 | `prompt_origin` | Behavior |
 |-----------------|----------|
@@ -88,7 +88,7 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 | `pipeline/video_prompt_practice.py` | User-origin branch in director_approve / prepare / practice checks |
 | `node_agent.py` | Ensure generate/origin reaches locks; stamp sent prompt |
 | `handlers/clip.py` | Same origin-aware path if used for regenerate |
-| `tests/unit_tests/designer/` | M08 unit cases |
+| `tests/unit_tests/designer/` | user-edit-prompt authority unit cases |
 
 **Why preferred:** Smallest blast radius; preserves director for storyboard; matches existing `prompt_origin` semantics in `designer_graph.py`.
 
@@ -96,11 +96,11 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 
 | Option | Idea | Verdict |
 |--------|------|---------|
-| **M08-B** | Sync toolbar prompt into `shot_action`/`camera` on save | Phase 2 companion — brittle extraction |
-| **M08-C** | Always restore `regenerate_packet` prompt | **Not sufficient alone** — still loses to director |
-| **M08-D** | Structured prop/color fields | Phase 3 — too large for P0 |
+| **edit-prompt-B** | Sync toolbar prompt into `shot_action`/`camera` on save | Phase 2 companion — brittle extraction |
+| **edit-prompt-C** | Always restore `regenerate_packet` prompt | **Not sufficient alone** — still loses to director |
+| **edit-prompt-D** | Structured prop/color fields | Phase 3 — too large for P0 |
 
-### M08 acceptance
+### User-edit-prompt authority acceptance
 
 1. Toolbar blue + regenerate → media request contains **blue**, not white.
 2. Storyboard/agent origin still director-rewrites lock essays / image binding.
@@ -108,7 +108,7 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 4. After success, toolbar-resolved prompt and last sent prompt agree on cup color.
 5. Non-user wardrobe/seat/exited-cast locks still enforced.
 
-### M08 risks
+### User-edit-prompt authority risks
 
 | Risk | Mitigation |
 |------|------------|
@@ -116,17 +116,17 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 | Leaf agent narrates white | User-origin director path must win **after** agent text |
 | Over-broad bypass | Gate strictly on `prompt_origin == "user"` + non-empty prompt |
 
-### M08 tests
+### User-edit-prompt authority tests
 
 - Unit: user origin + blue generate.prompt + white shot_action → approved text blue.
 - Unit: storyboard origin + blue generate.prompt + white beat → may rewrite toward white beat (intentional).
 - Unit: user-origin lock essay → practice form, user-seeded action.
 - Regression: existing director rewrite / compose coverage tests.
-- Manual: café M08 corpus.
+- Manual: café user-edit-prompt authority corpus.
 
 ---
 
-## Recommended fix — M15
+## Recommended fix — Stale-shot-reference scrub
 
 ### Choke points (confirmed)
 
@@ -134,9 +134,9 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 
 **B. Regex FP:** `_SHOT_REFERENCE` matches `每个镜头 5 秒` as shot **5**.
 
-### Preferred — M15-A: Regex fix + missing-shot tombstone/scrub (both required)
+### Preferred — shot-scrub-A: Regex fix + missing-shot tombstone/scrub (both required)
 
-#### M15-A1 — Regex false-positive (quick win)
+#### Stale-shot-reference scrub-A1 — Regex false-positive (quick win)
 
 **File:** `chat_shot_references.py`
 
@@ -146,7 +146,7 @@ UI still shows BLUE (packet-first resolveMediaPromptForToolbar)
 
 Prefer filter-after-`finditer` with shared `_is_shot_index_reference`. Use in both `referenced_shot_indices` and `map_shot_references`.
 
-#### M15-A2 — Stale missing-shot refs after prior canvas delete
+#### Stale-shot-reference scrub-A2 — Stale missing-shot refs after prior canvas delete
 
 1. **Tombstone in `document_edit_context`:** for each shot-ref whose index ∉ live indices, map to `[[REMOVED_SHOT:missing:{n}]]` even if not in current-turn `before` graph.
 2. **Deterministic scrub in `prepare_document_update` before validate:** drop/neutralize missing-shot sections and inline refs; then re-check; only then raise.
@@ -154,17 +154,17 @@ Prefer filter-after-`finditer` with shared `_is_shot_index_reference`. Use in bo
 
 **Files:** `chat_shot_references.py`, `chat_document_plan.py`, `chat_document_sync.py` (`prepare_document_update`).
 
-**Do not:** soften validation to warn-only (M15-C) or skip doc sync for clip-only edits (M15-D).
+**Do not:** soften validation to warn-only (shot-scrub-C) or skip doc sync for clip-only edits (shot-scrub-D).
 
 ### Alternatives
 
 | Option | Verdict |
 |--------|---------|
-| **M15-B** Canvas delete-time doc rewrite | Phase 2 after A proves chat path |
-| **M15-C** Warn instead of throw | **Reject** — corrupt docs |
-| **M15-D** Skip sync when topology frozen | **Reject** — leaves docs permanently stale |
+| **shot-scrub-B** Canvas delete-time doc rewrite | Phase 2 after A proves chat path |
+| **shot-scrub-C** Warn instead of throw | **Reject** — corrupt docs |
+| **shot-scrub-D** Skip sync when topology frozen | **Reject** — leaves docs permanently stale |
 
-### M15 acceptance
+### Stale-shot-reference scrub acceptance
 
 1. `referenced_shot_indices("每个镜头 5 秒") == set()`.
 2. Keepers: `### 镜头 3｜…` → `{3}`; `镜头1→镜头2→镜头3` → `{1,2,3}`.
@@ -172,7 +172,7 @@ Prefer filter-after-`finditer` with shared `_is_shot_index_reference`. Use in bo
 4. No silent continuity redirect 3→2 (`redirects_removed_continuity` remains).
 5. N09/N10-style (no delete, duration only) must not fail on `[5]`.
 
-### M15 risks
+### Stale-shot-reference scrub risks
 
 | Risk | Mitigation |
 |------|------------|
@@ -187,25 +187,25 @@ Prefer filter-after-`finditer` with shared `_is_shot_index_reference`. Use in bo
 1. **Declare precedence** (user origin vs storyboard beat vs agent+director vs documents) — implement user-origin + live-index ⊆ prose rows in P0.
 2. **Structured shot/prop fields (Phase 2+):** node id + index; prop color tokens — regex becomes compatibility only.
 3. **Canvas topology vs docs:** update together **or** leave tombstone channel for next `prepare_document_update`.
-4. **UI honesty:** do not “fix” M08 by only changing the toolbar resolver.
+4. **UI honesty:** do not “fix” user-edit-prompt authority by only changing the toolbar resolver.
 
 ---
 
 ## Implementation order
 
 ### Phase 0 — Characterization
-Failing unit tests for M08 + M15 acceptance (red).
+Failing unit tests for user-edit-prompt authority + stale-shot-reference scrub acceptance (red).
 
 ### Phase 1 — P0 land order
 
 | Order | Item | Case | Effort |
 |------:|------|------|--------|
-| 1 | **M15-A1** regex filter | M15 `[5]` | XS |
-| 2 | **M08-A** user-origin director gate | M08 | S–M |
-| 3 | **M15-A2** tombstone + deterministic scrub | M15 `[3]` | S–M |
+| 1 | **shot-scrub-A1** regex filter | stale-shot-reference scrub `[5]` | XS |
+| 2 | **edit-prompt-A** user-origin director gate | user-edit-prompt authority | S–M |
+| 3 | **shot-scrub-A2** tombstone + deterministic scrub | stale-shot-reference scrub `[3]` | S–M |
 
 ### Phase 2
-Optional toolbar→`shot_action` sync (M08-B); delete-time doc scrub (M15-B); richer tombstones; `persistBeforeRun` error surfacing.
+Optional toolbar→`shot_action` sync (edit-prompt-B); delete-time doc scrub (shot-scrub-B); richer tombstones; `persistBeforeRun` error surfacing.
 
 ### Phase 3
 Single `resolve_video_prompt_authority(...)`; structured document shot graph.
@@ -214,27 +214,27 @@ Single `resolve_video_prompt_authority(...)`; structured document shot graph.
 
 ## Verification checklist
 
-### M08
+### User-edit-prompt authority
 | # | Pass criteria |
 |---|---------------|
-| M08-1 | Toolbar blue → `generate.prompt` blue, `prompt_origin=user` |
-| M08-2 | Regenerate → API prompt **blue**, not white |
-| M08-3 | Post-run stamps agree on blue |
-| M08-4 | Reopen: toolbar blue; no split-brain |
-| M08-5 | Storyboard origin still director-rewrites lock essays |
-| M08-6 | Only beat fields blue → API blue |
-| M08-7 | Director notes: `kept_user_prompt` or rewrite without white-beat storyboard force |
+| edit-prompt-1 | Toolbar blue → `generate.prompt` blue, `prompt_origin=user` |
+| edit-prompt-2 | Regenerate → API prompt **blue**, not white |
+| edit-prompt-3 | Post-run stamps agree on blue |
+| edit-prompt-4 | Reopen: toolbar blue; no split-brain |
+| edit-prompt-5 | Storyboard origin still director-rewrites lock essays |
+| edit-prompt-6 | Only beat fields blue → API blue |
+| edit-prompt-7 | Director notes: `kept_user_prompt` or rewrite without white-beat storyboard force |
 
-### M15
+### Stale-shot-reference scrub
 | # | Pass criteria |
 |---|---------------|
-| M15-1 | Canvas delete → clips `{1,2}` only |
-| M15-2 | `每个镜头 5 秒` not a shot ref |
-| M15-3 | Chat close-up on shot 2 saves; no `[3, 5]` |
-| M15-4 | Brief loses missing-3 refs; duration phrase OK |
-| M15-5 | No silent 3→2 continuity redirect |
-| M15-6 | Duration-only brief does not fail on `[5]` |
-| M15-7 | Reopen shows close-up applied |
+| shot-scrub-1 | Canvas delete → clips `{1,2}` only |
+| shot-scrub-2 | `每个镜头 5 秒` not a shot ref |
+| shot-scrub-3 | Chat close-up on shot 2 saves; no `[3, 5]` |
+| shot-scrub-4 | Brief loses missing-3 refs; duration phrase OK |
+| shot-scrub-5 | No silent 3→2 continuity redirect |
+| shot-scrub-6 | Duration-only brief does not fail on `[5]` |
+| shot-scrub-7 | Reopen shows close-up applied |
 
 ### Cross
 | # | Pass criteria |
@@ -269,12 +269,12 @@ Single `resolve_video_prompt_authority(...)`; structured document shot graph.
 | Validate | `chat_document_sync.py` — `prepare_document_update` |
 | Doc plan | `chat_document_plan.py` |
 | Chat order | `leader_chat.py` |
-| Findings | `designer-M08-M15-expert-findings.md` |
+| Findings | `designer-edit-prompt-authority-and-shot-scrub-expert-findings.md` |
 
 ---
 
 ## Bottom line
 
-1. **M08:** Prefer **user-origin authority in the WAN/director gate** (M08-A). Do not disable director for storyboard. Packet restore alone is insufficient.
-2. **M15:** Land **regex FP fix** + **missing-shot tombstone/scrub** (M15-A1+A2). Do not soften validation to warn-only.
-3. **Order:** tests red → regex → M08 user-origin → M15 scrub → acceptance on café / M14–M15 fixtures → Phase 2 structured fields / delete-time doc sync.
+1. **user-edit-prompt authority:** Prefer **user-origin authority in the WAN/director gate** (edit-prompt-A). Do not disable director for storyboard. Packet restore alone is insufficient.
+2. **stale-shot-reference scrub:** Land **regex FP fix** + **missing-shot tombstone/scrub** (shot-scrub-A1+A2). Do not soften validation to warn-only.
+3. **Order:** tests red → regex → user-edit-prompt authority user-origin → stale-shot-reference scrub scrub → acceptance on café / M14–stale-shot-reference scrub fixtures → Phase 2 structured fields / delete-time doc sync.

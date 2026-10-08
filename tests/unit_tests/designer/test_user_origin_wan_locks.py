@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""M08: prompt_origin=user is authoritative at the WAN / director gate."""
+"""User-edit-prompt authority: prompt_origin=user wins at the WAN / director gate."""
 
 from __future__ import annotations
 
