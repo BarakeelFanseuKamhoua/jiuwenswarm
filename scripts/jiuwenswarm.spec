@@ -194,6 +194,7 @@ hiddenimports = webview_hiddenimports + [
     "webview",
     "jiuwenswarm.channels.web.app_web",  # 静态文件服务
     "jiuwenswarm.channels.web.desktop_app",  # 桌面入口
+    "xiaoyi_prompt_assets",
 ] + openjiuwen_submodules + symphony_submodules + dispatch_submodules
 
 # 排除不需要的模块以减小体积（pandas 为 pymilvus/openjiuwen 所需，不可排除）
@@ -314,7 +315,14 @@ def _reloc_jiuwenbox_yaml(entries):
     relocated = []
     for src, dest in entries:
         dest_n = str(dest).replace("\\", "/")
-        if dest_n == "jiuwenbox" or dest_n.startswith("jiuwenbox/"):
+        # `collect_data_files("jiuwenbox")` also returns native payloads such
+        # as `native/jiuwen_softdelete.dll`.  Only configuration YAML belongs
+        # in jiuwenbox_configs; the DLL is resolved from jiuwenbox/native at
+        # runtime by jiuwenbox.supervisor.win_softdelete.
+        if (
+            os.path.splitext(src)[1].lower() in {".yaml", ".yml"}
+            and (dest_n == "jiuwenbox" or dest_n.startswith("jiuwenbox/"))
+        ):
             dest = "jiuwenbox_configs" + dest_n[len("jiuwenbox"):]
         relocated.append((src, dest))
     return relocated

@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import sys
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 from weakref import WeakValueDictionary
@@ -1457,6 +1458,31 @@ class AgentWebSocketServer:
                         "fall back to base policy: %s",
                         exc,
                     )
+            elif policy_path == resolve_sandbox_policy_path(default_sandbox_policy_file()):
+                # Linux: box-server 固定以打包 default-policy.yaml 为基底合并副本,
+                # 只有用的正是该基底时才换成副本, 否则自定义 policy_file 会被丢掉.
+                try:
+                    from jiuwenswarm.server.sandbox_policy_render import (
+                        ensure_linux_copy_exists,
+                    )
+                    runtime_policy = ensure_linux_copy_exists()
+                    if runtime_policy.is_file():
+                        policy_path = runtime_policy
+                        logger.info(
+                            "[AgentWebSocketServer][sandbox] using Linux runtime policy copy: %s",
+                            policy_path,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[AgentWebSocketServer][sandbox] ensure Linux runtime copy failed, "
+                        "fall back to base policy: %s",
+                        exc,
+                    )
+
+            # config.yaml is the source; materialize synchronized domains before
+            # starting a service, including startup after an AgentServer restart.
+            from jiuwenswarm.common.net_guard_config import render_saved_sandbox_urls
+            render_saved_sandbox_urls(policy_path)
 
             host, preferred_port = self._parse_sandbox_host_port(url)
             port = self._allocate_internal_jiuwenbox_port(host, preferred_port)
@@ -3417,6 +3443,19 @@ class AgentWebSocketServer:
             and request.req_method == ReqMethod.CHAT_SEND
             and (request.metadata or {}).get("require_admission_ack") is True
         )
+        # 流式审计（诊断取证）：统计本轮模型增量块里"思考/正文"的条数与交替次数，
+        # 轮末输出一行汇总。只计数、不改帧、不新增日志文件。
+        # 背景：手机控制 PC 时正文被切成大量碎片（每片夹一行深度思考），需要证据判断
+        # 交替是否来自模型返回流本身；逐块日志会被日志轮转冲掉，轮级汇总不会。
+        stream_audit = {
+            "reasoning": 0,
+            "text": 0,
+            "switches": 0,
+            "last_kind": "",
+            "text_chars": 0,
+            "first_switch_seq": -1,
+            "samples": [],
+        }
         # 心跳控制：当有真实 chunk 发送时重置，空闲时发送心跳
         heartbeat_event = asyncio.Event()
         heartbeat_task: asyncio.Task | None = None
@@ -3477,98 +3516,120 @@ class AgentWebSocketServer:
         # 手机侧会新建会话。
         _inject_session_xiaoyi_routing(request)
         try:
-            async for chunk in agent.process_message_stream(request):
-                chunk_count += 1
-                if is_xiaoyi_request:
-                    logger.info(
-                        "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_GENERATED "
-                        "request_id=%s sequence=%s event_type=%s "
-                        "is_complete=%s payload=%r",
-                        request.request_id,
-                        chunk_count - 1,
-                        (
-                            chunk.payload.get("event_type")
-                            if isinstance(chunk.payload, dict)
-                            else None
-                        ),
-                        chunk.is_complete,
-                        chunk.payload,
-                    )
-                # 通知心跳任务有真实 chunk 发送，重置心跳计时
-                heartbeat_event.set()
-                # V2: chunk 回带请求侧 agent_ref，供 gateway 3 元组精确路由
-                # （设计 §6.3）。is None 守卫：保留 team 模式由事件派生的 agent_ref
-                # （_build_team_event_chunk_meta 已设值），不覆盖。
-                if chunk.agent_ref is None:
-                    chunk.agent_ref = request.agent_ref
-                wire = encode_agent_chunk_for_wire(
-                    chunk,
-                    response_id=request.request_id,
-                    sequence=chunk_count - 1,
-                )
-                chunk_payload = getattr(chunk, "payload", None)
-                if (
-                    isinstance(chunk_payload, dict)
-                    and chunk_payload.get("event_type") == "chat.ask_user_question"
-                ):
-                    logger.info(
-                        format_permission_wire_diagnostic(
-                            request_id=request.request_id,
-                            sequence=chunk_count - 1,
-                            payload=chunk_payload,
-                            wire=wire,
-                        )
-                    )
-                # 诊断：全量打印 chunk 载荷（E2A 帧内容排查，经桌面端 stderr 转发进 app.log）。
-                # chat.reasoning/chat.delta 是高频增量帧：只打印 is_complete=True 的
-                # （增量帧全部 is_complete=False，即不打印，避免淹没其它帧）；
-                # 其余事件（tool_call/tool_result/todo/usage/error/final 等）全量打印。
-                _pl = getattr(chunk, "payload", None) or {}
-                _et = _pl.get("event_type", "") if isinstance(_pl, dict) else ""
-                _is_complete = bool(getattr(chunk, "is_complete", False))
-                if not (_et in ("chat.reasoning", "chat.delta") and not _is_complete):
-                    _pl_repr = repr(_pl)
-                    if len(_pl_repr) > 8000:
-                        _pl_repr = _pl_repr[:8000] + f"…(truncated {len(_pl_repr)})"
-                    logger.info(
-                        "[AgentWebSocketServer] chunk payload: request_id=%s seq=%s"
-                        " event_type=%s is_complete=%s payload=%s",
-                        request.request_id, chunk_count - 1, _et, _is_complete, _pl_repr,
-                    )
-                try:
-                    async with send_lock:
-                        if is_xiaoyi_request:
-                            logger.info(
-                                "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_WS_SEND_BEGIN "
-                                "request_id=%s sequence=%s wire=%r",
-                                request.request_id,
-                                chunk_count - 1,
-                                wire,
-                            )
-                        sent_original = await send_wire_payload(ws, wire)
-                        if is_xiaoyi_request:
-                            logger.info(
-                                "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_WS_SEND_DONE "
-                                "request_id=%s sequence=%s",
-                                request.request_id,
-                                chunk_count - 1,
-                            )
-                    if not sent_original:
-                        logger.warning(
-                            "[AgentWebSocketServer] 流式响应因单个 chunk 超限而停止: "
-                            "request_id=%s seq=%s",
+            # 在宿主上下文仍有效时关闭流，释放输出租约和生产者任务。
+            async with aclosing(agent.process_message_stream(request)) as stream:
+                async for chunk in stream:
+                    chunk_count += 1
+                    if is_xiaoyi_request:
+                        logger.info(
+                            "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_GENERATED "
+                            "request_id=%s sequence=%s event_type=%s "
+                            "is_complete=%s payload=%r",
                             request.request_id,
                             chunk_count - 1,
+                            (
+                                chunk.payload.get("event_type")
+                                if isinstance(chunk.payload, dict)
+                                else None
+                            ),
+                            chunk.is_complete,
+                            chunk.payload,
+                        )
+                    # 通知心跳任务有真实 chunk 发送，重置心跳计时
+                    heartbeat_event.set()
+                    # V2: chunk 回带请求侧 agent_ref，供 gateway 3 元组精确路由
+                    # （设计 §6.3）。is None 守卫：保留 team 模式由事件派生的 agent_ref
+                    # （_build_team_event_chunk_meta 已设值），不覆盖。
+                    if chunk.agent_ref is None:
+                        chunk.agent_ref = request.agent_ref
+                    wire = encode_agent_chunk_for_wire(
+                        chunk,
+                        response_id=request.request_id,
+                        sequence=chunk_count - 1,
+                    )
+                    chunk_payload = getattr(chunk, "payload", None)
+                    if (
+                        isinstance(chunk_payload, dict)
+                        and chunk_payload.get("event_type") == "chat.ask_user_question"
+                    ):
+                        logger.info(
+                            format_permission_wire_diagnostic(
+                                request_id=request.request_id,
+                                sequence=chunk_count - 1,
+                                payload=chunk_payload,
+                                wire=wire,
+                            )
+                        )
+                    # 诊断：全量打印 chunk 载荷（E2A 帧内容排查，经桌面端 stderr 转发进 app.log）。
+                    # chat.reasoning/chat.delta 是高频增量帧：只打印 is_complete=True 的
+                    # （增量帧全部 is_complete=False，即不打印，避免淹没其它帧）；
+                    # 其余事件（tool_call/tool_result/todo/usage/error/final 等）全量打印。
+                    _pl = getattr(chunk, "payload", None) or {}
+                    _et = _pl.get("event_type", "") if isinstance(_pl, dict) else ""
+                    _is_complete = bool(getattr(chunk, "is_complete", False))
+                    # 思考/正文增量块计数（stream_audit：见上）
+                    if _et in ("chat.reasoning", "chat.delta"):
+                        _audit_kind = "R" if _et == "chat.reasoning" else "T"
+                        _audit_text = (
+                            str(_pl.get("content", "") or "") if isinstance(_pl, dict) else ""
+                        )
+                        if stream_audit["last_kind"] and stream_audit["last_kind"] != _audit_kind:
+                            stream_audit["switches"] += 1
+                            if stream_audit["first_switch_seq"] < 0:
+                                stream_audit["first_switch_seq"] = chunk_count - 1
+                        stream_audit["last_kind"] = _audit_kind
+                        if _audit_kind == "R":
+                            stream_audit["reasoning"] += 1
+                        else:
+                            stream_audit["text"] += 1
+                            stream_audit["text_chars"] += len(_audit_text.strip())
+                            if len(stream_audit["samples"]) < 3:
+                                stream_audit["samples"].append(
+                                    _audit_text.strip().replace("\n", " ")[:24]
+                                )
+                    if not (_et in ("chat.reasoning", "chat.delta") and not _is_complete):
+                        _pl_repr = repr(_pl)
+                        if len(_pl_repr) > 8000:
+                            _pl_repr = _pl_repr[:8000] + f"…(truncated {len(_pl_repr)})"
+                        logger.info(
+                            "[AgentWebSocketServer] chunk payload: request_id=%s seq=%s"
+                            " event_type=%s is_complete=%s payload=%s",
+                            request.request_id, chunk_count - 1, _et, _is_complete, _pl_repr,
+                        )
+                    try:
+                        async with send_lock:
+                            if is_xiaoyi_request:
+                                logger.info(
+                                    "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_WS_SEND_BEGIN "
+                                    "request_id=%s sequence=%s wire=%r",
+                                    request.request_id,
+                                    chunk_count - 1,
+                                    wire,
+                                )
+                            sent_original = await send_wire_payload(ws, wire)
+                            if is_xiaoyi_request:
+                                logger.info(
+                                    "[GUI_AGENT_DIAG] phase=AGENT_CHUNK_WS_SEND_DONE "
+                                    "request_id=%s sequence=%s",
+                                    request.request_id,
+                                    chunk_count - 1,
+                                )
+                        if not sent_original:
+                            logger.warning(
+                                "[AgentWebSocketServer] 流式响应因单个 chunk 超限而停止: "
+                                "request_id=%s seq=%s",
+                                request.request_id,
+                                chunk_count - 1,
+                            )
+                            return
+                    except TRANSPORT_CLOSED_ERRORS:
+                        logger.info(
+                            "[AgentWebSocketServer] 流式响应停止，连接已关闭: request_id=%s",
+                            request.request_id,
                         )
                         return
-                except TRANSPORT_CLOSED_ERRORS:
-                    logger.info(
-                        "[AgentWebSocketServer] 流式响应停止，连接已关闭: request_id=%s",
-                        request.request_id,
-                    )
-                    return
-                # 清除 event，让心跳任务重新开始计时
-                heartbeat_event.clear()
+                    # 清除 event，让心跳任务重新开始计时
+                    heartbeat_event.clear()
         finally:
             # 通知 heartbeat_loop 立即退出（即使 stream task 卡在 process_message_stream 中）
             stream_stop_event.set()
@@ -3599,6 +3660,29 @@ class AgentWebSocketServer:
                     request.request_id,
                     session_id,
                     chunk_count,
+                )
+            # 流式审计汇总（每轮一行）：证明"思考/正文交替"发生在模型增量块序列里，
+            # 与我方网关/端侧渲染无关；switches 高即正文碎片的直接来源。
+            _audit_frames = stream_audit["reasoning"] + stream_audit["text"]
+            if _audit_frames:
+                logger.info(
+                    "[GUI_AGENT_DIAG] phase=AGENT_STREAM_AUDIT request_id=%s session_id=%s "
+                    "channel_id=%s frames=%s text=%s reasoning=%s switches=%s "
+                    "avg_text_chars=%.1f first_switch_seq=%s samples=%s",
+                    request.request_id,
+                    session_id,
+                    request.channel_id,
+                    _audit_frames,
+                    stream_audit["text"],
+                    stream_audit["reasoning"],
+                    stream_audit["switches"],
+                    (
+                        stream_audit["text_chars"] / stream_audit["text"]
+                        if stream_audit["text"]
+                        else 0.0
+                    ),
+                    stream_audit["first_switch_seq"],
+                    " | ".join(stream_audit["samples"]),
                 )
 
         logger.info(
@@ -4691,6 +4775,16 @@ class AgentWebSocketServer:
                     team_name = str(metadata.get("team_name") or "").strip()
                     channel_id = str(metadata.get("channel_id") or request.channel_id or "").strip() or None
                     if not is_team_mode:
+                        # session.delete must also stop what the session *does*, not
+                        # just erase its records: an in-flight round keeps streaming
+                        # and re-persists the session dir right after rmtree(), which
+                        # is exactly why session.list resurrects a "deleted" session
+                        # and the chat stream never ends. Cancel the round first via
+                        # the same chat.interrupt routing used by _handle_cancel.
+                        # Team sessions own their teardown through
+                        # team_manager.delete_session_runtime below — skip to avoid
+                        # double cancellation.
+                        await self._cancel_inflight_round_for_delete(request, target)
                         from jiuwenswarm.server.runtime.session.kv_cache_product_hooks import (
                             evict_plan_session,
                         )
@@ -4794,6 +4888,48 @@ class AgentWebSocketServer:
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
         async with send_lock:
             await send_wire_payload(ws, wire)
+
+    async def _cancel_inflight_round_for_delete(
+        self, request: AgentRequest, target: str
+    ) -> None:
+        """Best-effort cancel of the session's in-flight chat round before delete.
+
+        Mirrors _handle_cancel's session reverse-lookup (no mode-based fallback:
+        hitting an unrelated agent would spin without reaching this session's
+        round). Never raises — a failed cancel must not block the user's delete;
+        it only degrades back to the old behavior.
+        """
+        channel_id = request.channel_id or "default"
+        lookup = getattr(self._agent_manager, "get_agent_for_session", None)
+        agent = lookup(channel_id, target) if callable(lookup) else None
+        if agent is None:
+            logger.info(
+                "[AgentWebSocketServer] session.delete: no live agent for "
+                "session=%s, nothing to cancel",
+                target,
+            )
+            return
+        cancel_request = AgentRequest(
+            request_id=f"session.delete-cancel-{target[:16]}",
+            channel_id=channel_id,
+            session_id=target,
+            req_method=ReqMethod.CHAT_CANCEL,
+            params={"session_id": target, "intent": "cancel"},
+        )
+        try:
+            await agent.process_message(cancel_request)
+            logger.info(
+                "[AgentWebSocketServer] session.delete: cancelled in-flight "
+                "round session=%s",
+                target,
+            )
+        except Exception:
+            logger.warning(
+                "[AgentWebSocketServer] session.delete: cancel in-flight round "
+                "failed, proceeding with delete session=%s",
+                target,
+                exc_info=True,
+            )
 
     async def _resolve_rewind_agent(
         self,
@@ -5176,12 +5312,11 @@ class AgentWebSocketServer:
         # reload agent config so the PermissionInterruptRail picks up the
         # change immediately instead of waiting for the next tool call's
         # get_permissions_snapshot refresh.
-        read_only_methods = {
-            ReqMethod.PERMISSIONS_TOOLS_GET,
-            ReqMethod.PERMISSIONS_RULES_GET,
-            ReqMethod.PERMISSIONS_APPROVAL_OVERRIDES_GET,
-        }
-        if resp.ok and request.req_method not in read_only_methods:
+        from jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc import (
+            get_permissions_read_only_req_methods,
+        )
+
+        if resp.ok and request.req_method not in get_permissions_read_only_req_methods():
             # 后台异步重载: 不阻塞权限 RPC 回包(避免 reload 慢导致 AgentServer
             # request timed out)。reload_agents_config 内部有 _reload_lock 串行化
             # + fingerprint 去重,fire-and-forget 安全。
@@ -5200,10 +5335,96 @@ class AgentWebSocketServer:
         """处理 sandbox.* 配置 E2A 请求 (officeAce 经 WS 控制沙箱开关/启动方式/文件/网络)."""
         from jiuwenswarm.server.sandbox_config_rpc import dispatch_sandbox_config_request
 
-        resp = dispatch_sandbox_config_request(request)
+        if request.req_method == ReqMethod.SANDBOX_RESTART:
+            try:
+                payload = await self._restart_configured_sandboxes(request.params or {})
+                resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,
+                                     ok=True, payload=payload, metadata=request.metadata)
+            except Exception as exc:
+                resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,
+                                     ok=False, payload={"error": str(exc), "code": "SANDBOX_RESTART_FAILED"},
+                                     metadata=request.metadata)
+        else:
+            resp = dispatch_sandbox_config_request(request)
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
         async with send_lock:
             await send_wire_payload(ws, wire)
+
+    async def _restart_configured_sandboxes(self, params: dict) -> dict:
+        """Apply saved network policy and recreate sandboxes with saved file rules."""
+        if params:
+            raise ValueError("sandbox.restart accepts no parameters (scope: all active sandboxes)")
+        if get_sandbox_endpoint().get("type") != "jiuwenbox":
+            raise ValueError("sandbox.restart currently supports jiuwenbox only")
+        runtime = get_sandbox_runtime()
+        if not runtime.get("enabled"):
+            raise ValueError("sandbox is disabled")
+        from jiuwenswarm.server.sandbox_config_rpc import apply_sandbox_policy_for_restart
+
+        # Network egress is owned by the service. Wait for its saved policy before
+        # recreating instances; never acknowledge a queued background reload.
+        service_reloaded = await apply_sandbox_policy_for_restart(
+            getattr(self, "_bootstrap_internal_jiuwenbox", None),
+        )
+        adapters = []
+        launchers = set()
+        pending = []
+        for agents in list(self._agent_manager.agents.values()):
+            for agent in list(agents.values()):
+                pending.append(self._resolve_adapter(agent))
+        pending.reverse()
+        visited = set()
+        while pending:
+            adapter = pending.pop()
+            if adapter is None or id(adapter) in visited:
+                continue
+            visited.add(id(adapter))
+            # Root adapters dispatch execution to session-owned adapters, which
+            # hold the live SysOperation cards. Visit children before deduplication.
+            pending.extend(reversed(list(getattr(adapter, "_session_adapters", {}).values())))
+            if not hasattr(adapter, "apply_sandbox_runtime_patch"):
+                continue
+            # A port change can replace a registered sysop while older sessions
+            # still retain its previous card. Rebind before launcher deduplication.
+            refresh_binding = getattr(adapter, "refresh_sandbox_runtime_binding", None)
+            if refresh_binding is not None:
+                refresh_binding()
+            card = getattr(adapter, "_sys_operation_card", None)
+            gateway = getattr(card, "gateway_config", None)
+            launcher = getattr(gateway, "launcher_config", None)
+            if launcher is not None:
+                if id(launcher) in launchers:
+                    continue
+                launchers.add(id(launcher))
+            adapters.append(adapter)
+        restarted = 0
+        # Finish old Windows ACL cleanup for every scope before installing any
+        # replacement ACLs. Otherwise a later old instance can undo an earlier new one.
+        for adapter in adapters:
+            await adapter.apply_sandbox_runtime_patch(
+                runtime, files_changed=True, strict=True, prepare_only=True,
+            )
+        failures = []
+        for index, adapter in enumerate(adapters):
+            try:
+                if await adapter.apply_sandbox_runtime_patch(runtime, files_changed=True, strict=True):
+                    restarted += 1
+            except Exception as exc:
+                card = getattr(adapter, "_sys_operation_card", None)
+                identity = getattr(card, "id", None) or f"adapter[{index}]"
+                failures.append(f"{identity}: {exc}")
+        if failures:
+            raise RuntimeError(
+                f"Sandbox rebuild partially failed: restarted={restarted}, failed={len(failures)}; "
+                + "; ".join(failures)
+                + ". Retry sandbox.restart to apply the saved policy."
+            )
+        from jiuwenswarm.common.config import get_sandbox_startup_mode
+
+        return {"restarted": restarted, "scope": "all_active_sandboxes",
+                "status": "applied" if restarted or service_reloaded else "no_active_sandboxes",
+                **({"network_status": "externally_managed"}
+                   if get_sandbox_startup_mode() != "internal" else {})}
 
     async def _handle_history_get(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         params = request.params if isinstance(request.params, dict) else {}
@@ -6456,6 +6677,11 @@ class AgentWebSocketServer:
             url = server_payload.get("url", "")
             if not url:
                 return True, "skipped: no url"
+            from jiuwenswarm.common.mcp_config import mcp_endpoint_blocked_reason
+
+            blocked = mcp_endpoint_blocked_reason(str(url))
+            if blocked:
+                return False, f"{name} ({transport}) pre-check failed: {blocked}"
             payload["server_path"] = url
             params = {}
             if isinstance(server_payload.get("headers"), dict):
@@ -6514,6 +6740,12 @@ class AgentWebSocketServer:
             url = str(entry.get("url", "")).strip()
             if not url:
                 logger.warning("[command.mcp] _fetch skipped: no url for sse")
+                return []
+            from jiuwenswarm.common.mcp_config import mcp_endpoint_blocked_reason
+
+            blocked = mcp_endpoint_blocked_reason(url)
+            if blocked:
+                logger.warning("[command.mcp] _fetch skipped: %s", blocked)
                 return []
             payload["server_path"] = url
             params = {}
@@ -6963,6 +7195,8 @@ class AgentWebSocketServer:
             # 故意的, 让 ValueError 命中下方 ``except ValueError`` 分支转成
             # ``SANDBOX_BAD_REQUEST`` 回执, 跟其它入参校验失败的处理一致。
             _require_sandbox_supported()
+            if sub in {"files.allow", "files.deny", "files.remove"}:
+                raise ValueError("edit permissions.file_guard first, then call sandbox.files.sync and sandbox.restart")
             endpoint = get_sandbox_endpoint()
             sandbox_type = str(endpoint.get("type") or "").strip().lower()
             if sandbox_type == "yuanrong":
@@ -7007,7 +7241,7 @@ class AgentWebSocketServer:
                 elif sub == "files.remove":
                     payload = await self._handle_sandbox_files_remove(channel_id, params)
                 elif sub == "files.list":
-                    payload = {"files": dict(get_sandbox_runtime().get("files") or {})}
+                    payload = {"files": list(get_sandbox_runtime().get("files") or [])}
                 else:
                     raise ValueError(f"unknown sub: {sub!r}")
                 self._attach_effective_sandbox_files(payload, channel_id, params)
@@ -7524,18 +7758,18 @@ class AgentWebSocketServer:
                     payload["effective_files"] = cached
                     return
 
-            files_runtime: dict[str, Any] | None = None
+            files_runtime: list[dict[str, Any]] | None = None
             runtime = payload.get("runtime")
             if isinstance(runtime, dict):
                 rt_files = runtime.get("files")
-                if isinstance(rt_files, dict):
+                if isinstance(rt_files, list):
                     files_runtime = rt_files
             if files_runtime is None:
                 files_in_payload = payload.get("files")
-                if isinstance(files_in_payload, dict):
+                if isinstance(files_in_payload, list):
                     files_runtime = files_in_payload
             if files_runtime is None:
-                files_runtime = get_sandbox_runtime().get("files") or {}
+                files_runtime = get_sandbox_runtime().get("files") or []
             is_code_agent = self._resolve_active_is_code_agent(channel_id)
             payload["effective_files"] = list_effective_sandbox_files(
                 files_runtime,

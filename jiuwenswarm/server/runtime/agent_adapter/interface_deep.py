@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
+from contextlib import aclosing
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, List, Optional, 
 
 if TYPE_CHECKING:
     from openjiuwen.harness.schema.config import SubAgentConfig
+    from openjiuwen.harness.schema.interaction import InteractionOutputStream
     from jiuwenswarm.server.runtime.agent_config_service import AgentDefinition
 
 import yaml
@@ -43,6 +45,7 @@ from openjiuwen.core.session.checkpointer import CheckpointerFactory
 from openjiuwen.core.session.checkpointer.checkpointer import CheckpointerConfig
 from openjiuwen.core.session.checkpointer.persistence import PersistenceCheckpointerProvider
 from openjiuwen.core.single_agent import AgentCard, ReActAgentConfig
+from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail
 from openjiuwen.core.single_agent.interrupt.state import INTERRUPTION_KEY
 from openjiuwen.core.sys_operation import (
     SysOperation,
@@ -1303,6 +1306,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._instance_overrides: dict[str, Any] = {}
         self._is_session_scoped_adapter: bool = False
         self._synced_history_tail_request_id: str | None = None
+        # 被用户停止（interrupt(cancel) 命中）且未获回复的轮数：这些轮次会在
+        # 会话历史留下悬空用户消息，下一次普通 chat.send 派发时消费计数并
+        # 注入 <system-reminder> 提示（_consume_stopped_rounds_reminder）。
+        self._stopped_unanswered_rounds: int = 0
         # Office (work) profile always uses English for system-prompt scaffolding
         # (identity / safety / skills / task_execution / runtime / env sections),
         # mirroring code mode. ``_runtime_language_override`` stays ``None`` in
@@ -3896,7 +3903,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         *,
         model_name_override: str | None = None,
     ) -> None:
-        """将指定模型应用到 react_agent 实例（替换 _llm 和 _config 字段）。
+        """将当前请求的有效模型同步到主执行器和子代理继承配置。
 
         react_agent._railed_model_call 使用 self._config.model_name 作为 model= 参数，
         因此需要同时替换 _llm 和 _config 中的模型相关字段。
@@ -3908,15 +3915,23 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         react_agent = getattr(self._instance, "_react_agent", None)
         if react_agent is None:
             return
-        if callable(getattr(react_agent, "set_llm", None)):
-            react_agent.set_llm(model)
         override = (model_name_override or "").strip() or None
         base_name = getattr(model.model_config, "model_name", None)
         effective_name = override or base_name
         request_config = model.model_config
-        if override and request_config is not None:
+        if override and override != base_name and request_config is not None:
             request_config = copy.copy(request_config)
             request_config.model_name = override
+            model = TraceAwareModel(
+                model_client_config=model.model_client_config,
+                model_config=request_config,
+                trace_header_exporters=get_xiaoyi_trace_header_exporters(),
+            )
+        if callable(getattr(react_agent, "set_llm", None)):
+            react_agent.set_llm(model)
+        deep_config = getattr(self._instance, "_deep_config", None)
+        if deep_config is not None:
+            deep_config.model = model
         config = getattr(react_agent, "_config", None)
         if config is not None:
             config.model_name = effective_name
@@ -4062,6 +4077,22 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             return None
 
     @staticmethod
+    def _sandbox_base_url_of(gateway_config: Any) -> str | None:
+        launcher_config = getattr(gateway_config, "launcher_config", None)
+        base_url = getattr(launcher_config, "base_url", None)
+        return str(base_url).rstrip("/") if base_url else None
+
+    @staticmethod
+    def _has_stale_sandbox_endpoint(
+        registered: SysOperation, sysop_card: SysOperationCard
+    ) -> bool:
+        # isolation key 不含 base_url: jiuwenbox 启动时换端口后, 旧 sysop 仍会命中复用。
+        wanted = JiuWenSwarmDeepAdapter._sandbox_base_url_of(sysop_card.gateway_config)
+        run_config = getattr(registered, "_run_config", None)
+        current = JiuWenSwarmDeepAdapter._sandbox_base_url_of(getattr(run_config, "config", None))
+        return bool(wanted and current and wanted != current)
+
+    @staticmethod
     def _get_registered_sys_operation_by_isolation_key(
         isolation_key_template: str | None,
     ) -> SysOperation | None:
@@ -4103,7 +4134,42 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         if sys_operation is not None:
             self._retain_sys_operation(str(sys_operation.id))
         self._release_sys_operations(previously_retained)
+        if sys_operation is not None:
+            self._install_file_soft_delete()
         return sys_operation
+
+    def _install_file_soft_delete(self) -> None:
+        """Load the Windows soft-delete DLL once when the switch is on.
+
+        Failure raises. The agent must not keep running with physical deletes
+        after the operator turned the feature on.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return
+        from jiuwenswarm.common.config import get_config, get_file_soft_delete_settings
+
+        enabled, archive = get_file_soft_delete_settings(
+            get_config(),
+            workspace_dir=getattr(self, "_workspace_dir", None),
+        )
+        if not enabled:
+            return
+        # The frozen desktop executable moves the on-disk ``jiuwenbox`` data
+        # directory to ``jiuwenbox_legacy_overlay`` before agents start, so the
+        # generic agent-core resolver cannot infer the DLL location from the
+        # package module alone.  Publish JiuwenBox's layout-aware resolution
+        # without overriding an explicitly configured DLL path.
+        from jiuwenbox.supervisor.win_softdelete import dll_path as jiuwenbox_soft_delete_dll_path
+
+        os.environ.setdefault(
+            "JIUWENBOX_SOFT_DELETE_DLL",
+            str(jiuwenbox_soft_delete_dll_path()),
+        )
+        from openjiuwen.core.sys_operation.local.win_softdelete import install_win_soft_delete
+
+        install_win_soft_delete(archive)
 
     def _retain_sys_operation(self, sys_operation_id: str) -> None:
         """Record one adapter-held reference on a registered sys operation.
@@ -4228,11 +4294,27 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     isolation_key_template
                 )
             )
+            if registered_sys_operation is not None and JiuWenSwarmDeepAdapter._has_stale_sandbox_endpoint(
+                registered_sys_operation, sysop_card
+            ):
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] replace sys_operation with stale sandbox endpoint: "
+                    "id=%s wanted_base_url=%s",
+                    registered_sys_operation.id,
+                    JiuWenSwarmDeepAdapter._sandbox_base_url_of(sysop_card.gateway_config),
+                )
+                Runner.resource_mgr.remove_sys_operation(registered_sys_operation.id)
+                registered_sys_operation = None
             if registered_sys_operation is not None:
                 logger.info(
                     "[JiuWenSwarmDeepAdapter] reuse registered sys_operation: %s",
                     registered_sys_operation.id,
                 )
+                # Runtime patches must mutate the config used by existing providers,
+                # not the newly built (unregistered) card's detached config.
+                sysop_card.id = registered_sys_operation.id
+                if sysop_card.mode == OperationMode.SANDBOX:
+                    sysop_card.gateway_config = registered_sys_operation._run_config.config
                 return registered_sys_operation
 
             result = Runner.resource_mgr.add_sys_operation(sysop_card)
@@ -4247,6 +4329,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                         "[JiuWenSwarmDeepAdapter] reuse registered sys_operation after add failure: %s",
                         registered_sys_operation.id,
                     )
+                    sysop_card.id = registered_sys_operation.id
+                    if sysop_card.mode == OperationMode.SANDBOX:
+                        sysop_card.gateway_config = registered_sys_operation._run_config.config
                     return registered_sys_operation
                 logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", result.msg())
                 return None
@@ -4255,9 +4340,25 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", exc)
             return None
 
+    def refresh_sandbox_runtime_binding(self) -> None:
+        """Rebind cards retained before a shared sys operation was replaced."""
+        card = self._sys_operation_card
+        if card is None or card.mode != OperationMode.SANDBOX:
+            return
+        registered = JiuWenSwarmDeepAdapter._get_registered_sys_operation_by_isolation_key(
+            self._sys_operation_isolation_key(card)
+        )
+        if registered is None:
+            return
+        gateway = getattr(getattr(registered, "_run_config", None), "config", None)
+        if getattr(gateway, "launcher_config", None) is not None:
+            card.id = registered.id
+            card.gateway_config = gateway
+
     async def apply_sandbox_runtime_patch(
-        self, runtime: dict[str, Any], *, files_changed: bool
-    ) -> None:
+        self, runtime: dict[str, Any], *, files_changed: bool, strict: bool = False,
+        prepare_only: bool = False,
+    ) -> bool:
         """轻量级热更新沙箱 runtime 参数（无需重建 agent）.
 
         - 通过 mutate 已构建 SysOperationCard 的 ``launcher_config.extra_params``
@@ -4276,16 +4377,20 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 "[JiuWenSwarmDeepAdapter] apply_sandbox_runtime_patch skipped: "
                 "no active sandbox sys_operation"
             )
-            return
+            return False
 
         launcher = card.gateway_config.launcher_config if card.gateway_config else None
         if launcher is None:
             logger.warning(
                 "[JiuWenSwarmDeepAdapter] apply_sandbox_runtime_patch: missing launcher_config"
             )
-            return
+            if strict:
+                raise RuntimeError("missing sandbox launcher_config")
+            return False
 
         sandbox_type = str(getattr(launcher, "sandbox_type", "") or "").strip().lower()
+        if strict and sandbox_type != "jiuwenbox":
+            raise ValueError("sandbox.restart currently supports jiuwenbox only")
         if sandbox_type == "yuanrong":
             logger.info(
                 "[JiuWenSwarmDeepAdapter] yuanrong runtime patch "
@@ -4339,9 +4444,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         extra["excluded_commands"] = merge_connector_excluded_commands(
             runtime.get("excluded_commands")
         )
-        extra["fallback_on_failure"] = bool(runtime.get("fallback_on_failure", False))
+        # A failed explicit policy rebuild must never execute outside the sandbox.
+        extra["fallback_on_failure"] = False if strict else bool(runtime.get("fallback_on_failure", False))
         new_policy, upload_list = build_filesystem_policy(
-            runtime.get("files") or {},
+            runtime.get("files", []),
             project_dir=self._resolve_project_dir_for_sandbox(),
             is_code_agent=self._is_code_agent,
             startup_mode=get_sandbox_startup_mode(),
@@ -4365,6 +4471,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             try:
                 from openjiuwen.extensions.sys_operation.sandbox.providers.jiuwenbox import (
                     force_recreate_jiuwenbox_sandbox,
+                    build_jiuwenbox_shared_scope_key,
+                    delete_jiuwenbox_sandbox,
                 )
             except Exception as exc:
                 logger.warning(
@@ -4372,10 +4480,32 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     "failed: %s",
                     exc,
                 )
-                return
+                if strict:
+                    raise
+                return False
             try:
+                isolation_key = self._sys_operation_isolation_key(card)
+                if strict and not isolation_key:
+                    raise RuntimeError("sandbox isolation key is unavailable")
+                shared_key = (build_jiuwenbox_shared_scope_key(str(launcher.base_url), isolation_key)
+                              if strict else None)
+                if strict:
+                    import sys
+                    # Windows sandboxes share the account used by ACL entries.
+                    # Deleting the old instance after creation revokes the new ACL.
+                    if sys.platform == "win32":
+                        old_id = extra.get("sandbox_id")
+                        deleted = await delete_jiuwenbox_sandbox(
+                            sandbox_id=old_id, shared_key=shared_key, reason="policy_changed",
+                        )
+                        if old_id and old_id not in deleted:
+                            raise RuntimeError(f"could not delete old sandbox {old_id}")
+                        extra.pop("sandbox_id", None)
+                    if prepare_only:
+                        return False
                 new_sandbox_id = await force_recreate_jiuwenbox_sandbox(
                     launcher.base_url,
+                    shared_key=shared_key,
                     policy=new_policy,
                     policy_mode=extra.get("policy_mode", "append"),
                     preserve_files_upload=upload_list,
@@ -4385,12 +4515,16 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     "[JiuWenSwarmDeepAdapter] sandbox instance recreated: %s",
                     new_sandbox_id,
                 )
+                return True
             except Exception as exc:
                 logger.warning(
                     "[JiuWenSwarmDeepAdapter] force_recreate_jiuwenbox_sandbox "
                     "failed: %s",
                     exc,
                 )
+                if strict:
+                    raise
+        return False
 
     @staticmethod
     def _build_filesystem_rail() -> SysOperationRail | None:
@@ -5709,7 +5843,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             )
             self._register_agent_owned_tool(tool_instance, agent_id)
             tool_cards.append(tool_instance.card)
-
+        
         self._vision_tools = []
         self._vision_tools_registered = False
         if self._vision_model_config is not None:
@@ -5798,7 +5932,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             ]
             try:
                 for xt in _xiaoyi_tools:
-                    self._register_shared_tool(xt)
+                    if xt.card.name in {"save_media_to_gallery", "save_file_to_file_manager"}:
+                        from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools.save_tools import bind_save_tool
+
+                        xt = bind_save_tool(xt, lambda: self._sys_operation)
+                        self._register_agent_owned_tool(xt, agent_id)
+                    else:
+                        self._register_shared_tool(xt)
                     tool_cards.append(xt.card)
                 self._xiaoyi_phone_tools_registered = True
                 logger.info(
@@ -6861,6 +7001,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     session_id=session_id,
                     channel_id=channel_for_tool,
                     metadata=metadata_for_tool,
+                    operation_provider=lambda: self._sys_operation,
                 )
                 for sf_tool in self._send_file_toolkit.get_tools():
                     self._register_agent_owned_tool(sf_tool, self._tool_owner_id())
@@ -7175,13 +7316,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 project_dir=runtime_config.project_dir or self._project_dir,
             )
             self._runtime_prompt_rail.set_model_name(self._resolve_model_name())
-            # Web 单 agent 一律显示办公（agent）：前端路由过来的 code/design canonical
-            # 不再泄露给 LLM。团队与 TUI/CLI/IM/cron 走原值（与 _adapter_mode_for_request
+            # Web / Desktop 单 agent 一律显示办公（agent）：前端路由过来的 code/design
+            # canonical 不再泄露给 LLM。团队与 TUI/CLI/IM/cron 走原值（与 _adapter_mode_for_request
             # 改动一致）。仅影响 runtime_prompt_rail 显示标签，runtime_config.mode 本身
             # 不变（计费 trace / 会话 metadata / 项目分桶保持原行为）。
             from jiuwenswarm.common.mode_matrix import is_team_mode as _is_team_canonical
             _display_mode = (
-                "agent" if runtime_config.channel_id == "web"
+                "agent" if runtime_config.channel_id in {"web", "desktop"}
                 and not _is_team_canonical(runtime_config.mode)
                 else runtime_config.mode
             )
@@ -7779,37 +7920,68 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         return cancelled_tool_results
 
     @staticmethod
-    def _append_cancelled_tools_to_history(
+    async def _append_cancelled_tools_to_history(
         request: AgentRequest,
         cancelled_tool_results: list[dict[str, Any]],
+        target_request_id: str | None = None,
     ) -> None:
         """Persist cancelled tool results so refresh does not leave spinners."""
         if not cancelled_tool_results:
             return
+        # 流可能已关闭、active_round 已清除；用 tool_call_id 从历史找原轮。
+        records = []
+        try:
+            if request.session_id:
+                if not target_request_id:
+                    # active 已清除时确保原 tool_call 可见；不能在事件循环 join。
+                    await asyncio.to_thread(flush_history_writes)
+                records = await asyncio.to_thread(load_history_records, request.session_id)
+        except Exception:
+            logger.warning("failed to read cancelled tool history: session=%s",
+                           request.session_id, exc_info=True)
+        tool_requests: dict[str, str] = {}
+        for record in records:
+            tool_call = record.get("tool_call")
+            if record.get("event_type") != "chat.tool_call" or not isinstance(tool_call, dict):
+                continue
+            call_id = tool_call.get("tool_call_id") or record.get("tool_call_id")
+            rid = record.get("request_id")
+            if isinstance(call_id, str) and isinstance(rid, str) and rid:
+                tool_requests[call_id] = rid
         mode = (
             request.params.get("mode", "unknown")
             if isinstance(request.params, dict)
             else "unknown"
         )
         for tool_info in cancelled_tool_results:
-            append_history_record(
-                session_id=request.session_id,
-                request_id=request.request_id,
-                channel_id=request.channel_id,
-                role="assistant",
-                event_type="chat.tool_result",
-                content=tool_info.get("result", ""),
-                timestamp=time.time(),
-                extra={
-                    "tool_result": {
-                        "tool_name": tool_info.get("tool_name", ""),
-                        "tool_call_id": tool_info.get("tool_call_id", ""),
-                        "result": tool_info.get("result", ""),
-                        "status": tool_info.get("status", "error"),
+            rid = tool_requests.get(tool_info.get("tool_call_id", "")) or target_request_id
+            if not rid:
+                # 不知道原轮时不能用中断 RPC 的 id 伪造一轮回复。
+                logger.warning("cancelled tool history missing target: session=%s tool_call_id=%s",
+                               request.session_id, tool_info.get("tool_call_id"))
+                continue
+            try:
+                append_history_record(
+                    session_id=request.session_id,
+                    request_id=rid,
+                    channel_id=request.channel_id,
+                    role="assistant",
+                    event_type="chat.tool_result",
+                    content="",
+                    timestamp=time.time(),
+                    extra={
+                        "tool_result": {
+                            "tool_name": tool_info.get("tool_name", ""),
+                            "tool_call_id": tool_info.get("tool_call_id", ""),
+                            "result": tool_info.get("result", ""),
+                            "status": tool_info.get("status", "error"),
+                        },
                     },
-                },
-                mode=mode,
-            )
+                    mode=mode,
+                )
+            except Exception:
+                logger.warning("failed to persist cancelled tool history: session=%s request_id=%s",
+                               request.session_id, rid, exc_info=True)
 
     def _has_active_goal_round(self) -> bool:
         """Whether DeepAgent is currently executing a goal round.
@@ -8223,6 +8395,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
         intent = request.params.get("intent", "cancel")
         new_input = request.params.get("new_input")
+        # 在任何取消 await 前固定目标；取消结束时 active_round 可能已是下一轮。
+        active = getattr(self._instance, "active_round", None)
+        target_request_id = getattr(getattr(active, "work", None), "request_id", None)
+        if not isinstance(target_request_id, str):
+            target_request_id = None
 
         # Interaction-managed sessions: route cancel/supplement through
         # DeepAgent.cancel_round instead of the global DeepAgent abort + raw
@@ -8238,7 +8415,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             and self._instance_interaction_started()
             and intent in ("cancel", "supplement")
         ):
-            return await self._process_interaction_interrupt(request, intent, new_input)
+            return await self._process_interaction_interrupt(request, intent, new_input, target_request_id)
 
         # Session guard: only execute interrupt operations if the target session
         # is currently active on this adapter. Without this guard, a shared adapter
@@ -8390,7 +8567,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         if cancelled_tool_results:
             payload["cancelled_tools"] = cancelled_tool_results
             # 写入历史记录，确保刷新网页后工具状态正确显示
-            self._append_cancelled_tools_to_history(request, cancelled_tool_results)
+            await self._append_cancelled_tools_to_history(request, cancelled_tool_results, target_request_id)
 
         # 方案A：用户 cancel/supplement 单回合后，agent 实例仍存活、会话仍
         # 会被复用。刷新主 adapter 的 last_used，避免本会话被随后的
@@ -8413,6 +8590,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         request: "AgentRequest",
         intent: str,
         new_input: Any,
+        target_request_id: str | None = None,
     ) -> "AgentResponse":
         """Handle cancel/supplement for an interaction-managed session.
 
@@ -8422,6 +8600,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         without clearing GoalRecord.  For user cancel, pause an ACTIVE goal
         first so the GoalBar stops continuing after the round is aborted.
         """
+        if target_request_id is None:
+            active = getattr(self._instance, "active_round", None)
+            rid = getattr(getattr(active, "work", None), "request_id", None)
+            target_request_id = rid if isinstance(rid, str) else None
         paused_goal_payload: dict[str, Any] | None = None
         if intent == "cancel":
             try:
@@ -8467,6 +8649,14 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 "[JiuWenSwarmDeepAdapter] interrupt(%s): interaction cancel failed",
                 intent,
             )
+        if cancelled and intent == "cancel":
+            # 被停止的轮次没有任何产出，会在会话历史里留下无回复的用户消息
+            # （悬空消息）；登记计数，下一次普通 chat.send 派发时消费并注入
+            # 提示（_consume_stopped_rounds_reminder），避免模型把已停止的
+            # 请求当作待处理任务回应。supplement 是换输入续跑，不算放弃。
+            self._stopped_unanswered_rounds = (
+                getattr(self, "_stopped_unanswered_rounds", 0) + 1
+            )
         # cancel 会放弃整个当前交互回合；supplement 仅在纯 ask_user 回合下做
         # 保守清理。两者都必须同时移除持久化 interrupt state 和上下文尾部
         # tool_call，否则下一条普通消息会被旧交互当作回答消费。
@@ -8494,7 +8684,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             payload["goal"] = paused_goal_payload
         if cancelled_tool_results:
             payload["cancelled_tools"] = cancelled_tool_results
-            self._append_cancelled_tools_to_history(request, cancelled_tool_results)
+            await self._append_cancelled_tools_to_history(request, cancelled_tool_results, target_request_id)
 
         # Best-effort todo cancellation for user cancel (does not touch runtime).
         if cancelled and intent == "cancel" and request.session_id:
@@ -8521,6 +8711,103 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             ok=True,
             payload=payload,
             metadata=request.metadata,
+        )
+
+    async def _reclaim_output_stream_for_new_round(
+        self,
+        request: "AgentRequest",
+        session_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> Optional["InteractionOutputStream"]:
+        """普通对话取输出租约；被旧轮悬挂占用时重放 interrupt 收回。
+
+        ``attach_output`` 在租约被其他消费者持有时返回 None。网关的
+        cancel-then-start 顶替通常保证派发新消息前旧流已结束，但「取消早于
+        旧轮注册」的竞态（手机发送后立即终止，cancel 与消息在途中交错）会
+        让 fire-and-forget 中断扑空，旧轮带着租约跑到自然结束——期间同
+        session 的后续 chat.send 全部静默退化为只回 runtime.accepted
+        （前端「本轮无响应」）。这里重放一次 interrupt(cancel)（与网关中断
+        同一条清理路径：暂停 ACTIVE goal、cancel_round、清 pending
+        interrupt state），并在时限内轮询等待旧消费者释放租约。
+
+        Args:
+            request: 触发本次取回的 chat.send 请求，interrupt 复用其
+                session/request 标识做清理。
+            session_id: 会话 id。
+            timeout_seconds: 等待租约释放的总时限（秒）。
+            poll_interval_seconds: 租约轮询间隔（秒）。
+
+        Returns:
+            拿到租约时返回输出流；超时仍被占用返回 None，由调用方显式
+            报错收尾。
+
+        Raises:
+            RuntimeError: 交互已终止时由 ``attach_output`` 原样上抛。
+        """
+        stream = await self._instance.attach_output()
+        if stream is not None:
+            return stream
+        logger.warning(
+            "[JiuWenSwarmDeepAdapter] 新消息输出租约被旧消费者占用，"
+            "重放 interrupt 收回: session=%s request_id=%s",
+            session_id,
+            request.request_id,
+        )
+        await self._process_interaction_interrupt(request, "cancel", None)
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        while True:
+            stream = await self._instance.attach_output()
+            if stream is not None:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] 输出租约已收回: session=%s "
+                    "request_id=%s waited_ms=%.0f",
+                    session_id,
+                    request.request_id,
+                    (time.monotonic() - started_at) * 1000,
+                )
+                return stream
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] 输出租约收回超时: session=%s "
+                    "request_id=%s timeout_s=%.1f",
+                    session_id,
+                    request.request_id,
+                    timeout_seconds,
+                )
+                return None
+            await asyncio.sleep(poll_interval_seconds)
+
+    def _consume_stopped_rounds_reminder(self) -> str | None:
+        """消费「被用户停止且未回复」的轮次计数，生成一次性模型提示。
+
+        interrupt(cancel) 命中的轮次被中止时没有任何产出，会在会话历史里
+        留下一条无回复的用户消息（悬空消息）。下一条普通消息的模型会把这些
+        悬空消息当作待处理请求回应——实测：手机停止「生成图片」后发送
+        「你好」，模型回复的却是图片生成的引导话术。这里在普通 chat.send
+        派发时消费计数，返回一段 ``<system-reminder>``（模型系统提示中已
+        声明该标签承载系统信息），提醒模型这些请求已被用户放弃。
+
+        Returns:
+            存在被停止未回复轮次时返回提醒文本（计数已清零）；否则 None。
+        """
+        stopped = getattr(self, "_stopped_unanswered_rounds", 0)
+        if stopped <= 0:
+            return None
+        self._stopped_unanswered_rounds = 0
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] 注入被停止请求提示: session=%s "
+            "stopped_rounds=%d",
+            getattr(self, "_parent_session_id", None),
+            stopped,
+        )
+        return (
+            "<system-reminder>用户此前主动停止了 "
+            f"{stopped} 条未获得回复的请求（对应会话中未被应答的用户消息）。"
+            "这些请求已被用户放弃，请勿继续处理或主动回应它们；"
+            "只需处理最新一条用户消息。</system-reminder>"
         )
 
     def _cancel_scheduler_running_tasks(self) -> None:
@@ -10071,8 +10358,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 warmup_exclude_request_id=request.request_id,
             )
             try:
-                async for chunk in session_adapter.process_message_stream_impl(request, inputs):
-                    yield chunk
+                # 委托层也拥有内层流；关闭不能依赖 async generator 的 GC。
+                async with aclosing(session_adapter.process_message_stream_impl(request, inputs)) as stream:
+                    async for chunk in stream:
+                        yield chunk
                 return
             finally:
                 await self._evict_idle_session_adapters()
@@ -10732,12 +11021,37 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 # 之前的 rewind 分支 Runner.run_agent_streaming(session=_runner_session)
                 # 会导致 stream 归属错位（core 写原始 session 的流，adapter 读
                 # _runner_session 的流），从而丢掉 output/notice chunk。
-                interaction_stream = await self._instance.attach_output()
+                # 输出租约被旧轮悬挂时（取消竞态漏网的场景），先重放
+                # interrupt 收回再走正常路径——不再静默只回
+                # runtime.accepted 把本轮吞掉。
+                interaction_stream = await self._reclaim_output_stream_for_new_round(
+                    request, session_id
+                )
                 if interaction_stream is None:
-                    async for chunk in _yield_runtime_accepted():
-                        yield chunk
+                    # 收回失败：显式报错收尾（计费按 FAILED）。旧实现只回
+                    # runtime.accepted 就返回，本轮零内容地「完成」，前端
+                    # 表现为「本轮无响应」。
+                    _billing_failed = True
+                    yield AgentResponseChunk(
+                        request_id=rid,
+                        channel_id=cid,
+                        payload={
+                            "event_type": "chat.error",
+                            "error": "上一轮任务仍在处理且无法停止，请稍后重试",
+                            "code": "OUTPUT_LEASE_BUSY",
+                        },
+                        is_complete=True,
+                    )
                     interaction_stream_abort = False
                     return
+                # 悬空停止轮提示：只改本轮发往模型的 inputs（用户历史与计费
+                # 用的是门面层已落盘的原始 query）；放在租约收回之后，本轮
+                # 收回的悬挂旧轮同样计入。
+                stopped_reminder = self._consume_stopped_rounds_reminder()
+                if stopped_reminder is not None:
+                    inputs["query"] = (
+                        f"{inputs.get('query') or ''}\n\n{stopped_reminder}"
+                    )
                 server_logger.info(
                     "[AgentServer] message entering runner streaming: session_id=%s request_id=%s"
                     " channel_id=%s mode=%s prepare_ms=%.1f query=%s",
@@ -11180,11 +11494,15 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 reset_current_multimodal_image_files(image_files_token)
             if interaction_stream is not None:
                 try:
+                    logger.info("[JiuWenSwarmDeepAdapter] output stream close begin: request_id=%s session=%s abort=%s",
+                                rid, session_id, interaction_stream_abort)
                     await interaction_stream.close(
                         abort_active_round=interaction_stream_abort,
                     )
+                    logger.info("[JiuWenSwarmDeepAdapter] output stream close end: request_id=%s session=%s", rid, session_id)
                 except Exception:
-                    logger.debug("[Goal] interaction stream close failed", exc_info=True)
+                    logger.warning("[JiuWenSwarmDeepAdapter] output stream close failed: request_id=%s session=%s",
+                                   rid, session_id, exc_info=True)
             self._unregister_session_agent_task(session_id)
             TOOL_PERMISSION_CHANNEL_ID.reset(token_perm_cid)
             CURRENT_CHANNEL_ID.reset(token_cid)
@@ -13224,65 +13542,96 @@ def _load_custom_subagents(
     return result
 
 
-# === [JiuWenSwarm patch] widen general-purpose subagent sandbox =============
-# core 的 DeepAgent.create_subagent 会给 general-purpose 子 agent 生成窄目录
-# sub_agents/<id> 作为 CWD，并把 sandbox 边界(回退到 [workspace, project_root]) 也
-# 锁成该窄目录；叠加从父继承的 restrict_to_work_dir(openJiuwen #987) 后，子 agent
-# 读不到共享 skills/、也无法落盘到主工作区。
-#
-# 这里在不改 core 源码的前提下，运行时包一层 create_subagent：保留窄目录当 CWD(每次
-# 调用独立工位)，仅把该子 agent 的 sandbox_root 显式放宽到主 agent 的共享 workspace 根，
-# 并保持 restrict_to_sandbox=True —— 于是 skills/ 可读、工作区可落盘，而 /tmp 及外部路径
-# 仍被沙箱拒绝(#987 的隔离不变)。
-#
-# 影响面：仅当 subagent_type == "general-purpose" 时才改写 sandbox_root；其它子 agent
-# (research/browser/code 以及 team 成员各自派生的子 agent) 原样返回，不受影响。
-def _jws_install_subagent_sandbox_widen_patch() -> None:
+# === [JiuWenSwarm patch] subagent streaming and sandbox defaults ===========
+# 子代理创建后按 config.yaml 的 sandbox.enabled 设置本地路径检查。
+# 调用方：create_subagent 补丁，以及自定义 Agent 的 create_deep_agent。
+# - false：restrict_to_sandbox=False，不拦截工作区外路径。
+# - true：restrict_to_sandbox=True。
+#   general-purpose 另把 sandbox_root 设为主 workspace，才能读共享 skills/。
+#   若不放宽，它的回退目录是 sub_agents/<id>。
+#   其它类型只打开检查，不改 sandbox_root。
+def _jws_sync_subagent_sandbox(sub, subagent_type: str, shared_root: str | None = None) -> None:
+    """Align a sub-agent's local path check with ``sandbox.enabled``."""
+    # pylint: disable=protected-access
+    try:
+        sysop = getattr(getattr(sub, "_deep_config", None), "sys_operation", None)
+        wc = getattr(sysop, "_run_config", None)
+        if wc is None or not hasattr(wc, "restrict_to_sandbox"):
+            return
+        enabled = bool(get_sandbox_runtime().get("enabled"))
+        wc.restrict_to_sandbox = enabled
+        if not enabled:
+            logger.info(
+                "[JiuWenSwarm] sandbox disabled, subagent %s path check off",
+                subagent_type,
+            )
+            return
+        if (
+            subagent_type == "general-purpose"
+            and shared_root
+            and hasattr(wc, "sandbox_root")
+        ):
+            wc.sandbox_root = [str(shared_root)]
+            sub_ws = getattr(getattr(sub, "_deep_config", None), "workspace", None)
+            cwd_root = getattr(sub_ws, "root_path", None) if sub_ws else None
+            logger.info(
+                "[JiuWenSwarm] sandbox enabled, widened general-purpose "
+                "subagent sandbox to %s (cwd stays %s)",
+                shared_root,
+                cwd_root,
+            )
+            return
+        logger.info(
+            "[JiuWenSwarm] sandbox enabled, subagent %s path check on",
+            subagent_type,
+        )
+    except Exception:
+        logger.warning("[JiuWenSwarm] sync subagent sandbox failed", exc_info=True)
+    # pylint: enable=protected-access
+
+
+class _SubagentStreamingRail(AgentRail):
+    """Use ReAct's native stream accumulation while keeping invoke's result.
+
+    The desktop gateway can return empty messages for non-streaming calls.
+    Set the core's streaming flag on the inner model-call context, not the
+    outer DeepAgent context, so tool rounds and resumes use the same path.
+    """
+
+    async def before_model_call(self, ctx: AgentCallbackContext) -> None:
+        ctx.extra["_streaming"] = True
+
+
+def _jws_install_subagent_runtime_patch() -> None:
     # DeepAgent 已在模块级导入(顶部 `from openjiuwen.harness import DeepAgent`),
     # 此处直接复用,避免函数内重复 import 造成同名遮蔽(huawei-redefined-outer-name)。
-    if getattr(DeepAgent, "_jws_subagent_sandbox_widen", False):
+    if getattr(DeepAgent, "_jws_subagent_runtime", False):
         return
     _orig_create_subagent = DeepAgent.create_subagent
 
-    # pylint: disable=protected-access
-    # 此处为运行时 monkey-patch:必须在 DeepAgent 类外访问其受保护成员
-    # (_deep_config / _run_config) 才能改写子 agent 沙箱边界,G.CLS.11 在此不适用。
-    def _create_subagent_widen_sandbox(self, subagent_type, subsession_id, *args, **kwargs):
+    def _create_subagent_with_runtime_defaults(self, subagent_type, subsession_id, *args, **kwargs):
         sub = _orig_create_subagent(self, subagent_type, subsession_id, *args, **kwargs)
-        try:
-            if subagent_type == "general-purpose":
-                parent_ws = getattr(self._deep_config, "workspace", None)
-                shared_root = getattr(parent_ws, "root_path", None) if parent_ws else None
-                if shared_root:
-                    shared_root = str(shared_root)
-                    sysop = getattr(getattr(sub, "_deep_config", None), "sys_operation", None)
-                    wc = getattr(sysop, "_run_config", None)
-                    if wc is not None and hasattr(wc, "sandbox_root"):
-                        wc.sandbox_root = [shared_root]
-                        wc.restrict_to_sandbox = True
-                        sub_ws = getattr(sub._deep_config, "workspace", None)
-                        cwd_root = getattr(sub_ws, "root_path", None) if sub_ws else None
-                        logger.info(
-                            "[JiuWenSwarm] widened general-purpose subagent sandbox to "
-                            "%s (cwd stays %s)",
-                            shared_root,
-                            cwd_root,
-                        )
-        except Exception:
-            logger.warning(
-                "[JiuWenSwarm] widen subagent sandbox failed", exc_info=True
-            )
+        # A configured DeepAgent instance may be reused across task calls.
+        if not sub.find_rails_by_type((_SubagentStreamingRail,)):
+            sub.add_rail(_SubagentStreamingRail())
+        # pylint: disable=protected-access
+        parent_ws = getattr(self._deep_config, "workspace", None)
+        # pylint: enable=protected-access
+        shared_root = getattr(parent_ws, "root_path", None) if parent_ws else None
+        _jws_sync_subagent_sandbox(
+            sub,
+            subagent_type,
+            str(shared_root) if shared_root else None,
+        )
         return sub
-
-    # pylint: enable=protected-access
-    DeepAgent.create_subagent = _create_subagent_widen_sandbox
-    DeepAgent._jws_subagent_sandbox_widen = True  # pylint: disable=protected-access
+    DeepAgent.create_subagent = _create_subagent_with_runtime_defaults
+    DeepAgent._jws_subagent_runtime = True  # pylint: disable=protected-access
     logger.info(
-        "[JiuWenSwarm] installed general-purpose subagent sandbox-widen patch"
+        "[JiuWenSwarm] installed subagent streaming and sandbox defaults"
     )
 
 
-_jws_install_subagent_sandbox_widen_patch()
+_jws_install_subagent_runtime_patch()
 # === [JiuWenSwarm patch end] ================================================
 
 
