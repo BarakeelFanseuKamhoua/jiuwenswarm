@@ -1560,6 +1560,7 @@ async def _start_team_stream_round(
     hide_dm: bool = False,
     debug: bool = False,
     source: str = "first",
+    request_metadata: dict[str, Any] | None = None,
 ) -> asyncio.Queue:
     """Start a team stream round and register its waiter queue."""
     # Sync team observability with current config before streaming.
@@ -1570,6 +1571,13 @@ async def _start_team_stream_round(
 
     sync_team_observability()
     await team_manager.prepare_runtime_activation(session_id, team_name)
+    # 每轮起跑前刷新在跑团队的计费 trace（RESUME_FROM_PAUSE 复用池中暂停运行时，
+    # 其模型池 trace 头仍是首轮装配时的值）：不刷新则次轮起模型调用的
+    # x-hag-trace-id 冻结在首轮，云端按 trace 归集后后续轮 FINISH consumedPoints=0。
+    # 首轮/冷恢复时池中无条目，refresh 内部按缺项静默跳过。
+    refresh_trace = getattr(team_manager, "refresh_active_team_trace_for_round", None)
+    if callable(refresh_trace):
+        await refresh_trace(session_id, team_name, request_metadata)
     request_queue = _new_team_event_queue()
     team_manager.add_waiter(session_id, request_id, request_queue)
     logger.info(
@@ -1983,12 +1991,12 @@ async def process_team_message_stream(
                     },
                     is_complete=False,
                 )
-                yield AgentResponseChunk(
-                    request_id=rid,
-                    channel_id=channel_id,
-                    payload=None,
-                    is_complete=True,
-                )
+                # 不再自发 is_complete 终帧：外层 facade（interface.py 消费循环结尾）
+                # 对每条流统一补唯一终止帧。此前此处再发一帧 is_complete=True，导致
+                # 一条 follow-up 流出现两个终止帧——桌面端 deferred 守卫一次性消费后，
+                # 第二个终止帧穿透兜底被误判为回合完成（2026-10-08 专家团 HITL 续跑
+                # 事故：计费 FINISH 随答案提交提前收口、上报链 final 断链，续跑产出
+                # 的计费与交付全部丢失）。
                 return
 
         if is_first_request:
@@ -2017,6 +2025,7 @@ async def process_team_message_stream(
                 hide_dm=hide_dm,
                 debug=debug,
                 source=first_request_source,
+                request_metadata=request_metadata,
             )
 
         try:
