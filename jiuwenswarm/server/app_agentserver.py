@@ -150,6 +150,12 @@ async def _run(host: str, port: int) -> None:
     finally:
         logger.info("[AgentServer] stopping…")
         stop_event.set()
+        try:
+            from jiuwenswarm.server.agent_http_server import stop_http_server
+
+            await stop_http_server()
+        except Exception as exc:
+            logger.warning("[AgentHTTPServer] stop failed: %s", exc)
         begin_drain = getattr(front, "begin_drain", None)
         if callable(begin_drain):
             begin_drain()

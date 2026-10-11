@@ -235,6 +235,12 @@ class WorkerRuntime:
             await trajectory_gateway_hint_bridge.unbind()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Worker] trajectory hint bridge unbind failed: %s", exc)
+        try:
+            from jiuwenswarm.server.agent_http_server import stop_http_server
+
+            await stop_http_server()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[AgentHTTPServer] stop failed: %s", exc)
         stop = getattr(self.server, "stop", None)
         if callable(stop):
             await stop()
@@ -381,6 +387,14 @@ async def start_worker_runtime(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Worker] teammate bootstrap daemon start failed: %s", exc)
     log_startup_stage("ready")
+    from jiuwenswarm.server.agent_http_server import start_http_if_enabled
+
+    try:
+        app_services = getattr(server, "app_services", None)
+        if app_services is not None:
+            await start_http_if_enabled(app_services)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[AgentHTTPServer] start failed: %s", exc)
     return WorkerRuntime(
         server=server,
         stop_event=stop_event,
