@@ -78,6 +78,18 @@ async def _start_supervisor(front: object, host: str, port: int) -> object:
     return supervisor
 
 
+def _ws_server_config() -> dict:
+    """读 WebSocket 门的配置。读不到就当没写，门保持打开。"""
+    try:
+        from jiuwenswarm.common.config import get_config
+
+        section = get_config().get("ws_server")
+    except Exception:
+        logger.debug("[AgentServer] 读取 ws_server 配置失败", exc_info=True)
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
 async def _run(host: str, port: int) -> None:
     from jiuwenswarm.server.front.server import AgentServerFront
 
@@ -97,20 +109,26 @@ async def _run(host: str, port: int) -> None:
     )
 
     front = AgentServerFront(host=host, port=port)
-    await front.start()
-    logger.info(
-        "[AgentServer] port listening: ws://%s:%s (elapsed %.2fs)",
-        host,
-        port,
-        time.monotonic() - startup_t0,
-    )
-    logger.info(
-        "[AgentServer] startup stage=%s process_elapsed=%.2fs run_elapsed=%.2fs control_ready=%s",
-        "agent_ws_listening",
-        time.monotonic() - _PROCESS_START_T0,
-        time.monotonic() - startup_t0,
-        front.readiness.snapshot().get("control_ready"),
-    )
+    from jiuwenswarm.server.startup_switches import resolve_websocket_enabled
+
+    websocket_enabled = resolve_websocket_enabled(config_section=_ws_server_config())
+    if websocket_enabled:
+        await front.start()
+        logger.info(
+            "[AgentServer] port listening: ws://%s:%s (elapsed %.2fs)",
+            host,
+            port,
+            time.monotonic() - startup_t0,
+        )
+        logger.info(
+            "[AgentServer] startup stage=%s process_elapsed=%.2fs run_elapsed=%.2fs control_ready=%s",
+            "agent_ws_listening",
+            time.monotonic() - _PROCESS_START_T0,
+            time.monotonic() - startup_t0,
+            front.readiness.snapshot().get("control_ready"),
+        )
+    else:
+        logger.info("[AgentServer] WebSocket 门关闭，不听端口")
 
     stop_event = asyncio.Event()
     supervisor: object | None = None

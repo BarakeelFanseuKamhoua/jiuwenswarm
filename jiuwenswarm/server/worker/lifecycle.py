@@ -319,6 +319,17 @@ async def start_worker_runtime(
             on_warmup_retry=signals.warmup_retry,
             on_failed=signals.failed,
         )
+    from jiuwenswarm.server.startup_switches import resolve_websocket_enabled
+
+    def _ws_config() -> dict:
+        try:
+            from jiuwenswarm.common.config import get_config
+            section = get_config().get("ws_server")
+        except Exception:
+            return {}
+        return section if isinstance(section, dict) else {}
+
+    server._websocket_enabled = resolve_websocket_enabled(config_section=_ws_config())
     await server.start(bind_transport=False)
     log_startup_stage("runtime_started")
 
