@@ -419,8 +419,8 @@ class SkillSelectionRail(DeepAgentRail):
             search_id=search_id, candidates=candidates)
 
     async def _handle_explicit(self, ctx, native, settings):
-        # Explicit selections bypass ranking, but still load through the normal
-        # model-issued skill_tool call (permissions, credentials, active state).
+        # Explicit selections bypass ranking; native loads retain the normal
+        # skill_tool checks (permissions, credentials, active state).
         content = self._latest_content(ctx)
         query = explicit_task_text(retrieval_text(content))
         request = explicit_request(content, query, (s.name for s in native.skills) if native else ())
@@ -438,6 +438,11 @@ class SkillSelectionRail(DeepAgentRail):
         if error:
             prompt = ('用户指定的技能不存在、不可用或名称不唯一，尚未加载。'
                       '请说明原因，不要自动换用其他技能。指定名称：' + names)
+        elif any(skill.name.casefold() == 'pptx-craft' for skill in selected):
+            prompt = ('用户明确指定以下技能，无需先检索。其中 pptx-craft 按下述 PPT 加速例外选择执行方式，'
+                      '符合加速条件时优先调用 skill_acceleration_exec，无需先通过 skill_tool 加载；'
+                      '其他指定技能仍通过原生 skill_tool 加载指令后执行对应任务。'
+                      '本提示不代表指令已加载。指定名称：' + names + '\n\n' + SYSTEM_GUIDANCE)
         else:
             prompt = ('用户明确指定以下技能，无需先检索。请通过原生 skill_tool 加载指令后执行对应任务；'
                       '本提示不代表指令已加载。指定名称：' + names + '\n\n' + SYSTEM_GUIDANCE)
