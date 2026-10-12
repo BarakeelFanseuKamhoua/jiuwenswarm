@@ -1636,11 +1636,12 @@ class AgentWebSocketServer:
 
             host, preferred_port = self._parse_sandbox_host_port(url)
             port = self._allocate_internal_jiuwenbox_port(host, preferred_port)
+            preferred_url = url
             if port != preferred_port:
                 url = f"http://{host}:{port}"
                 logger.info(
                     "[AgentWebSocketServer] jiuwenbox auto-start: "
-                    "preferred port %d busy, using %d",
+                    "cannot bind preferred port %d, using %d",
                     preferred_port,
                     port,
                 )
@@ -1693,6 +1694,25 @@ class AgentWebSocketServer:
                     "after auto-start: %s",
                     exc,
                 )
+            if port != preferred_port:
+                # Agents built while box-server was starting still hold the old port.
+                try:
+                    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+                        JiuWenSwarmDeepAdapter,
+                    )
+                    retargeted = await JiuWenSwarmDeepAdapter.retarget_sandbox_sys_operations(
+                        preferred_url, url,
+                    )
+                    if retargeted:
+                        logger.info(
+                            "[AgentWebSocketServer] sandbox sys_operations retargeted to %s: %s",
+                            url, retargeted,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[AgentWebSocketServer] retarget sandbox sys_operations failed: %s",
+                        exc,
+                    )
 
             # auto-start 成功 → ``runtime.enabled`` 同步为 True, 这样 /sandbox
             # status / TUI 显示的状态跟真实运行的 jiuwenbox 对齐。如果用户上次
@@ -7375,6 +7395,7 @@ class AgentWebSocketServer:
         # 2. 解析 host:port 并 (internal 模式下) 完成端口分配。
         # external 模式: 直接用配置里的 url, 由用户保证 jiuwenbox 监听在此处。
         # internal 模式: 期望端口被占就换一个随机空闲端口, 不去探测占用方是谁。
+        preferred_url = url
         host, preferred_port = self._parse_sandbox_host_port(url)
         if startup_mode == "internal":
             port = self._allocate_internal_jiuwenbox_port(host, preferred_port)
@@ -7383,7 +7404,7 @@ class AgentWebSocketServer:
                 url = f"http://{host}:{port}"
                 logger.info(
                     "[command.sandbox] jiuwenbox effective url changed to %s "
-                    "(preferred port %d was busy)",
+                    "(preferred port %d could not be bound)",
                     url,
                     preferred_port,
                 )
@@ -7436,6 +7457,12 @@ class AgentWebSocketServer:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[command.sandbox] persist sandbox endpoint failed: %s", exc)
+
+        if url != preferred_url:
+            from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+
+            # Other channels' agents also hold the old endpoint and cached providers.
+            await JiuWenSwarmDeepAdapter.retarget_sandbox_sys_operations(preferred_url, url)
 
         runtime = update_sandbox_runtime({"enabled": True})
         await self._agent_manager.recreate_agent(channel_id, immediate=True)
@@ -7951,7 +7978,9 @@ class AgentWebSocketServer:
         try:
             try:
                 sock.bind((host, port))
-            except OSError:
+            except OSError as exc:
+                logger.warning("[sandbox.port] cannot bind %s:%d: %s (winerror=%s)",
+                               host, port, exc, getattr(exc, "winerror", None))
                 return False
             return True
         finally:
@@ -7988,7 +8017,7 @@ class AgentWebSocketServer:
             return preferred_port
         new_port = self._pick_free_tcp_port(host)
         logger.warning(
-            "[command.sandbox] preferred port %s:%d is busy; "
+            "[command.sandbox] cannot bind preferred port %s:%d; "
             "allocating fresh port %d for new jiuwenbox instance",
             host,
             preferred_port,

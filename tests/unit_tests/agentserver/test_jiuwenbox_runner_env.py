@@ -13,6 +13,73 @@ from jiuwenswarm.server.sandbox import jiuwenbox_runner as runner_module
 
 
 @pytest.mark.asyncio
+async def test_stop_preserves_pumps_until_process_exit(monkeypatch):
+    runner = runner_module.JiuwenBoxRunner()
+    exited = asyncio.Event()
+    output = []
+
+    async def pump():
+        await exited.wait()
+        output.append("shutdown complete")
+
+    async def wait():
+        assert not runner._stdout_pump_task.cancelled()
+        exited.set()
+        return 0
+
+    runner.process = SimpleNamespace(pid=123, returncode=None, terminate=Mock(), wait=wait)
+    runner.owns_process = True
+    runner._stdout_pump_task = asyncio.create_task(pump())
+    monkeypatch.setattr(runner_module, "sys", SimpleNamespace(platform="linux"))
+    await runner.stop()
+    assert output == ["shutdown complete"]
+    assert runner._stdout_pump_task is None
+
+
+def test_port_bind_failure_preserves_error(monkeypatch):
+    from jiuwenswarm.server.sandbox import port_util
+    error = OSError("permission denied")
+    error.winerror = 10013
+    sock = Mock()
+    sock.bind.side_effect = error
+    monkeypatch.setattr(port_util.socket, "socket", Mock(return_value=sock))
+    warning = Mock()
+    monkeypatch.setattr(port_util.logger, "warning", warning)
+    assert not port_util.is_tcp_port_bindable("127.0.0.1", 8321)
+    assert warning.call_args.args[-1] == 10013
+    assert "cannot bind" in warning.call_args.args[0]
+    sock.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_timeout_kills_before_draining_shutdown_logs(monkeypatch):
+    import ctypes
+
+    runner = runner_module.JiuwenBoxRunner()
+    exited = asyncio.Event()
+    output = []
+
+    async def pump():
+        await exited.wait()
+        output.append("shutdown tail")
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **kw: SimpleNamespace(
+        GenerateConsoleCtrlEvent=lambda *a: False,
+    ), raising=False)
+    proc = SimpleNamespace(pid=123, returncode=None, terminate=Mock(),
+                           wait=AsyncMock(side_effect=[asyncio.TimeoutError(), 0]),
+                           kill=Mock(side_effect=exited.set))
+    runner.process = proc
+    runner.owns_process = True
+    runner._stdout_pump_task = asyncio.create_task(pump())
+    await runner.stop()
+    proc.terminate.assert_called_once()
+    proc.kill.assert_called_once()
+    assert output == ["shutdown tail"]
+    assert runner.process is None
+
+
+@pytest.mark.asyncio
 async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp_path, monkeypatch):
     runner = runner_module.JiuwenBoxRunner()
     policy = tmp_path / "policy.yaml"
@@ -20,6 +87,7 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     monkeypatch.setattr(runner_module, "_cleanup_stale_win_proxy_ports", lambda: None)
     monkeypatch.setattr(runner_module, "_resolve_jiuwenbox_src_dir", lambda: None)
     monkeypatch.setattr(runner, "_register_atexit_once", Mock())
+    monkeypatch.setattr(runner, "_bind_win_job", Mock())
     monkeypatch.setattr(runner, "_wait_until_ready", AsyncMock(return_value=True))
     monkeypatch.setattr(runner, "_pump_stream", AsyncMock())
     monkeypatch.delenv("JIUWENBOX_RUNNER_PYTHON", raising=False)
@@ -59,6 +127,42 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     assert "JIUWENBOX_RUNNER_PYTHON" not in spawn.await_args.kwargs["env"]
     assert "JIUWENBOX_SKILLS_DIR" not in spawn.await_args.kwargs["env"]
     await asyncio.sleep(0)  # Complete mocked stdout/stderr drain tasks.
+
+
+_HARD_KILLED_AGENT = """
+import asyncio, sys
+from jiuwenswarm.server.sandbox.jiuwenbox_runner import JiuwenBoxRunner
+
+async def main():
+    runner = JiuwenBoxRunner()
+    runner.process = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)")
+    runner._bind_win_job()
+    print(runner.process.pid if runner._win_job else "unbound", flush=True)
+    await asyncio.sleep(60)
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object")
+def test_hard_killed_agent_server_takes_box_server_down():
+    import ctypes
+
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    agent = subprocess.Popen([sys.executable, "-c", _HARD_KILLED_AGENT], stdout=subprocess.PIPE, text=True, env=env)
+    try:
+        line = agent.stdout.readline().strip()
+        assert line.isdigit(), line
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        child = kernel32.OpenProcess(0x00100000, False, int(line))  # SYNCHRONIZE
+        assert child
+        agent.kill()
+        assert kernel32.WaitForSingleObject(child, 10000) == 0
+        kernel32.CloseHandle(child)
+    finally:
+        agent.kill()
+        agent.wait()
+        agent.stdout.close()
 
 
 def test_runner_probe_uses_startup_source_path(monkeypatch, tmp_path):

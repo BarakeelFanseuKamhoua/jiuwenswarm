@@ -299,6 +299,9 @@ class JiuwenBoxRunner:
         self.owns_process: bool = False
         # 进程退出兜底: atexit 同步钩子, 即便 stop() 没被走到也尝试终止子进程
         self._atexit_registered: bool = False
+        # Windows: KILL_ON_JOB_CLOSE Job held only by this process, so a hard kill
+        # of agent-server (which skips stop()/atexit) still takes box-server down.
+        self._win_job: Optional[int] = None
         # 持续 drain 的后台任务以及 stderr 滚动缓冲, 便于子进程异常退出时反查原因
         self._stdout_pump_task: Optional[asyncio.Task] = None
         self._stderr_pump_task: Optional[asyncio.Task] = None
@@ -612,6 +615,7 @@ class JiuwenBoxRunner:
                     **spawn_kwargs,
                 )
                 self.owns_process = True
+                self._bind_win_job()
                 self.spawned_policy_path = policy_path
                 self._spawned_policy_fingerprint = new_fp
                 # 同步退出兜底: 即便没走 stop() 也尽可能 terminate 子进程
@@ -627,6 +631,7 @@ class JiuwenBoxRunner:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("[JiuwenBoxRunner] spawn failed: %s", exc)
+                self._release_win_job()
                 self.process = None
                 self.owns_process = False
                 self.spawned_policy_path = None
@@ -706,6 +711,33 @@ class JiuwenBoxRunner:
             await asyncio.sleep(0.1)
         return False
 
+    def _bind_win_job(self) -> None:
+        if sys.platform != "win32" or self.process is None:
+            return
+        try:
+            from jiuwenbox.supervisor import win_job
+
+            job = win_job.create_job()
+            try:
+                win_job.assign_process_by_pid(job, self.process.pid)
+            except Exception:
+                win_job.teardown(job)
+                raise
+            self._win_job = job
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[JiuwenBoxRunner] bind box-server pid=%s to Job failed; "
+                "it may outlive a hard-killed agent-server: %s",
+                self.process.pid, exc,
+            )
+
+    def _release_win_job(self) -> None:
+        job, self._win_job = self._win_job, None
+        if job is not None:
+            from jiuwenbox.supervisor import win_job
+
+            win_job.teardown(job)
+
     def _register_atexit_once(self) -> None:
         if self._atexit_registered:
             return
@@ -781,21 +813,24 @@ class JiuwenBoxRunner:
         被 ``ensure_running`` 复用: 监测到 policy_path 变更, 需要重启子进程以让
         新的 ``JIUWENBOX_POLICY_PATH`` 生效。
         """
-        for task_attr in ("_stdout_pump_task", "_stderr_pump_task"):
-            task = getattr(self, task_attr, None)
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            setattr(self, task_attr, None)
+        try:
+            await self._stop_process_no_lock()
+        finally:
+            # Closing the Job kills members; only do it once box-server has exited
+            # so the CTRL_BREAK lifespan shutdown is never cut short.
+            if self.process is None or self.process.returncode is not None:
+                self._release_win_job()
 
+    async def _stop_process_no_lock(self) -> None:
         proc = self.process
         if proc is None or proc.returncode is not None:
+            await self._drain_log_pumps()
             self.process = None
             self.spawned_policy_path = None
             self._spawned_policy_fingerprint = None
             return
         if not self.owns_process:
+            await self._drain_log_pumps()
             self.process = None
             self.spawned_policy_path = None
             self._spawned_policy_fingerprint = None
@@ -822,6 +857,7 @@ class JiuwenBoxRunner:
                 try:
                     proc.terminate()
                 except ProcessLookupError:
+                    await self._drain_log_pumps()
                     self.process = None
                     self.spawned_policy_path = None
                     self._spawned_policy_fingerprint = None
@@ -830,6 +866,7 @@ class JiuwenBoxRunner:
             try:
                 proc.terminate()
             except ProcessLookupError:
+                await self._drain_log_pumps()
                 self.process = None
                 self.spawned_policy_path = None
                 self._spawned_policy_fingerprint = None
@@ -850,7 +887,20 @@ class JiuwenBoxRunner:
                 await proc.wait()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[JiuwenBoxRunner] kill failed: %s", exc)
+                raise
+        await self._drain_log_pumps()
         self.process = None
         self.owns_process = False
         self.spawned_policy_path = None
         self._spawned_policy_fingerprint = None
+
+    async def _drain_log_pumps(self) -> None:
+        """Keep shutdown output until EOF, with a bounded drain after exit."""
+        tasks = [task for task in (self._stdout_pump_task, self._stderr_pump_task)
+                 if task is not None]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=2.0)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._stdout_pump_task = self._stderr_pump_task = None
