@@ -668,6 +668,8 @@ class ProcessRuntime(RuntimeAdapter):
         # 完全不动这些字典 (文档 6.9: 在 ProcessRuntime 层新增 Windows 分支).
         # runner pipe 句柄 + Job handle + ACL workspace + runner pid/handle.
         self._win_runners: dict[str, dict] = {}
+        self._win_stop_locks: dict[str, asyncio.Lock] = {}
+        self._win_stop_users: dict[str, int] = {}
         self._win_job_handles: dict[str, int] = {}
         self._win_acl_paths: dict[str, list[str]] = {}
         self._win_acl_lock = asyncio.Lock()
@@ -3508,6 +3510,21 @@ class ProcessRuntime(RuntimeAdapter):
             await asyncio.sleep(WIN_RUNNER_READY_PROBE_INTERVAL)
 
     async def _stop_windows(self, sandbox_id: str, timeout: float = 10.0) -> None:
+        lock = self._win_stop_locks.setdefault(sandbox_id, asyncio.Lock())
+        # Count holders and waiters so cleanup cannot replace a lock still in use.
+        self._win_stop_users[sandbox_id] = self._win_stop_users.get(sandbox_id, 0) + 1
+        try:
+            async with lock:
+                await self._stop_windows_unlocked(sandbox_id, timeout)
+        finally:
+            remaining = self._win_stop_users[sandbox_id] - 1
+            if remaining:
+                self._win_stop_users[sandbox_id] = remaining
+            else:
+                self._win_stop_users.pop(sandbox_id)
+                self._win_stop_locks.pop(sandbox_id)
+
+    async def _stop_windows_unlocked(self, sandbox_id: str, timeout: float = 10.0) -> None:
         from jiuwenbox.supervisor import win_acl, win_exec, win_job
 
         cancelled = False

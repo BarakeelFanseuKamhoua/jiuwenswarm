@@ -7459,10 +7459,13 @@ class AgentWebSocketServer:
             logger.warning("[command.sandbox] persist sandbox endpoint failed: %s", exc)
 
         if url != preferred_url:
-            from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+            try:
+                from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
 
-            # Other channels' agents also hold the old endpoint and cached providers.
-            await JiuWenSwarmDeepAdapter.retarget_sandbox_sys_operations(preferred_url, url)
+                # Other channels' agents also hold the old endpoint and cached providers.
+                await JiuWenSwarmDeepAdapter.retarget_sandbox_sys_operations(preferred_url, url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[command.sandbox] retarget sandbox sys_operations failed: %s", exc)
 
         runtime = update_sandbox_runtime({"enabled": True})
         await self._agent_manager.recreate_agent(channel_id, immediate=True)

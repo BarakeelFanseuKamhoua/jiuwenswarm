@@ -195,18 +195,27 @@ async def test_enable_passes_rebuilt_sandbox_env(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("port,started", [(8321, True), (58428, True), (58428, False)])
-async def test_enable_retargets_existing_agents_only_after_successful_port_change(monkeypatch, tmp_path, port, started):
+@pytest.mark.parametrize("port,started,retarget_failure", [
+    (8321, True, False), (58428, True, False), (58428, False, False), (58428, True, True),
+])
+async def test_enable_retargets_existing_agents_only_after_successful_port_change(
+    monkeypatch, tmp_path, port, started, retarget_failure,
+):
     from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
 
     owner = _enable_owner(monkeypatch, tmp_path, AsyncMock(return_value=started))
     owner._allocate_internal_jiuwenbox_port = lambda host, preferred: port
     owner._jiuwenbox_runner.get_stderr_tail = lambda lines: ""
     retarget = AsyncMock(return_value=[])
+    if retarget_failure:
+        retarget.side_effect = RuntimeError("retarget failed")
     monkeypatch.setattr(JiuWenSwarmDeepAdapter, "retarget_sandbox_sys_operations", retarget)
+    warning = Mock()
+    monkeypatch.setattr(server.logger, "warning", warning)
     monkeypatch.setattr(server, "_build_sandbox_env", AsyncMock(return_value={}))
     monkeypatch.setattr(server, "update_sandbox_endpoint", Mock())
-    monkeypatch.setattr(server, "update_sandbox_runtime", Mock(return_value={"enabled": True}))
+    update_runtime = Mock(return_value={"enabled": True})
+    monkeypatch.setattr(server, "update_sandbox_runtime", update_runtime)
     monkeypatch.setattr(server, "resolve_preserve_file_sharing_mode_default", lambda: "direct")
 
     async def recreate(*args, **kwargs):
@@ -217,6 +226,7 @@ async def test_enable_retargets_existing_agents_only_after_successful_port_chang
     if started:
         result = await server.AgentWebSocketServer._handle_sandbox_enable(owner, "channel")
         assert result["endpoint"]["url"] == f"http://127.0.0.1:{port}"
+        update_runtime.assert_called_once_with({"enabled": True})
         owner._agent_manager.recreate_agent.assert_awaited_once_with("channel", immediate=True)
     else:
         with pytest.raises(RuntimeError, match="健康检查失败"):
@@ -224,3 +234,7 @@ async def test_enable_retargets_existing_agents_only_after_successful_port_chang
         owner._agent_manager.recreate_agent.assert_not_awaited()
     if not started or port == 8321:
         retarget.assert_not_awaited()
+    if retarget_failure:
+        warning.assert_called_once()
+        assert "retarget sandbox sys_operations failed" in warning.call_args.args[0]
+        assert str(warning.call_args.args[1]) == "retarget failed"

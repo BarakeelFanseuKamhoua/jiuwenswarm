@@ -245,6 +245,8 @@ async def test_failed_stop_preserves_runner_and_acl_for_retry(monkeypatch):
     runtime = ProcessRuntime.__new__(ProcessRuntime)
     runner = {"pid": 42, "process_handle": 30, "control_port": 123}
     runtime._win_runners = {"sb": runner}
+    runtime._win_stop_locks = {}
+    runtime._win_stop_users = {}
     runtime._win_job_handles = {}
     runtime._win_log_stops = {}
     runtime._win_log_threads = {}
@@ -262,11 +264,15 @@ async def test_failed_stop_preserves_runner_and_acl_for_retry(monkeypatch):
         await runtime._stop_windows("sb")
     assert runtime._win_runners["sb"] is runner
     assert runtime._win_acl_paths["sb"] == ["workspace"]
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
     revoke.assert_not_called()
     await runtime._stop_windows("sb")
     assert not runtime._win_runners
     assert not runtime._win_acl_paths
     revoke.assert_called_once()
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
 
 
 @pytest.mark.asyncio
@@ -278,6 +284,8 @@ async def test_cancelled_stop_finishes_cleanup_before_propagating(monkeypatch):
 
     runtime = ProcessRuntime.__new__(ProcessRuntime)
     runtime._win_runners = {"sb": {"pid": 42, "process_handle": 30, "control_port": 123, "recycle_token": "tok"}}
+    runtime._win_stop_locks = {}
+    runtime._win_stop_users = {}
     runtime._win_job_handles = {"sb": 999}
     runtime._win_log_stops = {}
     runtime._win_log_threads = {}
@@ -310,6 +318,8 @@ async def test_cancelled_stop_finishes_cleanup_before_propagating(monkeypatch):
     revoke.assert_called_once()
     assert not runtime._win_runners
     assert not runtime._win_acl_paths
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
 
 
 @pytest.mark.asyncio
@@ -325,6 +335,135 @@ async def test_lifecycle_entrypoints_reject_deleting_sandbox(action):
         await getattr(manager, action)("sb")
     manager.runtime.create.assert_not_awaited()
     manager.runtime.stop.assert_not_awaited()
+
+
+@pytest.fixture
+def windows_cleanup_runtime(monkeypatch):
+    from jiuwenbox.server.runtime.process import ProcessRuntime
+    from jiuwenbox.supervisor import win_acl, win_recycle_broker
+
+    runtime = ProcessRuntime()
+    monkeypatch.setattr(sys, "platform", "win32")
+    runtime._win_runners["sb-1"] = {"pid": 42, "process_handle": 30, "control_port": 123}
+    runtime._win_job_handles["sb-1"] = 999
+    runtime._win_acl_paths["sb-1"] = ["workspace"]
+    runtime._win_sandbox_sids["sb-1"] = "sid"
+    runtime._send_runner_shutdown = AsyncMock()
+    monkeypatch.setattr(win_exec, "stop_runner", MagicMock())
+    monkeypatch.setattr(win_job, "teardown", MagicMock())
+    monkeypatch.setattr(win_acl, "revoke_sandbox_acl", MagicMock())
+    monkeypatch.setattr(win_recycle_broker, "detach_runner_recycle", MagicMock())
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_delete_and_cleanup_after_create_stop_runner_once(monkeypatch, windows_cleanup_runtime):
+    import threading
+
+    from jiuwenbox.models.sandbox import SandboxSpec
+    from jiuwenbox.server.sandbox_manager import SandboxManager
+
+    runtime = windows_cleanup_runtime
+    create_entered, finish_create = asyncio.Event(), asyncio.Event()
+    stop_entered, finish_stop = threading.Event(), threading.Event()
+
+    async def create(**kwargs):
+        create_entered.set()
+        await finish_create.wait()
+        return 42
+
+    def stop(pid, handle):
+        stop_entered.set()
+        assert finish_stop.wait(5)
+
+    runtime.create = AsyncMock(side_effect=create)
+    stop_mock = MagicMock(side_effect=stop)
+    monkeypatch.setattr(win_exec, "stop_runner", stop_mock)
+    manager = SandboxManager.__new__(SandboxManager)
+    manager._lock = asyncio.Lock()
+    manager._delete_tasks = {}
+    manager._sandboxes, manager._policies = {}, {}
+    manager.runtime = runtime
+    manager.policy_engine, manager.audit = MagicMock(), MagicMock()
+    manager._resolve_effective_policy = MagicMock(return_value=SimpleNamespace(name="test"))
+    manager._save_state, manager._delete_state = MagicMock(), MagicMock()
+    creation = asyncio.create_task(manager.create_sandbox(SandboxSpec(sandbox_id="sb-1")))
+    await create_entered.wait()
+    deletion = asyncio.create_task(manager.delete_sandbox("sb-1"))
+    try:
+        assert await asyncio.to_thread(stop_entered.wait, 5)
+        finish_create.set()
+        await asyncio.sleep(0)
+        assert not creation.done() and not deletion.done()
+        stop_mock.assert_called_once_with(42, 30)
+    finally:
+        finish_create.set()
+        finish_stop.set()
+    await asyncio.wait_for(asyncio.gather(creation, deletion), 5)
+    stop_mock.assert_called_once_with(42, 30)
+    win_job.teardown.assert_called_once_with(999)
+    assert not manager._sandboxes
+    assert not runtime._win_runners
+    assert not runtime._win_acl_paths
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cleanup_waiter_does_not_split_lock(windows_cleanup_runtime):
+    runtime = windows_cleanup_runtime
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def shutdown(*args):
+        entered.set()
+        await release.wait()
+
+    runtime._send_runner_shutdown = AsyncMock(side_effect=shutdown)
+    first = asyncio.create_task(runtime._stop_windows("sb-1"))
+    await entered.wait()
+    second = asyncio.create_task(runtime._stop_windows("sb-1"))
+    await asyncio.sleep(0)
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    third = asyncio.create_task(runtime._stop_windows("sb-1"))
+    try:
+        await asyncio.sleep(0)
+        assert not third.done()
+        runtime._send_runner_shutdown.assert_awaited_once()
+        win_exec.stop_runner.assert_not_called()
+    finally:
+        release.set()
+    await asyncio.wait_for(asyncio.gather(first, third), 5)
+    win_exec.stop_runner.assert_called_once_with(42, 30)
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
+
+
+@pytest.mark.asyncio
+async def test_windows_cleanup_does_not_block_other_sandboxes(windows_cleanup_runtime):
+    runtime = windows_cleanup_runtime
+    runtime._win_runners["sb-2"] = {"pid": 43, "process_handle": 31, "control_port": 124}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def shutdown(sandbox_id, runner):
+        if sandbox_id == "sb-1":
+            entered.set()
+            await release.wait()
+
+    runtime._send_runner_shutdown = AsyncMock(side_effect=shutdown)
+    first = asyncio.create_task(runtime._stop_windows("sb-1"))
+    await entered.wait()
+    try:
+        await asyncio.wait_for(runtime._stop_windows("sb-2"), 5)
+        win_exec.stop_runner.assert_called_once_with(43, 31)
+        assert not first.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(first, 5)
+    assert win_exec.stop_runner.call_count == 2
+    assert not runtime._win_stop_locks
+    assert not runtime._win_stop_users
 
 
 @pytest.mark.asyncio
