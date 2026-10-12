@@ -741,6 +741,7 @@ async def test_bootstrap_allows_later_kickoff_for_same_member_after_task_done(mo
         "member_name": "calculator",
         "leader_agent_id": "leader",
         "leader_direct_addr": "tcp://127.0.0.1:28555",
+        "model_capabilities": {"model_name": "opaque", "model_input": ["image"]},
     }
     await apply_bootstrap_envelope_from_control_plane(
         processed_ids=processed,
@@ -754,6 +755,7 @@ async def test_bootstrap_allows_later_kickoff_for_same_member_after_task_done(mo
     await asyncio.sleep(0)
 
     assert len(kickoff_calls) == 1
+    assert kickoff_calls[0]["assembly_model_capabilities"] == {"model_name": "opaque", "model_input": ["image"]}
     assert card_replace_calls == [{"channel_id": "default", "member_name": "calculator"}]
     assert ("sess_1", "calculator") not in loop_kicked_members
 
@@ -1503,6 +1505,7 @@ async def test_notify_remote_members_trace_context_update_targets_reserved_membe
         team_agent,
         "sid-1",
         request_metadata={
+            "model_capabilities": {"model_name": "opaque", "model_input": ["image"]},
             "jiuwenswarm_trace_header_exporter": "xiaoyi",
             "jiuwenswarm_trace_context": {
                 "version": 1,
@@ -1519,6 +1522,7 @@ async def test_notify_remote_members_trace_context_update_targets_reserved_membe
     assert deliveries[0]["member_name"] == "researcher"
     assert deliveries[0]["timeout_s"] == 2.0
     assert deliveries[0]["envelope"]["session_id"] == "sid-1"
+    assert deliveries[0]["envelope"]["model_capabilities"] == {"model_name": "opaque", "model_input": ["image"]}
     assert deliveries[0]["envelope"]["jiuwenswarm_trace_header_exporter"] == "xiaoyi"
     assert deliveries[0]["envelope"]["jiuwenswarm_trace_context"] == {
         "version": 1,
@@ -1530,6 +1534,7 @@ async def test_notify_remote_members_trace_context_update_targets_reserved_membe
 
 @pytest.mark.asyncio
 async def test_trace_context_update_refreshes_dynamic_member_without_bootstrap(monkeypatch) -> None:
+    from jiuwenswarm.agents.harness.team.team_manager import TeamManager
     pool_entry = SimpleNamespace(metadata={"client": {"custom_headers": {"keep": "yes"}}})
     spec = SimpleNamespace(model_pool=[pool_entry], model_router=None, agents={})
     update_model_pool = MagicMock()
@@ -1541,17 +1546,16 @@ async def test_trace_context_update_refreshes_dynamic_member_without_bootstrap(m
     bootstrap = AsyncMock()
     monkeypatch.setattr(_mod, "_ensure_dynamic_member_execution_loop", bootstrap)
     refreshed_evolution_rails: list[tuple[str, dict[str, str]]] = []
+    manager = TeamManager()
+    manager._refresh_live_evolution_rail_trace = lambda session_id, headers: refreshed_evolution_rails.append((session_id, headers))
     monkeypatch.setattr(
         "jiuwenswarm.agents.harness.team.team_manager.get_team_manager",
-        lambda: SimpleNamespace(
-            _refresh_live_evolution_rail_trace=lambda session_id, headers: (
-                refreshed_evolution_rails.append((session_id, headers))
-            )
-        ),
+        lambda: manager,
     )
 
     applied = await apply_trace_context_update_envelope_from_control_plane(
         envelope={
+            "model_capabilities": {"model_name": "opaque", "model_input": ["image"]},
             "trace_update_id": "trace-1",
             "session_id": "sid-1",
             "member_name": "researcher",
@@ -1567,6 +1571,7 @@ async def test_trace_context_update_refreshes_dynamic_member_without_bootstrap(m
     )
 
     assert applied is True
+    assert manager.get_model_capabilities("sid-1") == {"model_name": "opaque", "model_input": ["image"]}
     assert pool_entry.metadata["client"]["custom_headers"] == {
         "keep": "yes",
         "x-hag-trace-id": "root&20&abc&0",
@@ -1585,3 +1590,83 @@ async def test_trace_context_update_refreshes_dynamic_member_without_bootstrap(m
         )
     ]
     bootstrap.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_capabilities_update_and_clear_without_trace(monkeypatch) -> None:
+    from jiuwenswarm.agents.harness.team.team_manager import TeamManager
+
+    session_id = "sid-capability-only"
+    reservation = SimpleNamespace(service_id="remote-1", endpoint="tcp://127.0.0.1:29111")
+    monkeypatch.setitem(_mod._A2X_RESERVATIONS_BY_SESSION, session_id, [("researcher", reservation, {})])
+    team = SimpleNamespace(
+        spec=SimpleNamespace(team_name="demo-team", leader=SimpleNamespace(member_name="leader")),
+        runtime_context=None,
+        _configurator=SimpleNamespace(ctx=SimpleNamespace(team_spec=object())),
+        update_model_pool=MagicMock(),
+    )
+    monkeypatch.setitem(_mod._DYNAMIC_MEMBER_AGENTS, (session_id, "researcher"), team)
+    manager = TeamManager()
+    monkeypatch.setattr("jiuwenswarm.agents.harness.team.team_manager.get_team_manager", lambda: manager)
+
+    async def deliver(**kwargs):
+        return await apply_trace_context_update_envelope_from_control_plane(
+            envelope=kwargs["envelope"], source_id="capability-only",
+        )
+
+    monkeypatch.setattr(_mod, "_notify_reserved_teammate_control_plane", deliver)
+    declared = {"model_name": "opaque", "model_input": ["image"]}
+    assert await notify_remote_members_trace_context_update(
+        team, session_id, request_metadata={"model_capabilities": declared},
+    ) == 1
+    assert manager.get_model_capabilities(session_id) == declared
+    assert await notify_remote_members_trace_context_update(team, session_id, request_metadata={}) == 1
+    assert manager.get_model_capabilities(session_id) == {}
+    team.update_model_pool.assert_not_called()
+
+
+@pytest.mark.parametrize("current", [None, {}, {"model_name": "opaque", "model_input": ["image"]}])
+def test_bootstrap_capabilities_use_current_session_or_seed(monkeypatch, current):
+    from jiuwenswarm.agents.harness.team.team_manager import TeamManager
+    manager = TeamManager()
+    monkeypatch.setattr("jiuwenswarm.agents.harness.team.team_manager.get_team_manager", lambda *_: manager)
+    if current is not None:
+        manager.update_model_capabilities("bootstrap-capability", {"model_capabilities": current})
+    seed = {"model_name": "opaque", "model_input": ["text"]}
+    team = SimpleNamespace(runtime_context=None, spec=SimpleNamespace(
+        team_name="demo-team", leader=SimpleNamespace(member_name="leader"),
+        build_context_seed={"mode": "code", "request_metadata": {"model_capabilities": seed}},
+    ))
+    envelope = _mod.build_bootstrap_envelope(
+        team, session_id="bootstrap-capability", member_name="researcher", prompt="read image",
+    )
+    assert envelope["model_capabilities"] == (seed if current is None else current)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [None, {}, {
+    "model_name": "opaque", "model_input": ["image"],
+    "model_endpoint": {"api_base": "http://example.invalid/v1", "client_provider": "OpenAI"},
+}])
+async def test_bootstrap_capabilities_reach_member_build_metadata(monkeypatch, declared):
+    agent = SimpleNamespace(ensure_instance=AsyncMock(return_value=object()))
+    agent_manager = SimpleNamespace(get_agent_nowait=lambda _: agent)
+    server = SimpleNamespace(get_agent_manager=lambda: agent_manager)
+    monkeypatch.setattr("jiuwenswarm.server.agent_ws_server.AgentWebSocketServer.get_instance", lambda: server)
+    monkeypatch.setattr(_mod, "_member_status_for_session", AsyncMock(return_value=None))
+    build = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.get_team_manager",
+        lambda *_: SimpleNamespace(get_or_create_team=build),
+    )
+    monkeypatch.setattr(_mod, "_initialize_team_agent_db", AsyncMock())
+    await _mod._ensure_dynamic_member_execution_loop(
+        session_id="bootstrap-capability", target_member="researcher",
+        assembly_mode="code", assembly_model_capabilities=declared,
+    )
+    metadata = build.await_args.kwargs["request_metadata"]
+    assert metadata["mode"] == "code"
+    if declared is None:
+        assert "model_capabilities" not in metadata
+    else:
+        assert metadata["model_capabilities"] == declared

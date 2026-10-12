@@ -587,7 +587,7 @@ def parse_remote_bootstrap_ack_json(content: str) -> dict[str, Any] | None:
     return data
 
 
-def _swarm_assembly_hint(team_agent: Any) -> dict[str, Any]:
+def _swarm_assembly_hint(team_agent: Any, session_id: str = "") -> dict[str, Any]:
     """Extract provider-assembly hints and trace headers from a leader spec.
 
     Reads the serializable ``build_context_seed`` the swarm enrichment leaves on
@@ -613,6 +613,17 @@ def _swarm_assembly_hint(team_agent: Any) -> dict[str, Any]:
         hint["mode"] = mode
     if project_dir:
         hint["project_dir"] = project_dir
+    # A reused team's seed can predate a model switch; an explicit empty
+    # session declaration must also override that seed.
+    capabilities = (request_metadata or {}).get("model_capabilities")
+    if session_id:
+        from jiuwenswarm.agents.harness.team.team_manager import get_team_manager
+
+        current = get_team_manager().get_model_capabilities(session_id)
+        if current is not None:
+            capabilities = current
+    if isinstance(capabilities, dict):
+        hint["model_capabilities"] = dict(capabilities)
     trace_context = (request_metadata or {}).get(TRACE_CONTEXT_METADATA_KEY)
     if isinstance(trace_context, dict):
         hint[TRACE_CONTEXT_METADATA_KEY] = dict(trace_context)
@@ -658,7 +669,7 @@ def build_bootstrap_envelope(
     }
     # Carry provider-assembly hints so the remote teammate rebuilds with the
     # same request mode / project dir (empty dict for the legacy path).
-    envelope.update(_swarm_assembly_hint(team_agent))
+    envelope.update(_swarm_assembly_hint(team_agent, str(session_id or "").strip()))
     return envelope
 
 
@@ -709,10 +720,10 @@ def build_trace_context_update_envelope(
     *,
     session_id: str,
     member_name: str,
-    trace_context: dict[str, Any],
+    trace_context: dict[str, Any] | None,
     trace_header_exporter: str | None = None,
 ) -> dict[str, Any]:
-    """Build a direct event that refreshes one remote member's model trace."""
+    """Build a round update for one remote member; trace may be absent."""
     spec = getattr(team_agent, "spec", None)
     ctx = getattr(team_agent, "runtime_context", None)
     team_spec = getattr(ctx, "team_spec", None) if ctx else None
@@ -736,8 +747,9 @@ def build_trace_context_update_envelope(
             team_name=team_name,
             leader_member_name=str(leader_member_name or ""),
         ),
-        TRACE_CONTEXT_METADATA_KEY: dict(trace_context),
     }
+    if trace_context is not None:
+        envelope[TRACE_CONTEXT_METADATA_KEY] = dict(trace_context)
     if trace_header_exporter:
         envelope[TRACE_HEADER_EXPORTER_METADATA_KEY] = trace_header_exporter
     return envelope
@@ -1180,18 +1192,14 @@ async def notify_remote_members_trace_context_update(
     *,
     request_metadata: dict[str, Any] | None,
 ) -> int:
-    """Refresh TraceContext for active A2X-hosted members in one Team session."""
+    """Refresh trace and image declarations for active A2X-hosted members."""
     payload = (request_metadata or {}).get(TRACE_CONTEXT_METADATA_KEY)
-    if payload is None:
-        return 0
     try:
         trace_context = trace_context_from_dict(payload)
     except ValueError as exc:
         logger.warning("[RemoteMemberBootstrap] ignored invalid remote trace update: %s", exc)
         return 0
     serialized_trace = trace_context_to_dict(trace_context)
-    if serialized_trace is None:
-        return 0
 
     key = str(session_id or "").strip()
     if not key:
@@ -1213,6 +1221,9 @@ async def notify_remote_members_trace_context_update(
             trace_context=serialized_trace,
             trace_header_exporter=exporter_name or None,
         )
+        # The same round update carries native-image declarations; an empty
+        # declaration resets last round's support on an upgraded receiver.
+        envelope["model_capabilities"] = dict((request_metadata or {}).get("model_capabilities") or {})
         notifications.append(
             _notify_reserved_teammate_control_plane(
                 team_agent=team_agent,
@@ -2487,6 +2498,7 @@ async def _ensure_dynamic_member_execution_loop(
     assembly_project_dir: str = "",
     assembly_trace_context: dict[str, Any] | None = None,
     assembly_trace_header_exporter: str | None = None,
+    assembly_model_capabilities: dict[str, Any] | None = None,
 ) -> tuple[bool, bool]:
     """Best-effort bootstrap for teammate runtime loop after dynamic member takeover.
 
@@ -2538,7 +2550,10 @@ async def _ensure_dynamic_member_execution_loop(
 
         team_manager = get_team_manager(channel_id)
         request_metadata: dict[str, Any] | None = None
-        if assembly_mode or assembly_trace_context or assembly_trace_header_exporter:
+        if (
+            assembly_mode or assembly_trace_context or assembly_trace_header_exporter
+            or assembly_model_capabilities is not None
+        ):
             request_metadata = {}
             if assembly_mode:
                 request_metadata["mode"] = assembly_mode
@@ -2548,6 +2563,8 @@ async def _ensure_dynamic_member_execution_loop(
                 request_metadata[TRACE_CONTEXT_METADATA_KEY] = dict(assembly_trace_context)
             if assembly_trace_header_exporter:
                 request_metadata[TRACE_HEADER_EXPORTER_METADATA_KEY] = assembly_trace_header_exporter
+            if assembly_model_capabilities is not None:
+                request_metadata["model_capabilities"] = dict(assembly_model_capabilities)
         leader_team_agent = await team_manager.get_or_create_team(
             sid,
             deep_agent,
@@ -2801,6 +2818,9 @@ async def apply_bootstrap_envelope_from_control_plane(
     assembly_trace_header_exporter = str(
         envelope.get(TRACE_HEADER_EXPORTER_METADATA_KEY) or ""
     ).strip() or None
+    assembly_model_capabilities = envelope.get("model_capabilities")
+    if not isinstance(assembly_model_capabilities, dict):
+        assembly_model_capabilities = None
 
     logger.info(
         "[RemoteMemberBootstrap] teammate received direct bootstrap team=%s session_id=%s "
@@ -2846,6 +2866,7 @@ async def apply_bootstrap_envelope_from_control_plane(
                 assembly_project_dir=assembly_project_dir,
                 assembly_trace_context=assembly_trace_context,
                 assembly_trace_header_exporter=assembly_trace_header_exporter,
+                assembly_model_capabilities=assembly_model_capabilities,
             )
             if kicked:
                 logger.info(
@@ -2901,7 +2922,7 @@ async def apply_trace_context_update_envelope_from_control_plane(
     envelope: dict[str, Any],
     source_id: str,
 ) -> bool:
-    """Apply a new trace to an already-running remote member without bootstrap."""
+    """Apply trace and image declarations to an already-running remote member."""
     if not isinstance(envelope, dict):
         return False
     session_id = str(envelope.get("session_id", "")).strip()
@@ -2920,7 +2941,7 @@ async def apply_trace_context_update_envelope_from_control_plane(
         )
         return False
     serialized_trace = trace_context_to_dict(trace_context)
-    if serialized_trace is None:
+    if serialized_trace is None and "model_capabilities" not in envelope:
         return False
 
     team_agent = _DYNAMIC_MEMBER_AGENTS.get((session_id, member_name))
@@ -2939,6 +2960,10 @@ async def apply_trace_context_update_envelope_from_control_plane(
 
     from jiuwenswarm.agents.harness.team.team_manager import TeamManager, get_team_manager
 
+    manager = get_team_manager()
+    manager.update_model_capabilities(session_id, {"model_capabilities": envelope.get("model_capabilities") or {}})
+    if serialized_trace is None:
+        return True
     trace_headers = TeamManager._apply_trace_context(
         spec,
         request_metadata={
@@ -2951,7 +2976,7 @@ async def apply_trace_context_update_envelope_from_control_plane(
     update_model_pool = getattr(team_agent, "update_model_pool", None)
     if callable(update_model_pool):
         update_model_pool(list(spec.model_pool))
-    get_team_manager()._refresh_live_evolution_rail_trace(session_id, trace_headers)
+    manager._refresh_live_evolution_rail_trace(session_id, trace_headers)
     logger.info(
         "[RemoteMemberBootstrap] applied remote trace update session_id=%s member=%s source_id=%s",
         session_id,

@@ -359,6 +359,7 @@ class TeamManager:
         # distributed teammate bootstrap path. Local leader execution is owned
         # by Runner's TeamRuntimePool instead.
         self._team_agents: dict[str, TeamAgent] = {}
+        self._model_capability_requests: dict[str, dict[str, Any]] = {}
         self._runner_team_agents: dict[str, TeamAgent] = {}
         self._team_monitors: dict[str, TeamMonitorHandler] = {}
         self._stream_tasks: dict[str, asyncio.Task] = {}
@@ -897,6 +898,7 @@ class TeamManager:
 
         apply_mcp_register_failsoft_patch()
 
+        self.update_model_capabilities(session_id, request_metadata)
         config_base = get_config()
         await self._ensure_postgresql_for_leader(config_base)
         spec, has_binding = self._load_session_team_spec(
@@ -1096,8 +1098,6 @@ class TeamManager:
         team_name: str,
         request_metadata: dict[str, Any] | None,
     ) -> Any | None:
-        if not request_metadata or TRACE_CONTEXT_METADATA_KEY not in request_metadata:
-            return
         from openjiuwen.core.runner.runner import GLOBAL_RUNNER
 
         runtime_mgr = _runner_team_runtime_manager(GLOBAL_RUNNER)
@@ -1112,6 +1112,8 @@ class TeamManager:
         spec = getattr(context, "team_spec", None)
         if spec is None:
             return
+        if not request_metadata or TRACE_CONTEXT_METADATA_KEY not in request_metadata:
+            return team_agent
         trace_headers = self._apply_trace_context(spec, request_metadata=request_metadata)
         update_model_pool = getattr(team_agent, "update_model_pool", None)
         if callable(update_model_pool):
@@ -1284,10 +1286,29 @@ class TeamManager:
             list(self._pending_team_names),
         )
 
+    def update_model_capabilities(self, session_id: str, metadata: dict[str, Any] | None) -> None:
+        """Replace this session's declaration; omission clears last round's input."""
+        from jiuwenswarm.common.model_capabilities import normalize_model_input
+
+        raw = (metadata or {}).get("model_capabilities") or {}
+        raw = raw if isinstance(raw, dict) else {}
+        name = str(raw.get("model_name") or "").strip()
+        modes = normalize_model_input(raw.get("model_input"))
+        endpoint = raw.get("model_endpoint")
+        self._model_capability_requests[session_id] = {
+            **({"model_name": name} if name else {}),
+            **({"model_input": list(modes)} if modes else {}),
+            **({"model_endpoint": dict(endpoint)} if isinstance(endpoint, dict) else {}),
+        }
+
+    def get_model_capabilities(self, session_id: str) -> dict[str, Any] | None:
+        return self._model_capability_requests.get(session_id)
+
     def clear_pending_runtime(self, session_id: str) -> None:
         self._pending_team_names.pop(session_id, None)
 
     def clear_active_runtime(self, session_id: str) -> None:
+        self._model_capability_requests.pop(session_id, None)
         removed = self._active_team_names.pop(session_id, None)
         if removed is not None:
             logger.info(
@@ -1516,6 +1537,7 @@ class TeamManager:
         Local leader requests are built and owned by Runner's TeamRuntimePool;
         they must not use this cache.
         """
+        self.update_model_capabilities(session_id, request_metadata)
         config_base = get_config()
         await self._ensure_postgresql_for_leader(config_base)
         logger.info("[TeamManager] building TeamAgentSpec: session_id=%s", session_id)
@@ -1661,6 +1683,7 @@ class TeamManager:
                 )
                 return False, "not_active"
 
+            self.update_model_capabilities(session_id, request_metadata)
             team_agent = await self._refresh_active_team_trace(
                 session_id,
                 team_name,
