@@ -37,8 +37,10 @@ from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import 
     convert_interactions_to_ask_user_questions,
 )
 from jiuwenswarm.agents.harness.common.prompt.user_prompt_builder import (
+    ensure_multimodal_image_window_mutator,
     strip_image_content_from_model_context,
 )
+from jiuwenswarm.common.model_capabilities import ImageCapabilityPolicy
 from jiuwenswarm.agents.harness.common.rails.symphony import (
     SymphonyToolStreamHandler,
 )
@@ -286,9 +288,19 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         # cross-session leakage in concurrent collect→get→clear sequences).
         self._cancelled_tool_results: dict[str, list[dict[str, Any]]] = {}
         self._symphony_stream_handler = SymphonyToolStreamHandler()
+        self._image_capability_policy = ImageCapabilityPolicy()
+
+    def configure_image_capabilities(self, request_source, config_source=None) -> None:
+        self._image_capability_policy.request_source = request_source
+        if config_source is not None:
+            self._image_capability_policy.config_source = config_source
+
+    def _sync_image_capabilities(self) -> bool | None:
+        return self._image_capability_policy.apply(self._deep_agent)
 
     def init(self, agent: Any) -> None:
         self._deep_agent = agent
+        self._sync_image_capabilities()
 
     def _get_prompt_language(self) -> str:
         """Get the current prompt language from the agent's system_prompt_builder."""
@@ -582,6 +594,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
     # ------------------------------------------------------------------
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
+        self._sync_image_capabilities()
         if not isinstance(ctx.inputs, InvokeInputs):
             return
         # Subagents have no session on their before_invoke (ctx.session is None);
@@ -631,13 +644,17 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
     # ------------------------------------------------------------------
 
     async def before_model_call(self, ctx: AgentCallbackContext) -> None:
+        declared = self._sync_image_capabilities()
         sid = self._resolve_sid(ctx, ctx.session)
         await self._get_pause_event(sid).wait()
         if self._abort_requested.get(sid, False):
             raise asyncio.CancelledError("Agent abort requested")
 
         if ctx.context is not None:
+            if declared is True:
+                ensure_multimodal_image_window_mutator(ctx.context)
             if not self._read_image_multimodal_enabled():
+                ensure_multimodal_image_window_mutator(ctx.context, [])
                 strip_image_content_from_model_context(ctx.context)
             await self._fix_incomplete_tool_context(ctx)
 
@@ -649,6 +666,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         )
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
+        self._sync_image_capabilities()
         sid = self._resolve_sid(ctx, ctx.session)
         await self._get_pause_event(sid).wait()
         if self._abort_requested.get(sid, False):

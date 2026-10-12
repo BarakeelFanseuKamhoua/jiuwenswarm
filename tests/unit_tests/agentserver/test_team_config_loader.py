@@ -93,6 +93,151 @@ def test_load_team_spec_dict_reads_models_defaults_from_repository_config(monkey
     assert model["model_request_config"]["model"] == "gpt-template"
 
 
+def _two_entry_models_config() -> dict:
+    return {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://first.example.test/v1",
+                        "api_key": "sk-first",
+                        "model_name": "first-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.1},
+                    "is_default": True,
+                },
+                {
+                    "model_client_config": {
+                        "api_base": "https://second.example.test/v1",
+                        "api_key": "sk-second",
+                        "model_name": "second-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.9},
+                },
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {"leader": {}, "teammate": {}},
+                }
+            }
+        ),
+    }
+
+
+def test_load_team_spec_dict_requested_model_hit_selects_matching_entry():
+    """页面选择命中 models.defaults 条目时，整团（leader+teammate）用匹配条目。"""
+    spec = load_team_spec_dict(
+        config_base=_two_entry_models_config(),
+        requested_model_name="second-model",
+    )
+
+    for role in ("leader", "teammate"):
+        model = spec["agents"][role]["model"]
+        assert model["model_client_config"]["model_name"] == "second-model"
+        assert model["model_client_config"]["api_key"] == "sk-second"
+        assert model["model_request_config"]["model"] == "second-model"
+
+
+def test_load_team_spec_dict_requested_model_miss_overrides_first_entry(monkeypatch):
+    """页面选择未命中 models.defaults 时，不再静默回退首条目
+    模型名——以首条目为底覆盖 model_name（凭证复用），对齐单 agent
+    model_name_override 语义。"""
+    from unittest.mock import MagicMock
+
+    # 可观测性断言用 spy 替换模块 logger（caplog 在本仓日志体系下收不到记录）
+    spy = MagicMock()
+    monkeypatch.setattr("jiuwenswarm.agents.harness.team.config_loader.logger", spy)
+    spec = load_team_spec_dict(
+        config_base=_two_entry_models_config(),
+        requested_model_name="page-selected-model",
+    )
+
+    for role in ("leader", "teammate"):
+        model = spec["agents"][role]["model"]
+        assert model["model_client_config"]["model_name"] == "page-selected-model"
+        # 凭证复用首条目
+        assert model["model_client_config"]["api_base"] == "https://first.example.test/v1"
+        assert model["model_client_config"]["api_key"] == "sk-first"
+        assert model["model_client_config"]["client_provider"] == "OpenAI"
+        assert model["model_request_config"]["model"] == "page-selected-model"
+        assert model["model_request_config"]["temperature"] == 0.1
+    # 覆盖动作必须可观测（info 日志含 requested 与命中失败说明）
+    logged = [c.args[0] % c.args[1:] if len(c.args) > 1 else c.args[0] for c in spy.info.call_args_list if c.args]
+    assert any("page-selected-model" in m and "not in models.defaults" in m for m in logged)
+
+
+def test_load_team_spec_dict_requested_model_miss_overrides_legacy_default():
+    """models.default 旧格式同样适用覆盖语义。"""
+    config = {
+        "models": {
+            "default": {
+                "model_client_config": {
+                    "api_base": "https://legacy.example.test/v1",
+                    "api_key": "sk-legacy",
+                    "model_name": "legacy-model",
+                    "client_provider": "openai",
+                },
+                "model_config_obj": {},
+            }
+        },
+        **_wrap_modes_team({"demo_team": {"team_name": "demo_team", "agents": {"leader": {}}}}),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="page-model")
+
+    model = spec["agents"]["leader"]["model"]
+    assert model["model_client_config"]["model_name"] == "page-model"
+    assert model["model_client_config"]["api_key"] == "sk-legacy"
+    assert model["model_request_config"]["model"] == "page-model"
+
+
+def test_load_team_spec_dict_requested_model_equal_to_default_is_noop():
+    """页面选择恰等于默认条目时走命中/恒等路径，不产生覆盖。"""
+    spec = load_team_spec_dict(
+        config_base=_two_entry_models_config(),
+        requested_model_name="first-model",
+    )
+
+    model = spec["agents"]["leader"]["model"]
+    assert model["model_client_config"]["model_name"] == "first-model"
+    assert model["model_client_config"]["api_key"] == "sk-first"
+
+
+def test_load_team_spec_dict_requested_model_blank_keeps_first_entry():
+    """空白 requested_model_name 不触发覆盖，保持首条目回退（现状行为）。"""
+    spec = load_team_spec_dict(
+        config_base=_two_entry_models_config(),
+        requested_model_name="   ",
+    )
+
+    model = spec["agents"]["leader"]["model"]
+    assert model["model_client_config"]["model_name"] == "first-model"
+
+
+def test_load_team_spec_dict_requested_model_does_not_override_explicit_member_model():
+    """成员 manifest 显式配置的 model 不受页面选择影响（setdefault 不覆盖）。"""
+    config = _two_entry_models_config()
+    config["modes"]["team"]["demo_team"]["agents"]["teammate"]["model"] = {
+        "model_client_config": {
+            "api_base": "https://member.example.test/v1",
+            "api_key": "sk-member",
+            "model_name": "member-pinned-model",
+            "client_provider": "OpenAI",
+        },
+        "model_config_obj": {},
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="page-model")
+
+    assert spec["agents"]["teammate"]["model"]["model_client_config"]["model_name"] == "member-pinned-model"
+    assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "page-model"
+
+
 def test_load_team_spec_dict_uses_first_models_defaults_entry_for_team(monkeypatch):
     """Team config loading should use the first models.defaults entry."""
     config = {

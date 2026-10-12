@@ -451,12 +451,18 @@ class RuntimePromptRail(DeepAgentRail):
         ).strip()
         channel = (runtime_state.get("channel") or self._channel or "unknown").strip()
 
+        image_support = getattr(self._agent, "_jiuwenswarm_model_image_support", None)
+        if not isinstance(image_support, bool):
+            deep_config = getattr(self._agent, "deep_config", None) or getattr(self._agent, "_deep_config", None)
+            image_support = bool(getattr(deep_config, "enable_read_image_multimodal", False))
+        multimodal = str(image_support).lower()
         if not self._force_english and self._language == "cn":
             mode_display = _mode_display_name(mode, "cn")
             mode_line = f"- 当前模式：{mode_display}\n" if include_mode else ""
             runtime_content = (
                 "# 运行时状态\n\n"
                 f"- 当前模型：{model}\n"
+                f"- 支持多模态：{multimodal}\n"
                 f"- 可用模型：{available_models_str}\n"
                 f"{mode_line}"
                 f"- 当前语言：{language_val}\n"
@@ -468,6 +474,7 @@ class RuntimePromptRail(DeepAgentRail):
             runtime_content = (
                 "# Runtime State\n\n"
                 f"- Current model: {model}\n"
+                f"- Supports multimodal: {multimodal}\n"
                 f"- Available models: {available_models_str}\n"
                 f"{mode_line}"
                 f"- Current language: {language_val}\n"

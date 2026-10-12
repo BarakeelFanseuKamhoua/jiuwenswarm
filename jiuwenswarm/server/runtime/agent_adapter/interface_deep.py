@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, List, Optional, 
 if TYPE_CHECKING:
     from openjiuwen.harness.schema.config import SubAgentConfig
     from openjiuwen.harness.schema.interaction import InteractionOutputStream
+    from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
     from jiuwenswarm.server.runtime.agent_config_service import AgentDefinition
 
 import yaml
@@ -133,7 +134,6 @@ from jiuwenswarm.agents.harness.common.browser_defaults import (
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
 )
 from jiuwenswarm.agents.harness.common.tools.cron.cron_runtime import CronRuntimeBridge
-from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     SKILL_EVOLUTION_APPROVAL_SCHEMA,
     apply_permission_trusted_dirs,
@@ -166,6 +166,7 @@ from jiuwenswarm.server.invocation_context_builder import build_invocation_conte
 from jiuwenswarm.agents.harness.common.rails.execution_guard import (
     CircuitBreakerRail,
     CircuitBreakerConfig,
+    ModelResponseGuardRail,
 )
 from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.agents.harness.common.rails.cspl import CsplConfig, CsplSentinelRail
@@ -199,6 +200,7 @@ from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
 )
 from jiuwenswarm.agents.harness.common.memory.workspace import configure_workspace_memory  # noqa: E402
 from jiuwenswarm.common.model_config_validation import is_placeholder_api_base
+from jiuwenswarm.common.model_capabilities import ImageCapabilityPolicy, model_identity, resolve_image_support  # noqa: E402
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import TOOL_PERMISSION_CHANNEL_ID
 from jiuwenswarm.agents.harness.common.channel_runtime_context import (
     CURRENT_CHANNEL_ID,
@@ -260,7 +262,6 @@ from jiuwenswarm.agents.harness.common.tools.multimodal_config import (
     complete_multimodal_model_configured,
 )
 from jiuwenswarm.agents.harness.common.tools.video_tools import video_understanding
-from jiuwenswarm.agents.harness.common.tools.image_tools import generate_image
 
 from jiuwenswarm.agents.harness.common.tools import (
     SendFileToolkit,
@@ -388,6 +389,12 @@ _CRON_TOOL_BOUND: ContextVar[bool] = ContextVar(
 
 
 _HIDDEN_RUNTIME_TOOLS = frozenset({"video_understanding", "acp_chat"})
+
+
+def _load_generate_image():
+    """生图依赖（fastmcp、google.genai）留到真正注册工具时再导入。"""
+    from jiuwenswarm.agents.harness.common.tools.image_tools import generate_image
+    return generate_image
 
 
 def _runtime_tool_is_disabled(tool_name: str) -> bool:
@@ -1278,6 +1285,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # 延时重索引任务（debounce）：连续改多次 embedding 只在最后一次后跑一次。
         self._memory_reindex_task: asyncio.Task | None = None
         self._llm_retry_rail: LLMRetryRail | None = None
+        self._model_response_guard_rail: ModelResponseGuardRail | None = None
         self._heartbeat_rail: HeartbeatRail | None = None
         self._skill_evolution_rail: SkillEvolutionRail | None = None
         self._evolution_interrupt_rail: EvolutionInterruptRail | None = None
@@ -3342,11 +3350,22 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             warn_label="video tool",
         )
 
+        if self._image_gen_model_config or self._image_gen_tool_registered:
+            image_tool = _load_generate_image()
+            image_tools = mark_stateless([image_tool])
+
+            def image_create_fn(tool: Any = image_tool) -> list[Any]:
+                return mark_stateless([tool])
+        else:
+            image_tools = []
+
+            def image_create_fn() -> list[Any]:
+                return []
         _, self._image_gen_tool_registered = self._sync_tool_group(
-            current_tools=mark_stateless([generate_image]),
+            current_tools=image_tools,
             registered=self._image_gen_tool_registered,
             enabled=bool(self._image_gen_model_config),
-            create_fn=lambda: mark_stateless([generate_image]),
+            create_fn=image_create_fn,
             warn_label="generate_image tool",
         )
 
@@ -3866,6 +3885,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         return None
 
     def _native_image_input_enabled(self, config: dict[str, Any], model: Any | None) -> bool:
+        declared = resolve_image_support(model, getattr(self, "_image_capability_request", None), get_config())
+        if declared is not None:
+            return declared and config.get("enable_read_image_multimodal") is not False
         model_config = getattr(model, "model_config", None)
         model_name = str(getattr(model_config, "model_name", "") or "").strip()
         support = self._native_image_support_from_model_name(model_name)
@@ -3902,7 +3924,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         model: Model,
         *,
         model_name_override: str | None = None,
-    ) -> None:
+        request: AgentRequest | None = None,
+    ) -> Model:
         """将当前请求的有效模型同步到主执行器和子代理继承配置。
 
         react_agent._railed_model_call 使用 self._config.model_name 作为 model= 参数，
@@ -3914,7 +3937,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         """
         react_agent = getattr(self._instance, "_react_agent", None)
         if react_agent is None:
-            return
+            return model
         override = (model_name_override or "").strip() or None
         base_name = getattr(model.model_config, "model_name", None)
         effective_name = override or base_name
@@ -3938,12 +3961,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             config.model_client_config = model.model_client_config
             config.model_config_obj = request_config
         self._model_request_config = request_config
+        params = getattr(request, "params", None) or {}
+        _, api_base, provider = model_identity(model)
+        self._image_capability_request = {
+            "model_name": effective_name,
+            "model_input": params.get("model_input"),
+            "model_endpoint": {"api_base": api_base, "client_provider": provider},
+        }
+        if request is not None and isinstance(request.params, dict):
+            # Bind declarations server-side before team assembly; a same-named
+            # model at another endpoint must not inherit the request's capability.
+            request.params["_resolved_model_input"] = dict(self._image_capability_request)
+        rail = getattr(self, "_stream_event_rail", None)
+        if rail is not None:
+            rail.configure_image_capabilities(lambda: self._image_capability_request, get_config)
+            rail._sync_image_capabilities()
         if override:
             logger.info(
                 "[JiuWenSwarmDeepAdapter] model_name override=%s (base=%s)",
                 override,
                 base_name,
             )
+        return model
 
     @staticmethod
     def _resolve_skill_mode(config: dict[str, Any]) -> str:
@@ -4156,11 +4195,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         )
         if not enabled:
             return
-        # The frozen desktop executable moves the on-disk ``jiuwenbox`` data
-        # directory to ``jiuwenbox_legacy_overlay`` before agents start, so the
-        # generic agent-core resolver cannot infer the DLL location from the
-        # package module alone.  Publish JiuwenBox's layout-aware resolution
-        # without overriding an explicitly configured DLL path.
+        # 冻结包把 DLL 放在 jiuwenbox_native, 不放在 jiuwenbox 目录里。
+        # agent-core 只按包路径找, 找不到这一份, 所以先把实际路径写进环境变量。
+        # 已经配过的路径不覆盖。
         from jiuwenbox.supervisor.win_softdelete import dll_path as jiuwenbox_soft_delete_dll_path
 
         os.environ.setdefault(
@@ -5170,6 +5207,29 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             logger.warning("[JiuWenSwarmDeepAdapter] CircuitBreakerRail create failed: %s", exc)
             return None
 
+    def _build_model_response_guard_rail(self) -> ModelResponseGuardRail | None:
+        """模型响应语义守卫：流不完整（缺 finish_reason）/ 空产出 → MODEL_CALL_FAILED.
+
+        对应 JiuwenTest 缺陷守护用例 mf_002（SSE 中途断连）/ mf_006（空响应）：
+        两类异常原本会被当作正常完成（终止帧 succeeded + 0 chat.error）。
+        默认启用，execution_guard.model_response_guard.enabled=false 可关闭。
+        """
+        try:
+            guard_cfg = (get_config() or {}).get("execution_guard") or {}
+            mr_cfg = guard_cfg.get("model_response_guard") or {}
+            if mr_cfg.get("enabled", True) is not True:
+                logger.info("[JiuWenSwarmDeepAdapter] ModelResponseGuardRail disabled by config")
+                return None
+            rail = ModelResponseGuardRail(
+                check_incomplete_stream=mr_cfg.get("check_incomplete_stream", True),
+                check_empty_response=mr_cfg.get("check_empty_response", True),
+            )
+            logger.info("[JiuWenSwarmDeepAdapter] ModelResponseGuardRail create success")
+            return rail
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] ModelResponseGuardRail create failed: %s", exc)
+            return None
+
     def _build_cspl_sentinel_rail(self) -> CsplSentinelRail | None:
         from jiuwenswarm.common.behavior_security import BehaviorSecurityBridge, desktop_security_active
         if desktop_security_active():
@@ -5472,6 +5532,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 self._build_llm_retry_rail,
                 {"config_base": config_base},
             ),
+            _RailBuildInfo(
+                "_model_response_guard_rail",
+                self._build_model_response_guard_rail,
+            ),
             _RailBuildInfo("_circuit_breaker_rail", self._build_circuit_breaker_rail),
             _RailBuildInfo("_cspl_sentinel_rail", self._build_cspl_sentinel_rail),
             _RailBuildInfo(
@@ -5670,7 +5734,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
     def _update_permission_rail(self, config_base: dict[str, Any] | None) -> None:
         """原地更新已有 PermissionRail 配置，或在首次启用时新建。"""
-        permission_config = config_base.get("permissions", {}) if config_base else {}
+        from jiuwenswarm.common.behavior_security import runtime_permission_config
+
+        config_base = config_base or {}
+        permission_config = runtime_permission_config(config_base)
         if self._permission_rail is not None:
             self._permission_rail.update_config(permission_config)
             logger.info("[JiuWenSwarmDeepAdapter] _permission_rail config hot-updated")
@@ -5885,6 +5952,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._image_gen_tool_registered = False
         if self._image_gen_model_config:
             try:
+                generate_image = _load_generate_image()
                 self._register_shared_tool(generate_image)
                 tool_cards.append(generate_image.card)
                 self._image_gen_tool_registered = True
@@ -10098,9 +10166,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         token_sid = CURRENT_SESSION_ID.set((request.session_id or "").strip())
         token_perm = setup_permission_context(request)
         resolved_model = self._resolve_model_for_request(request)
-        self._apply_model_to_react_agent(
+        resolved_model = self._apply_model_to_react_agent(
             resolved_model,
             model_name_override=self._request_model_name_override(request),
+            request=request,
         )
         self._mark_session_active(session_id)
         self._register_session_agent_task(session_id)
@@ -10451,9 +10520,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         if _is_team_canonical(mode):
             from jiuwenswarm.server.runtime.agent_adapter.team_helpers import process_team_message_stream
             resolved_model = self._resolve_model_for_request(request)
-            self._apply_model_to_react_agent(
+            resolved_model = self._apply_model_to_react_agent(
                 resolved_model,
                 model_name_override=self._request_model_name_override(request),
+                request=request,
             )
             inputs = self._prepare_multimodal_image_inputs(request, inputs)
             enable_read_image_multimodal = self._native_image_input_enabled(
@@ -10488,6 +10558,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # Auto-Harness 模式处理
         if mode == "auto_harness":
             if self._auto_harness_service is None:
+                from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
                 self._auto_harness_service = AutoHarnessService(
                     self._stream_event_rail,
                     agent=self._instance,
@@ -10725,9 +10796,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         token_perm = setup_permission_context(request)
         # 按请求选择模型
         resolved_model = self._resolve_model_for_request(request)
-        self._apply_model_to_react_agent(
+        resolved_model = self._apply_model_to_react_agent(
             resolved_model,
             model_name_override=self._request_model_name_override(request),
+            request=request,
         )
         self._mark_session_active(session_id)
         self._register_session_agent_task(session_id)
@@ -13611,6 +13683,34 @@ def _jws_install_subagent_runtime_patch() -> None:
 
     def _create_subagent_with_runtime_defaults(self, subagent_type, subsession_id, *args, **kwargs):
         sub = _orig_create_subagent(self, subagent_type, subsession_id, *args, **kwargs)
+        # Core may reuse the parent's rail objects. Detach their Agent binding and
+        # native-image policy state; pause/stream bookkeeping keeps its existing semantics.
+        parent_rails = self.configured_rails()
+        image_rails = sub.find_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail))
+        shared = [rail for rail in image_rails if rail in parent_rails]
+        if shared:
+            sub.strip_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail))
+            for rail in image_rails:
+                detached = rail
+                if rail in shared:
+                    detached = copy.copy(rail)
+                    policy = detached._image_capability_policy
+                    if policy is not None:
+                        detached._image_capability_policy = ImageCapabilityPolicy(policy.request_source, policy.config_source)
+                    detached._deep_agent = None
+                sub.add_rail(detached)
+        if not sub.find_rails_by_type((JiuSwarmStreamEventRail,)):
+            parents = self.find_rails_by_type((JiuSwarmStreamEventRail,))
+            if parents:
+                policy = parents[0]._image_capability_policy
+                rail = MultimodalImageRail()
+                rail.configure_image_capabilities(policy.request_source, policy.config_source)
+                sub.add_rail(rail)
+        for rail in sub.find_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail)):
+            policy = rail._image_capability_policy
+            if policy is not None:
+                # Resolve known declarations before Core's lazy probe/registration.
+                policy.apply(sub)
         # A configured DeepAgent instance may be reused across task calls.
         if not sub.find_rails_by_type((_SubagentStreamingRail,)):
             sub.add_rail(_SubagentStreamingRail())
