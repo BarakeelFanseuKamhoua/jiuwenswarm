@@ -7,7 +7,6 @@ from openjiuwen.core.single_agent.interrupt import InterruptRequest
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.rails.interrupt.confirm_rail import ConfirmPayload
 from openjiuwen.harness.rails.interrupt.interrupt_base import BaseInterruptRail
-from openjiuwen.harness.security import PermissionLevel, PermissionResult
 
 from jiuwenswarm.common.behavior_security import ACTIVE_BEHAVIOR, _event_id, raw_event
 
@@ -51,11 +50,8 @@ class BehaviorSecurityRail(DeepAgentRail):
         if local is not None:
             ctx.extra["behavior.local_permission"] = local
         ctx.extra["behavior.context_token"] = ACTIVE_BEHAVIOR.set((self.bridge, ctx, asyncio.get_running_loop()))
-        if not self.bridge.config.get("permissions", {}).get("enabled", False):
-            # The existing permission switch does not disable telemetry.
-            local = PermissionResult(PermissionLevel.ALLOW, reason="permission_checks_disabled")
-            ctx.extra["behavior.local_permission"] = local
-            await self.bridge.decide(raw_event(ctx, "tool.before"), local)
+        # Desktop full-access mode still uses PermissionInterruptRail. Its
+        # evaluated result drives report/authorize; never synthesize an ALLOW.
 
     async def after_tool_call(self, ctx):
         ctx.extra["behavior.finished"] = True

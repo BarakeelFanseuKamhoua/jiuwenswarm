@@ -284,6 +284,8 @@ async def test_skillnet_worker_stops_before_force_replace(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('permission_enabled', [False, True])
+@pytest.mark.parametrize('cloud_reply', ['allow', 'deny', 'clarify', 'unavailable'])
 @pytest.mark.parametrize('enabled,default,explicit,expected,mode,matched', [
     (False, 'allow', None, 'allow', 'report', 'tiered_policy:defaults.*'),
     (False, 'deny', None, 'deny', 'report', 'tiered_policy:defaults.*'),
@@ -294,34 +296,41 @@ async def test_skillnet_worker_stops_before_force_replace(tmp_path, monkeypatch,
     (False, 'deny', 'allow', 'allow', 'report', 'tools.install_skill'),
     (True, 'allow', None, 'deny', 'authorize', 'tiered_policy:unmatched'),
     (True, 'allow', 'ask', 'ask', 'report', 'tools.install_skill'),
+    (True, 'allow', 'deny', 'deny', 'report', 'tools.install_skill'),
     (True, 'deny', 'allow', 'allow', 'report', 'tools.install_skill'),
 ])
 async def test_permission_factory_uses_defaults_only_when_cloud_is_off(
-        monkeypatch, enabled, default, explicit, expected, mode, matched):
+        monkeypatch, permission_enabled, cloud_reply, enabled, default, explicit, expected, mode, matched):
     from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
     from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_CHANNEL_ID
     from openjiuwen.harness.rails.interrupt.interrupt_base import InterruptResult, RejectResult
     monkeypatch.setenv('CLAW_BEHAVIOR_SECURITY', '1')
     monkeypatch.setenv('CLAW_SKILL_TOKEN', 'test-token')
-    cfg = {'enabled': True, 'schema': 'tiered_policy', 'package_builtin_rules': False,
+    cfg = {'enabled': permission_enabled, 'schema': 'tiered_policy', 'package_builtin_rules': False,
            'defaults': {} if default is None else {'*': default},
            'tools': {} if explicit is None else {'install_skill': explicit}}
     monkeypatch.setattr(
         'jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist.get_permissions_with_session_overlay',
         lambda **_: cfg.copy(),
     )
-    b, events = bridge(enabled=enabled, decision='deny')
+    b, events = bridge(enabled=enabled, decision=cloud_reply)
     b.config['permissions'] = cfg
     ctx = context()
     rail = BehaviorSecurityRail(b)
     await rail.before_tool_call(ctx)
+    assert 'behavior.local_permission' not in ctx.extra
+    assert not events
     channel = CURRENT_CHANNEL_ID.set('desktop')
     try:
         permission = build_permission_rail(b.config)
         assert permission is not None
         # The refreshed snapshot must preserve the switch as well as the initial config.
         assert permission._host.get_permissions_snapshot()['defer_unmatched'] is enabled
+        assert permission._host.get_permissions_snapshot()['enabled'] is True
+        assert cfg['enabled'] is permission_enabled
         result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
+        if mode == 'authorize':
+            expected = {'allow': 'allow', 'deny': 'deny', 'clarify': 'allow', 'unavailable': 'ask'}[cloud_reply]
         assert isinstance(result, {'allow': ApproveResult, 'deny': RejectResult, 'ask': InterruptResult}[expected])
         assert ctx.extra['behavior.local_permission'].matched_rule == matched
         await asyncio.gather(*b.tasks)
@@ -330,3 +339,28 @@ async def test_permission_factory_uses_defaults_only_when_cloud_is_off(
         CURRENT_CHANNEL_ID.reset(channel)
         await rail.after_tool_call(ctx)
         await b.close()
+
+
+def test_full_access_outside_desktop_keeps_existing_behavior(monkeypatch):
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
+    monkeypatch.delenv('CLAW_BEHAVIOR_SECURITY', raising=False)
+    assert build_permission_rail({'permissions': {'enabled': False}}) is None
+
+
+def test_full_access_hot_reload_keeps_permission_checks(monkeypatch):
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+    monkeypatch.setenv('CLAW_BEHAVIOR_SECURITY', '1')
+    monkeypatch.setenv('CLAW_SKILL_TOKEN', 'test-token')
+    config = {'permissions': {'enabled': False, 'package_builtin_rules': False},
+              'xiaoyi_work_security': {'cloud_authorization': {'enabled': True}}}
+    adapter = SimpleNamespace(_permission_rail=None, _model=None)
+    JiuWenSwarmDeepAdapter._update_permission_rail(adapter, config)
+    permission = adapter._permission_rail
+    assert permission is not None
+    for enabled in (False, True, False):
+        config['permissions']['enabled'] = enabled
+        JiuWenSwarmDeepAdapter._update_permission_rail(adapter, config)
+        assert adapter._permission_rail is permission
+        assert permission._engine.config['enabled'] is True
+        assert permission._engine.config['defer_unmatched'] is True
+        assert config['permissions']['enabled'] is enabled

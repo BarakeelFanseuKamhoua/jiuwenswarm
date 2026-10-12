@@ -967,7 +967,7 @@ channels:
 # 明确 allow/deny/ask 仅异步上报；未匹配时，开启则等待云端授权，关闭则沿用 permissions.defaults。
 xiaoyi_work_security:
   cloud_authorization:
-    enabled: false
+    enabled: true
     timeout_ms: 4000
 
 permissions:
