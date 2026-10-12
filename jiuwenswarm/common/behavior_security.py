@@ -33,6 +33,19 @@ def cloud_authorization_enabled(config: dict) -> bool:
     return config.get("xiaoyi_work_security", {}).get("cloud_authorization", {}).get("enabled") is True
 
 
+def runtime_permission_config(config: dict) -> dict:
+    """Keep desktop policy checks active even in the full-access UI mode.
+
+    Only the runtime copy is changed; the stored permission mode and other
+    hosts retain their existing semantics.
+    """
+    permissions = copy.deepcopy(config.get("permissions", {}))
+    if desktop_security_active():
+        permissions["enabled"] = True
+        permissions["defer_unmatched"] = cloud_authorization_enabled(config)
+    return permissions
+
+
 def _session_id(ctx: Any) -> str:
     session = getattr(ctx, "session", None)
     getter = getattr(session, "get_session_id", None)
