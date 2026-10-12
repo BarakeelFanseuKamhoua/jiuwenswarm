@@ -8228,8 +8228,10 @@ class JiuWenSwarmDeepAdapter:
         """
         try:
             from openjiuwen.harness.rails.skills.skill_authorization_rail import (
-                SkillAuthorizationRail,
                 build_skill_registry_resolver,
+            )
+            from jiuwenswarm.agents.harness.common.rails.skill_authorization_rail import (
+                SkillAuthorizationRail,
             )
             from jiuwenswarm.common.utils import get_builtin_skills_dir
 
@@ -8301,6 +8303,7 @@ class JiuWenSwarmDeepAdapter:
                     and TOOL_PERMISSION_CONTEXT.get().scene == "group_digital_avatar"
                 ),
             )
+            self._bind_skill_permission_scope_resolver(permission_rail, rail)
             logger.info("[JiuWenSwarmDeepAdapter] SkillAuthorizationRail create success")
             return rail
         except Exception as exc:
@@ -8308,6 +8311,25 @@ class JiuWenSwarmDeepAdapter:
                 "[JiuWenSwarmDeepAdapter] SkillAuthorizationRail create failed: %s", exc
             )
             return None
+
+    def _bind_skill_permission_scope_resolver(self, permission_rail, skill_rail) -> None:
+        if permission_rail is None or skill_rail is None:
+            return
+        setter = getattr(permission_rail, "set_skill_scope_resolver", None)
+        if not callable(setter):
+            return
+
+        def resolve_scope(ctx):
+            # 权限 Rail 会被子 Agent 按引用继承；仅对所属 Agent 补齐缺失上下文，
+            # 子 Agent 保留自己的授权链，不能回落到主 Agent 的作用域。
+            owner = getattr(self, "_instance", None)
+            if ctx.agent is None or owner is None:
+                return None
+            if ctx.agent is not owner and ctx.agent is not getattr(owner, "react_agent", None):
+                return None
+            return skill_rail.resolve_scope(ctx)
+
+        setter(resolve_scope)
 
     def _skill_rail_session_id(self) -> str | None:
         """Session id bound into skill rails for session-scoped adapters.
@@ -10437,6 +10459,9 @@ class JiuWenSwarmDeepAdapter:
                         self._skill_authorization_rail,
                         "_engine",
                         getattr(self._permission_rail, "_engine", None),
+                    )
+                    self._bind_skill_permission_scope_resolver(
+                        self._permission_rail, self._skill_authorization_rail
                     )
 
     def _resolve_permission_config_for_agent(
