@@ -1,10 +1,10 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""No-factory class-rail declarations for swarm-owned team rails.
+"""Swarm-owned team rail declarations.
 
-These rails take no construction params (a bare ``cls()``), so they are declared
-with a class ``builder`` rather than a factory function. Only swarm-owned rail
-classes live here; the generic openjiuwen rails (``sys_operation`` /
+Most rails take no construction params and use a class ``builder``. The stream
+rail uses a factory to bind current session model capabilities. Only swarm-owned
+rails live here; the generic openjiuwen rails (``sys_operation`` /
 ``task_planning`` / ``security`` / ``heartbeat`` / ...) are declared and
 registered by openjiuwen itself and referenced by their bare names from
 ``config_specs``.
@@ -64,12 +64,29 @@ def _build_response_prompt_rail(
     return rail
 
 
-harness_element(
+@harness_element(
     kind=ElementKind.RAIL,
     name=STREAM_EVENT,
     description="Emits JiuSwarm streaming events across the member's lifecycle.",
-    builder=JiuSwarmStreamEventRail,
 )
+def _build_stream_event_rail(params: dict[str, Any], context: Any) -> JiuSwarmStreamEventRail:
+    """Resolve image declarations against each member's actual runtime model."""
+    from jiuwenswarm.agents.harness.team.team_manager import get_team_manager
+    from jiuwenswarm.common.config import get_config
+
+    session_id = getattr(context, "session_id", "")
+    manager = get_team_manager()
+
+    def request_source():
+        current = manager.get_model_capabilities(session_id)
+        if current is not None:
+            return current
+        return (getattr(context, "request_metadata", None) or {}).get("model_capabilities")
+
+    rail = JiuSwarmStreamEventRail()
+    rail.configure_image_capabilities(request_source, get_config)
+    return rail
+
 harness_element(
     kind=ElementKind.RAIL,
     name=AVATAR_PROMPT,

@@ -917,6 +917,70 @@ def test_deep_adapter_syncs_symphony_tools_from_config_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["cn", "en"])
+@pytest.mark.parametrize("modes,disabled,original,expected", [
+    (["text", "image"], False, False, "true"),
+    (["text", "image"], True, False, "true"),
+    (["text"], False, True, "false"),
+    (None, False, False, "false"),
+    (None, False, True, "true"),
+    (None, False, None, "false"),
+])
+async def test_runtime_prompt_exposes_multimodal_boolean(
+    tmp_path, monkeypatch, language, modes, disabled, original, expected,
+):
+    from jiuwenswarm.common.model_capabilities import ImageCapabilityPolicy
+    monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
+    agent = _FakeAgent(SystemPromptBuilder(language=language))
+    agent.deep_config = SimpleNamespace(
+        model=SimpleNamespace(model_config=SimpleNamespace(model_name="opaque")),
+        enable_read_image_multimodal=original,
+    )
+    ImageCapabilityPolicy(
+        lambda: {"model_name": "opaque", "model_input": modes},
+        lambda: {"react": {"enable_read_image_multimodal": False}} if disabled else {},
+    ).apply(agent)
+    rail = RuntimePromptRail(language=language, channel="desktop")
+    rail.init(agent)
+    rail.set_model_name("opaque")
+    ctx = AgentCallbackContext(agent=agent, inputs=None, session=_FakeSession(), extra={})
+    await rail.before_model_call(ctx)
+    items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+    rendered = agent.prompt_attachment_manager.render(items)
+    model_prefix = "- 当前模型：" if language == "cn" else "- Current model:"
+    capability_prefix = "- 支持多模态：" if language == "cn" else "- Supports multimodal: "
+    lines = rendered.splitlines()
+    model_index = next(i for i, line in enumerate(lines) if line.startswith(model_prefix))
+    assert lines[model_index + 1] == capability_prefix + expected
+    assert "Native image input:" not in rendered
+    assert "当前原生图片输入：" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_runtime_prompt_image_support_refreshes_on_model_switch(tmp_path, monkeypatch):
+    from jiuwenswarm.common.model_capabilities import ImageCapabilityPolicy
+    monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
+    agent = _FakeAgent(SystemPromptBuilder(language="cn"))
+    agent.deep_config = SimpleNamespace(
+        model=SimpleNamespace(model_config=SimpleNamespace(model_name="opaque")),
+        enable_read_image_multimodal=False,
+    )
+    request = {"model_name": "opaque", "model_input": ["image"]}
+    policy = ImageCapabilityPolicy(lambda: request)
+    rail = RuntimePromptRail(language="cn", channel="desktop")
+    rail.init(agent)
+    ctx = AgentCallbackContext(agent=agent, inputs=None, session=_FakeSession(), extra={})
+    for modes, expected in [(["image"], "true"), (["text"], "false"), (None, "false")]:
+        request["model_input"] = modes
+        policy.apply(agent)
+        await rail.before_model_call(ctx)
+        items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+        rendered = agent.prompt_attachment_manager.render(items)
+        assert rendered.count("- 支持多模态：") == 1
+        assert f"- 支持多模态：{expected}" in rendered
+
+
+@pytest.mark.asyncio
 async def test_runtime_environment_section_participates_in_priority_order():
     builder = SystemPromptBuilder(language="cn")
     builder.add_section(PromptSection(name="identity", content={"cn": "identity"}, priority=10))

@@ -200,6 +200,7 @@ from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
 )
 from jiuwenswarm.agents.harness.common.memory.workspace import configure_workspace_memory  # noqa: E402
 from jiuwenswarm.common.model_config_validation import is_placeholder_api_base
+from jiuwenswarm.common.model_capabilities import ImageCapabilityPolicy, model_identity, resolve_image_support  # noqa: E402
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import TOOL_PERMISSION_CHANNEL_ID
 from jiuwenswarm.agents.harness.common.channel_runtime_context import (
     CURRENT_CHANNEL_ID,
@@ -3868,6 +3869,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         return None
 
     def _native_image_input_enabled(self, config: dict[str, Any], model: Any | None) -> bool:
+        declared = resolve_image_support(model, getattr(self, "_image_capability_request", None), get_config())
+        if declared is not None:
+            return declared and config.get("enable_read_image_multimodal") is not False
         model_config = getattr(model, "model_config", None)
         model_name = str(getattr(model_config, "model_name", "") or "").strip()
         support = self._native_image_support_from_model_name(model_name)
@@ -3904,7 +3908,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         model: Model,
         *,
         model_name_override: str | None = None,
-    ) -> None:
+        request: AgentRequest | None = None,
+    ) -> Model:
         """将当前请求的有效模型同步到主执行器和子代理继承配置。
 
         react_agent._railed_model_call 使用 self._config.model_name 作为 model= 参数，
@@ -3916,7 +3921,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         """
         react_agent = getattr(self._instance, "_react_agent", None)
         if react_agent is None:
-            return
+            return model
         override = (model_name_override or "").strip() or None
         base_name = getattr(model.model_config, "model_name", None)
         effective_name = override or base_name
@@ -3940,12 +3945,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             config.model_client_config = model.model_client_config
             config.model_config_obj = request_config
         self._model_request_config = request_config
+        params = getattr(request, "params", None) or {}
+        _, api_base, provider = model_identity(model)
+        self._image_capability_request = {
+            "model_name": effective_name,
+            "model_input": params.get("model_input"),
+            "model_endpoint": {"api_base": api_base, "client_provider": provider},
+        }
+        if request is not None and isinstance(request.params, dict):
+            # Bind declarations server-side before team assembly; a same-named
+            # model at another endpoint must not inherit the request's capability.
+            request.params["_resolved_model_input"] = dict(self._image_capability_request)
+        rail = getattr(self, "_stream_event_rail", None)
+        if rail is not None:
+            rail.configure_image_capabilities(lambda: self._image_capability_request, get_config)
+            rail._sync_image_capabilities()
         if override:
             logger.info(
                 "[JiuWenSwarmDeepAdapter] model_name override=%s (base=%s)",
                 override,
                 base_name,
             )
+        return model
 
     @staticmethod
     def _resolve_skill_mode(config: dict[str, Any]) -> str:
@@ -10125,9 +10146,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         token_sid = CURRENT_SESSION_ID.set((request.session_id or "").strip())
         token_perm = setup_permission_context(request)
         resolved_model = self._resolve_model_for_request(request)
-        self._apply_model_to_react_agent(
+        resolved_model = self._apply_model_to_react_agent(
             resolved_model,
             model_name_override=self._request_model_name_override(request),
+            request=request,
         )
         self._mark_session_active(session_id)
         self._register_session_agent_task(session_id)
@@ -10478,9 +10500,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         if _is_team_canonical(mode):
             from jiuwenswarm.server.runtime.agent_adapter.team_helpers import process_team_message_stream
             resolved_model = self._resolve_model_for_request(request)
-            self._apply_model_to_react_agent(
+            resolved_model = self._apply_model_to_react_agent(
                 resolved_model,
                 model_name_override=self._request_model_name_override(request),
+                request=request,
             )
             inputs = self._prepare_multimodal_image_inputs(request, inputs)
             enable_read_image_multimodal = self._native_image_input_enabled(
@@ -10752,9 +10775,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         token_perm = setup_permission_context(request)
         # 按请求选择模型
         resolved_model = self._resolve_model_for_request(request)
-        self._apply_model_to_react_agent(
+        resolved_model = self._apply_model_to_react_agent(
             resolved_model,
             model_name_override=self._request_model_name_override(request),
+            request=request,
         )
         self._mark_session_active(session_id)
         self._register_session_agent_task(session_id)
@@ -13638,6 +13662,34 @@ def _jws_install_subagent_runtime_patch() -> None:
 
     def _create_subagent_with_runtime_defaults(self, subagent_type, subsession_id, *args, **kwargs):
         sub = _orig_create_subagent(self, subagent_type, subsession_id, *args, **kwargs)
+        # Core may reuse the parent's rail objects. Detach their Agent binding and
+        # native-image policy state; pause/stream bookkeeping keeps its existing semantics.
+        parent_rails = self.configured_rails()
+        image_rails = sub.find_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail))
+        shared = [rail for rail in image_rails if rail in parent_rails]
+        if shared:
+            sub.strip_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail))
+            for rail in image_rails:
+                detached = rail
+                if rail in shared:
+                    detached = copy.copy(rail)
+                    policy = detached._image_capability_policy
+                    if policy is not None:
+                        detached._image_capability_policy = ImageCapabilityPolicy(policy.request_source, policy.config_source)
+                    detached._deep_agent = None
+                sub.add_rail(detached)
+        if not sub.find_rails_by_type((JiuSwarmStreamEventRail,)):
+            parents = self.find_rails_by_type((JiuSwarmStreamEventRail,))
+            if parents:
+                policy = parents[0]._image_capability_policy
+                rail = MultimodalImageRail()
+                rail.configure_image_capabilities(policy.request_source, policy.config_source)
+                sub.add_rail(rail)
+        for rail in sub.find_rails_by_type((JiuSwarmStreamEventRail, MultimodalImageRail)):
+            policy = rail._image_capability_policy
+            if policy is not None:
+                # Resolve known declarations before Core's lazy probe/registration.
+                policy.apply(sub)
         # A configured DeepAgent instance may be reused across task calls.
         if not sub.find_rails_by_type((_SubagentStreamingRail,)):
             sub.add_rail(_SubagentStreamingRail())

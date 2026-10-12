@@ -327,6 +327,7 @@ def build_team_request_metadata(request: Any) -> dict[str, Any]:
         raise TypeError("request must be an AgentRequest")
 
     metadata = dict(getattr(request, "metadata", None) or {})
+    metadata.pop("model_capabilities", None)
     metadata.pop(TRACE_CONTEXT_METADATA_KEY, None)
     metadata.pop(TRACE_HEADER_EXPORTER_METADATA_KEY, None)
     invocation = get_current_invocation_context()
@@ -347,6 +348,17 @@ def build_team_request_metadata(request: Any) -> dict[str, Any]:
         metadata[TRACE_HEADER_EXPORTER_METADATA_KEY] = exporter_name.strip()
     params = getattr(request, "params", None)
     if isinstance(params, dict):
+        from jiuwenswarm.common.model_capabilities import normalize_model_input
+        model_name = str(params.get("model_name") or "").strip()
+        modes = normalize_model_input(params.get("model_input"))
+        if model_name:
+            metadata["model_capabilities"] = {
+                "model_name": model_name,
+                **({"model_input": list(modes)} if modes else {}),
+            }
+            bound = params.get("_resolved_model_input")
+            if isinstance(bound, dict) and bound.get("model_name") == model_name:
+                metadata["model_capabilities"]["model_endpoint"] = dict(bound.get("model_endpoint") or {})
         metadata.setdefault("mode", params.get("mode"))
         metadata.setdefault(
             "supports_user_interaction",
