@@ -19,22 +19,33 @@ def _clear_dedup_registry(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sfu, "SendFileToolkit", LocalSendFileToolkit)
     sfu._SENT_FILE_PATHS_BY_SESSION.clear()
+    sfu._MATERIALIZED_TARGETS_BY_SESSION.clear()
     yield
     sfu._SENT_FILE_PATHS_BY_SESSION.clear()
+    sfu._MATERIALIZED_TARGETS_BY_SESSION.clear()
 
 
 def test_partition_and_mark_sent_files():
-    new_paths, skipped = sfu._partition_sent_files("s1", [r"C:\tmp\a.md", r"C:\tmp\b.md"])
+    """去重键 = (归一化路径, size, 内容hash) 指纹：同指纹跳过，内容变了放行。"""
+    items_a = [(r"C:\tmp\a.md", sfu._sent_fingerprint(r"C:\tmp\a.md", b"v1"))]
+    items_b = [(r"C:\tmp\b.md", sfu._sent_fingerprint(r"C:\tmp\b.md", b"v1"))]
+    new_paths, skipped = sfu._partition_sent_files("s1", items_a + items_b)
     assert new_paths == [r"C:\tmp\a.md", r"C:\tmp\b.md"]
     assert skipped == []
 
-    sfu._mark_files_sent("s1", [r"C:\tmp\a.md"])
-    new_paths, skipped = sfu._partition_sent_files("s1", [r"C:\tmp\a.md", r"C:\tmp\b.md"])
+    sfu._mark_files_sent("s1", items_a)
+    new_paths, skipped = sfu._partition_sent_files("s1", items_a + items_b)
     assert new_paths == [r"C:\tmp\b.md"]
     assert skipped == [r"C:\tmp\a.md"]
 
+    # 同路径但内容指纹变了 → 放行（编辑后重发语义，design/team/22 §9）
+    items_a2 = [(r"C:\tmp\a.md", sfu._sent_fingerprint(r"C:\tmp\a.md", b"v2-changed"))]
+    new_paths, skipped = sfu._partition_sent_files("s1", items_a2)
+    assert new_paths == [r"C:\tmp\a.md"]
+    assert skipped == []
+
     sfu.clear_sent_files_for_session("s1")
-    new_paths, skipped = sfu._partition_sent_files("s1", [r"C:\tmp\a.md"])
+    new_paths, skipped = sfu._partition_sent_files("s1", items_a)
     assert new_paths == [r"C:\tmp\a.md"]
     assert skipped == []
 
