@@ -23,13 +23,14 @@ from jiuwenswarm.common.utils import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CLEANUP_PERIOD_DAYS = 30
+DEFAULT_CLEANUP_PERIOD_DAYS = 0
 RECURRING_CLEANUP_INTERVAL_S = 24 * 60 * 60
 FIRST_CLEANUP_DELAY_S = 10 * 60
 AGENT_ID = "jiuwenswarm"
 
 
 def _get_cleanup_period_days() -> int:
+    """Sessions are retained forever by default; non-positive days disable expiry."""
     env_val = os.getenv("CLEANUP_PERIOD_DAYS")
     if env_val:
         try:
@@ -52,9 +53,13 @@ def _rmtree(path: Path) -> None:
 def cleanup_old_sessions() -> dict[str, int]:
     """清理超过保留期的会话目录（按目录 mtime 判断，与 cc 一致）。
 
+    保留天数 <= 0 时不自动删除会话；默认永久保留。
+
     Returns:
         { "removed": N, "errors": N }
     """
+    if _get_cleanup_period_days() <= 0:
+        return {"removed": 0, "errors": 0}
     cutoff = _get_cutoff_timestamp()
     sessions_dir = get_agent_sessions_dir()
     if not sessions_dir.is_dir():
@@ -179,10 +184,11 @@ def start_background_cleanup(
         name="background-cleanup",
     )
     task.add_done_callback(lambda _: stop_event.set())
+    days = _get_cleanup_period_days()
     logger.info(
-        "background_cleanup: started (first_delay=%ds, interval=%ds, retention=%dd)",
+        "background_cleanup: started (first_delay=%ds, interval=%ds, retention=%s)",
         FIRST_CLEANUP_DELAY_S,
         RECURRING_CLEANUP_INTERVAL_S,
-        _get_cleanup_period_days(),
+        f"{days}d" if days > 0 else "disabled",
     )
     return task
