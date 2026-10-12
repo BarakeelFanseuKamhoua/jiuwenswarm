@@ -205,10 +205,36 @@ def resolve_team_sqlite_db_path(config_base: dict[str, Any] | None = None) -> Pa
     return get_agent_teams_home() / conn_str
 
 
+def _override_entry_model_name(entry: dict[str, Any], requested: str) -> dict[str, Any]:
+    """以条目为底、仅覆盖 model_name（api_base/api_key/provider 等凭证复用）。
+
+    对齐单 agent 链路的覆盖语义（interface_deep ``_apply_model_to_react_agent``
+    的 model_name_override：保留默认客户端凭证、仅覆盖发出的模型名）——页面
+    选择的模型不在 ``models.defaults`` 里时不再静默回退首条目的模型名。
+    """
+    overridden = deepcopy(entry)
+    mcc = overridden.get("model_client_config")
+    if not isinstance(mcc, dict):
+        mcc = {}
+        overridden["model_client_config"] = mcc
+    base_name = str(mcc.get("model_name") or "").strip()
+    mcc["model_name"] = requested
+    mco = overridden.get("model_config_obj")
+    if isinstance(mco, dict) and mco.get("model"):
+        mco["model"] = requested
+    logger.info(
+        "[TeamConfigLoader] requested model %s not in models.defaults; "
+        "overriding model_name on the default entry (base=%s, credentials reused)",
+        requested,
+        base_name or "<empty>",
+    )
+    return overridden
+
+
 def _resolve_default_model_config(
-    config_base: dict[str, Any],
-    *,
-    requested_model_name: str | None = None,
+        config_base: dict[str, Any],
+        *,
+        requested_model_name: str | None = None,
 ) -> dict[str, Any]:
     models_raw = config_base.get("models", {})
     if not isinstance(models_raw, dict):
@@ -231,10 +257,20 @@ def _resolve_default_model_config(
 
         for item in defaults_raw:
             if isinstance(item, dict):
+                if requested:
+                    # 未命中不静默回退首条目模型名：以首条目为底覆盖
+                    # model_name（凭证复用），与单 agent 覆盖语义对齐。
+                    return _override_entry_model_name(item, requested)
                 return item
 
     legacy_default = models_raw.get("default")
     if isinstance(legacy_default, dict):
+        requested = (requested_model_name or "").strip()
+        if requested:
+            mcc = legacy_default.get("model_client_config") or {}
+            base_name = str(mcc.get("model_name") or "").strip() if isinstance(mcc, dict) else ""
+            if base_name != requested:
+                return _override_entry_model_name(legacy_default, requested)
         return legacy_default
 
     return {}
@@ -487,19 +523,22 @@ def _resolve_enable_permissions(config_base: dict[str, Any], team_raw: dict[str,
 
 
 def load_team_spec_dict(
-    config_base: dict[str, Any] | None = None,
-    *,
-    requested_model_name: str | None = None,
-    template_id: str | None = None,
-    template_snapshot: dict[str, Any] | None = None,
-    strict_template: bool = False,
+        config_base: dict[str, Any] | None = None,
+        *,
+        requested_model_name: str | None = None,
+        template_id: str | None = None,
+        template_snapshot: dict[str, Any] | None = None,
+        strict_template: bool = False,
 ) -> dict[str, Any]:
     """Load team config and build a TeamAgentSpec-compatible dict.
 
     When ``requested_model_name`` is provided (e.g. from the chat page model
     selector), team members without an explicit ``modes.team.agents.*.model``
-    fall back to the matching entry in ``models.defaults`` instead of the
-    first list item.
+    fall back to the matching entry in ``models.defaults``; when no entry
+    matches, the default entry's ``model_name`` is overridden with the
+    requested name (credentials reused), mirroring the single-agent
+    model_name_override semantics instead of silently keeping the first
+    entry's model.
     """
     if config_base is None:
         config_base = get_config()
