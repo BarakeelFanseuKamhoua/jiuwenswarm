@@ -32,6 +32,7 @@ from typing import Any
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.runner.callback.errors import AbortError
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.rails.base import DeepAgentRail
 
@@ -149,18 +150,30 @@ class ModelResponseGuardRail(DeepAgentRail):
         ):
             if self._is_image_input_fallback(ctx, response):
                 return
-            raise build_error(
-                StatusCode.MODEL_CALL_FAILED,
-                error_msg=(
-                    "模型流未正常结束（未收到 finish_reason），响应可能被截断，"
-                    "无法确认输出完整性"
+            # 必须经 AbortError 包裹：callback framework 的 trigger() 对普通
+            # 回调异常只记日志不传播（"Handles errors gracefully"），裸
+            # build_error 会被静默吞掉，终止帧仍是 succeeded（!7840 上线后
+            # mf_002/mf_006 依旧红的根因）。trigger 对 AbortError 会 re-raise
+            # 其 cause，异常才能沿 _railed_model_call → on_model_exception
+            # → chat.error / failed 终态传播。
+            raise AbortError(
+                "model_response_guard",
+                cause=build_error(
+                    StatusCode.MODEL_CALL_FAILED,
+                    error_msg=(
+                        "模型流未正常结束（未收到 finish_reason），响应可能被截断，"
+                        "无法确认输出完整性"
+                    ),
                 ),
             )
 
         if self.check_empty_response and not has_output:
-            raise build_error(
-                StatusCode.MODEL_CALL_FAILED,
-                error_msg="模型返回空响应（协议正常完成但无任何文本/工具调用产出）",
+            raise AbortError(
+                "model_response_guard",
+                cause=build_error(
+                    StatusCode.MODEL_CALL_FAILED,
+                    error_msg="模型返回空响应（协议正常完成但无任何文本/工具调用产出）",
+                ),
             )
 
     @staticmethod

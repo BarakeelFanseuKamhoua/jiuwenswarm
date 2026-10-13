@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from openjiuwen.core.runner.callback.errors import AbortError
 
 from jiuwenswarm.agents.harness.common.rails.execution_guard import (
     ModelResponseGuardRail,
@@ -52,24 +53,27 @@ async def test_incomplete_stream_with_partial_content_raises(rail):
     """mf_002 场景：SSE 中途断连，截断残句 + 无 finish_reason → 必须抛错."""
     ctx = _make_ctx(_message(content="答案是 答案是 "))
     await rail.before_model_call(ctx)
-    with pytest.raises(Exception, match="finish_reason"):
+    with pytest.raises(AbortError) as exc_info:
         await rail.after_model_call(ctx)
+    assert "finish_reason" in str(exc_info.value.cause)
 
 
 async def test_incomplete_stream_without_output_raises(rail):
     """断连且零产出：按流不完整上报（优先于空响应判定）."""
     ctx = _make_ctx(_message(content=""))
     await rail.before_model_call(ctx)
-    with pytest.raises(Exception, match="finish_reason"):
+    with pytest.raises(AbortError) as exc_info:
         await rail.after_model_call(ctx)
+    assert "finish_reason" in str(exc_info.value.cause)
 
 
 async def test_empty_response_with_clean_stop_raises(rail):
     """mf_006 场景：协议完整（finish_reason=stop）但零产出 → 必须抛错."""
     ctx = _make_ctx(_message(content="", finish_reason="stop"))
     await rail.before_model_call(ctx)
-    with pytest.raises(Exception, match="空响应"):
+    with pytest.raises(AbortError) as exc_info:
         await rail.after_model_call(ctx)
+    assert "空响应" in str(exc_info.value.cause)
 
 
 async def test_normal_completion_passes(rail):
@@ -158,3 +162,50 @@ def test_builder_can_be_disabled(monkeypatch):
     )
     rail = idm.JiuWenSwarmDeepAdapter._build_model_response_guard_rail(object())
     assert rail is None
+
+
+class _FakeAgent:
+    """最小 agent 桩：只为 agent_callback_manager.execute 提供挂载点."""
+
+    def __init__(self, namespace: str):
+        from openjiuwen.core.single_agent.agent_callback_manager import (
+            AgentCallbackManager,
+        )
+
+        self.agent_callback_manager = AgentCallbackManager(
+            agent_id=namespace, event_namespace=namespace
+        )
+
+
+async def test_raise_propagates_through_framework_chain(rail):
+    """回归守护：after_model_call 的异常必须穿过 callback framework 的 trigger.
+
+    trigger() 对普通回调异常只记日志不传播（"Handles errors gracefully"），
+    裸 build_error 会被静默吞掉——!7840 上线后 mf_002/mf_006 依旧红的根因。
+    守卫以 AbortError 包裹（trigger 会 re-raise 其 cause），本用例走真实
+    注册 + @rail 装饰器 + trigger 全链路，防止该退化再次静默发生。
+    """
+    from openjiuwen.core.single_agent.rail.base import (
+        AgentCallbackContext,
+        AgentCallbackEvent,
+        ModelCallInputs,
+        rail as rail_decorator,
+    )
+
+    agent = _FakeAgent("ns_guard_ut_framework")
+    await agent.agent_callback_manager.register_rail(rail, agent)
+
+    @rail_decorator(
+        before=AgentCallbackEvent.BEFORE_MODEL_CALL,
+        after=AgentCallbackEvent.AFTER_MODEL_CALL,
+        on_exception=AgentCallbackEvent.ON_MODEL_EXCEPTION,
+    )
+    async def _model_call(self, ctx):
+        ctx.inputs = ModelCallInputs(messages=[], tools=None)
+        ctx.inputs.response = _message(content="截断残句")
+        return ctx.inputs.response
+
+    ctx = AgentCallbackContext(agent=agent)
+    ctx.extra["_streaming"] = True
+    with pytest.raises(Exception, match="finish_reason"):
+        await _model_call(agent, ctx)
