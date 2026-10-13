@@ -38,6 +38,7 @@ _PERMISSIONS_CFG_METHODS: frozenset[ReqMethod] = frozenset(
         ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
         ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
         ReqMethod.SECURITY_CONFIG_APPLY,
+        ReqMethod.SECURITY_BUILTIN_GET,
     }
 )
 

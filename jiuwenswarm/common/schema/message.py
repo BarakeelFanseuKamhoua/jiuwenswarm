@@ -196,6 +196,7 @@ class ReqMethod(Enum):
     SECURITY_CONFIG_LOCAL_UPDATE = "security.config.local.update"
     SECURITY_CONFIG_MODULE_UPDATE = "security.config.module.update"
     SECURITY_CONFIG_APPLY = "security.config.apply"
+    SECURITY_BUILTIN_GET = "security.builtin.get"
 
     CHANNEL_FEISHU_GET_CONF = "channel.feishu.get_conf"
     CHANNEL_FEISHU_SET_CONF = "channel.feishu.set_conf"

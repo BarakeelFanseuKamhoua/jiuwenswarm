@@ -58,6 +58,19 @@ def test_partial_initialization_never_reopens_legacy_writer(service):
         service.initialize_from_live()
 
 
+def test_builtin_rules_are_read_only_even_when_source_is_disabled(service):
+    service.initialize_from_live()
+    assert service.get_builtin("tool") == {
+        "module": "tool", "enabled": True,
+        "value": {"bash": "ask", "builtin_tool": "deny"},
+    }
+    service.update_settings({"policy_sources": [{"id": "builtin", "enabled": False}]})
+    assert service.get_builtin("network")["value"] == {"builtin.example": "deny"}
+    assert service.get_builtin("network")["enabled"] is False
+    with pytest.raises(ValueError, match="unknown security module"):
+        service.get_builtin("sandbox")
+
+
 def test_cloud_versions_priority_and_source_switches(service):
     service.initialize_from_live()
     cloud_rules = {

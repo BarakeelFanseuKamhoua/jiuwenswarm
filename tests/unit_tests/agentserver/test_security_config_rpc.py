@@ -57,6 +57,25 @@ async def test_initialize_and_update_apply_without_sandbox_restart(service, monk
 
 
 @pytest.mark.asyncio
+async def test_builtin_get_does_not_publish_or_restart(service):
+    service.initialize_from_live()
+
+    async def unexpected_restart(_params):
+        pytest.fail("read-only builtin query must not restart")
+
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_BUILTIN_GET, {"module": "tool"},
+        agent_manager=Manager(), restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert result == {"module": "tool", "enabled": True, "value": {}}
+    with pytest.raises(ValueError, match="requires module only"):
+        await dispatch_security_config_request(
+            ReqMethod.SECURITY_BUILTIN_GET, {"module": "tool", "other": 1},
+            agent_manager=Manager(), restart_sandboxes=unexpected_restart, service=service,
+        )
+
+
+@pytest.mark.asyncio
 async def test_host_exit_failure_stays_saved_but_not_applied(service, monkeypatch):
     def fail(_config):
         raise RuntimeError("host exit unavailable")

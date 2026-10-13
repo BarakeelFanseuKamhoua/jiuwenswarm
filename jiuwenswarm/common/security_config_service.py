@@ -225,6 +225,28 @@ class SecurityConfigService:
             candidate = compose_candidate(settings, self._sources(settings, local, cloud), state["revision"])
             return {"settings": settings, "local": local, "cloud": cloud, "permissions": candidate, "apply": state}
 
+    def get_builtin(self, module: str) -> dict[str, Any]:
+        key_map = {
+            "file": ("file_guard", "paths"),
+            "network": ("net_guard", "urls"),
+            "command": (None, "rules"),
+            "tool": (None, "tools"),
+        }
+        if not isinstance(module, str) or module not in key_map:
+            raise ValueError(f"unknown security module: {module}")
+        with self._thread_lock, self._locked():
+            settings = validate_settings(self._read_yaml(self.settings_path))
+            enabled = any(
+                item["id"] == "builtin" and item["enabled"]
+                for item in settings["security"]["policy_sources"]
+            )
+            section, field = key_map[module]
+            permissions = self._builtin_reader().get("permissions") or {}
+            value = (permissions.get(section) or {}).get(field) if section else permissions.get(field)
+            if value is None:
+                value = [] if module in {"file", "command"} else {}
+            return {"module": module, "enabled": enabled, "value": deepcopy(value)}
+
     def publish_candidate(
         self, *, expected_revision: str | None = None,
         validator: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,

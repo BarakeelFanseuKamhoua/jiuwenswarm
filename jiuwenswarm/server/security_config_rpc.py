@@ -13,6 +13,7 @@ _METHODS = frozenset({
     ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
     ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
     ReqMethod.SECURITY_CONFIG_APPLY,
+    ReqMethod.SECURITY_BUILTIN_GET,
 })
 
 
@@ -79,6 +80,10 @@ async def dispatch_security_config_request(
         if params:
             raise ValueError("security.config.get accepts no parameters")
         return service.get_candidate()
+    if method == ReqMethod.SECURITY_BUILTIN_GET:
+        if set(params) != {"module"}:
+            raise ValueError("security.builtin.get requires module only")
+        return service.get_builtin(params["module"])
 
     expected = params.get("expected_revision")
     if expected is not None and not isinstance(expected, str):

@@ -6128,7 +6128,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                     ws, req_id, ok=False, error=str(exc), code="SOURCE_UNAVAILABLE",
                 )
                 return
-            if req_method.value.startswith(("sandbox.", "security.config.")) or (
+            if req_method.value.startswith(("sandbox.", "security.config.")) or req_method == ReqMethod.SECURITY_BUILTIN_GET or (
                 managed and is_managed_permissions_method(req_method)
             ):
                 await channel.send_response(
@@ -6211,6 +6211,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     _register_perm("security.config.local.update", _PermReq.SECURITY_CONFIG_LOCAL_UPDATE)
     _register_perm("security.config.module.update", _PermReq.SECURITY_CONFIG_MODULE_UPDATE)
     _register_perm("security.config.apply", _PermReq.SECURITY_CONFIG_APPLY)
+    _register_perm("security.builtin.get", _PermReq.SECURITY_BUILTIN_GET)
     _register_perm("permissions.shell_guard.get", _PermReq.PERMISSIONS_SHELL_GUARD_GET)
     _register_perm("permissions.shell_guard.update", _PermReq.PERMISSIONS_SHELL_GUARD_UPDATE)
     _register_perm("permissions.file_guard.update", _PermReq.PERMISSIONS_FILE_GUARD_UPDATE)
