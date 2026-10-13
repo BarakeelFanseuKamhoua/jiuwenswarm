@@ -1606,14 +1606,116 @@ async def test_process_team_message_stream_emits_deferred_marker_for_followup(mo
     # to tell the Gateway not to auto-emit is_processing=False, preventing
     # "finished -> wait -> running again" flashing. See
     # team_helpers.process_team_message_stream.
-    assert len(chunks) == 2
+    # 2026-10-08 起不再自发 is_complete 终帧（外层 facade/interface.py 消费循环
+    # 结尾对每条流统一补唯一终止帧）——双终止帧会让桌面端 deferred 守卫一次性
+    # 消费后被第二帧穿透误判回合完成（HITL 续跑计费提前收口事故）。
+    assert len(chunks) == 1
     assert chunks[0].payload == {
         "event_type": "chat.processing_status_deferred",
         "session_id": "sess-team-followup",
     }
     assert chunks[0].is_complete is False
-    assert chunks[1].payload is None
-    assert chunks[1].is_complete is True
+
+
+@pytest.mark.anyio
+async def test_start_team_stream_round_refreshes_active_team_trace(monkeypatch):
+    """每轮起跑前刷新在跑团队的计费 trace（2026-10-08 专家团「扣点为 0」修复）。
+
+    桌面团队会话每个用户轮次都按新流首请求起跑（RESUME_FROM_PAUSE 复用池中
+    暂停的运行时），运行团队的模型池 trace 头仍是首轮装配值——不刷新则次轮起
+    模型调用 x-hag-trace-id 冻结在首轮，云端按 trace 归集后后续轮 FINISH
+    consumedPoints=0。这里钉死接线：_start_team_stream_round 必须在流任务
+    起跑前以本轮 request_metadata 调 refresh_active_team_trace_for_round。
+    """
+    calls: dict[str, Any] = {}
+    trace_metadata = {
+        TRACE_CONTEXT_METADATA_KEY: {
+            "version": 1,
+            "trace_id": "sess-refresh&r2abcd12",
+            "conversation_id": "sess-refresh",
+            "interaction_id": "r2abcd12",
+        }
+    }
+
+    class _FakeManager:
+        @staticmethod
+        async def prepare_runtime_activation(session_id: str, team_name: str) -> None:
+            calls["prepared"] = (session_id, team_name)
+
+        @staticmethod
+        async def refresh_active_team_trace_for_round(
+            session_id: str, team_name: str, request_metadata: dict | None
+        ) -> None:
+            # 刷新必须先于流任务起跑（register_stream_task 时刷新已完成）
+            assert "registered" not in calls, "trace refresh must run before stream task starts"
+            calls["refreshed"] = (session_id, team_name, request_metadata)
+
+        @staticmethod
+        def add_waiter(session_id: str, request_id: str, queue: object) -> None:
+            calls["waiter"] = (session_id, request_id)
+
+        @staticmethod
+        def register_stream_task(session_id: str, task: object) -> None:
+            calls["registered"] = session_id
+
+    async def _fake_consume(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(team_helpers, "_consume_stream_with_query", _fake_consume)
+    monkeypatch.setattr(team_helpers, "increment_session_round_count", lambda _sid: 3)
+
+    await team_helpers._start_team_stream_round(
+        channel_id="desktop",
+        session_id="sess-refresh",
+        request_id="req-refresh",
+        team_manager=_FakeManager(),
+        team_name="unit-team",
+        team_spec=SimpleNamespace(),
+        query="查一下紫金矿业",
+        request_metadata=trace_metadata,
+    )
+    await asyncio.sleep(0)
+
+    assert calls["prepared"] == ("sess-refresh", "unit-team")
+    assert calls["refreshed"] == ("sess-refresh", "unit-team", trace_metadata)
+    assert calls["registered"] == "sess-refresh"
+
+
+@pytest.mark.anyio
+async def test_start_team_stream_round_skips_trace_refresh_without_manager_support(
+    monkeypatch,
+) -> None:
+    """老形态/假 manager 无 refresh_active_team_trace_for_round 时静默跳过（兼容兜底）。"""
+
+    class _LegacyManager:
+        @staticmethod
+        async def prepare_runtime_activation(_session_id: str, _team_name: str) -> None:
+            return None
+
+        @staticmethod
+        def add_waiter(_session_id: str, _request_id: str, _queue: object) -> None:
+            return None
+
+        @staticmethod
+        def register_stream_task(_session_id: str, _task: object) -> None:
+            return None
+
+    async def _fake_consume(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(team_helpers, "_consume_stream_with_query", _fake_consume)
+    monkeypatch.setattr(team_helpers, "increment_session_round_count", lambda _sid: 1)
+
+    await team_helpers._start_team_stream_round(
+        channel_id="desktop",
+        session_id="sess-legacy",
+        request_id="req-legacy",
+        team_manager=_LegacyManager(),
+        team_name="unit-team",
+        team_spec=SimpleNamespace(),
+        query="你好",
+    )
+    await asyncio.sleep(0)
 
 
 @pytest.mark.anyio
@@ -1685,7 +1787,11 @@ async def test_process_team_message_stream_retries_followup_while_native_starts(
         "event_type": "chat.processing_status_deferred",
         "session_id": "sess-team-followup-starting",
     }
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧——终止帧由外层
+    # facade（interface.py 消费循环结尾）统一补发，避免双终止帧穿透桌面端
+    # deferred 守卫（专家团 HITL 续跑计费提前收口事故）
+    assert len(chunks) == 1
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2090,7 +2196,10 @@ async def test_process_team_message_stream_passes_interactive_input_to_followup(
     assert _FakeManager.interact_calls == [
         ("sess-team-plan-followup", approval_input),
     ]
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2163,7 +2272,10 @@ async def test_process_team_message_stream_resumes_active_session_without_stream
     assert _FakeManager.interact_calls == [
         ("sess-team-ask-followup", ask_answer_input),
     ]
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2241,7 +2353,10 @@ async def test_process_team_message_stream_routes_evolution_interrupt_to_active_
         and chunk.payload.get("error") == "Failed to send message, please try again later"
         for chunk in chunks
     )
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2339,7 +2454,10 @@ async def test_process_team_message_stream_resumes_structured_team_plan_confirm_
         ("sess-team-plan-resume", approval_input),
     ]
     assert "skills_ready" not in captured
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2490,7 +2608,10 @@ async def test_process_team_message_stream_recovers_paused_runtime_for_interacti
         "event_type": "chat.processing_status_deferred",
         "session_id": "sess-team-plan-recover",
     }
-    assert chunks[-1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio
@@ -2646,7 +2767,10 @@ async def test_process_team_message_stream_converts_a2ui_followup_event(monkeypa
         "event_type": "chat.processing_status_deferred",
         "session_id": "sess-team-a2ui",
     }
-    assert chunks[1].is_complete is True
+    # 2026-10-08 起 follow-up 短流不再自发 is_complete 终帧（终止帧由外层 facade
+    # interface.py 消费循环结尾统一补发），双终止帧会穿透桌面端 deferred 守卫
+    #（专家团 HITL 续跑计费提前收口事故）
+    assert chunks[-1].is_complete is False
 
 
 @pytest.mark.anyio

@@ -1183,6 +1183,43 @@ class TeamManager(metaclass=_TeamManagerMeta):
         self._refresh_live_evolution_rail_trace(session_id, trace_headers)
         return team_agent
 
+    async def refresh_active_team_trace_for_round(
+        self,
+        session_id: str,
+        team_name: str,
+        request_metadata: dict[str, Any] | None,
+    ) -> None:
+        """流式新一轮起跑前刷新在跑团队的计费 trace（interact 路径同款刷新的流式入口）。
+
+        桌面团队会话每个用户轮次都经 ``_start_team_stream_round`` 重新起跑
+        （RESUME_FROM_PAUSE 复用池中暂停的团队运行时）：运行团队的模型池 trace 头
+        是首轮装配时烘焙的，不刷新会让次轮起的模型调用 x-hag-trace-id 冻结在首轮，
+        云端按 trace 归集用量导致后续轮 FINISH consumedPoints=0。
+        在池条目（暂停态）上原地刷新，让后续「从池再解析模型」的路径
+        （成员重启/小模型/swarmflow worker）拿到本轮 trace；分布式形态同步通知远端成员。
+        失败只记日志，不阻塞本轮起跑。
+        """
+        try:
+            team_agent = await self._refresh_active_team_trace(
+                session_id,
+                team_name,
+                request_metadata,
+            )
+            if team_agent is not None:
+                await notify_remote_members_trace_context_update(
+                    team_agent,
+                    session_id,
+                    request_metadata=request_metadata,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[TeamManager] refresh active team trace for round failed: "
+                "session_id=%s team=%s error=%s",
+                session_id,
+                team_name,
+                exc,
+            )
+
     async def prepare_runtime_activation(self, session_id: str, team_name: str) -> None:
         if self._is_distributed_mode(get_config()):
             async with self._distributed_switch_lock:
