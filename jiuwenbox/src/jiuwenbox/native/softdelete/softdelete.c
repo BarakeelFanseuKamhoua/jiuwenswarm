@@ -2315,6 +2315,15 @@ static int directory_has_leaf(const wchar_t *exe, const wchar_t *leaf) {
 }
 
 static int image_is_posix(const wchar_t *exe) {
+    const wchar_t *name = exe != NULL ? wcsrchr(exe, L'\\') : NULL;
+    /* Git's bin\bash.exe is a native launcher for usr\bin\bash.exe.
+     * Keep its debug tree in the caller: injecting the launcher would
+     * make it own a debugger that dies as soon as the shell exits. */
+    if (name != NULL && _wcsicmp(name + 1, L"bash.exe") == 0
+        && directory_has_leaf(exe, L"..\\usr\\bin\\bash.exe")
+        && directory_has_leaf(exe, L"..\\usr\\bin\\msys-2.0.dll")) {
+        return 1;
+    }
     return directory_has_leaf(exe, L"msys-2.0.dll")
         || directory_has_leaf(exe, L"cygwin1.dll");
 }
@@ -2509,14 +2518,8 @@ static void close_create_handles(CREATE_PROCESS_DEBUG_INFO *info) {
         CloseHandle(info->hFile);
         info->hFile = NULL;
     }
-    if (info->hProcess != NULL) {
-        CloseHandle(info->hProcess);
-        info->hProcess = NULL;
-    }
-    if (info->hThread != NULL) {
-        CloseHandle(info->hThread);
-        info->hThread = NULL;
-    }
+    /* ContinueDebugEvent closes the process/thread handles on their exit
+     * events. Closing them here lets that later close hit a reused handle. */
 }
 
 /* 1 means do not inject: MSYS/Cygwin, a console host, or an unreadable image. */
@@ -2703,11 +2706,6 @@ static int dispatch_debug_event(DebugTree *tree, DEBUG_EVENT *ev) {
         ev->u.LoadDll.hFile = NULL;
         return 0;
     }
-    if (ev->dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT && ev->u.CreateThread.hThread != NULL) {
-        CloseHandle(ev->u.CreateThread.hThread);
-        ev->u.CreateThread.hThread = NULL;
-        return 0;
-    }
     if (ev->dwDebugEventCode != EXCEPTION_DEBUG_EVENT) {
         return 0;
     }
@@ -2766,7 +2764,6 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
     PROCESS_INFORMATION *pi;
     DWORD used;
     memset(&tree, 0, sizeof tree);
-    DebugSetProcessKillOnExit(FALSE);
     used = req->flags | DEBUG_PROCESS;
     t_worker_creating = 1;
     if (req->token == NULL) {
@@ -2789,6 +2786,8 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
         SetEvent(req->created);
         return 0;
     }
+    /* This call requires a debugging connection, established above. */
+    DebugSetProcessKillOnExit(FALSE);
     tree.root_pid = pi->dwProcessId;
     if (!DuplicateHandle(
             GetCurrentProcess(), pi->hProcess, GetCurrentProcess(), &tree.root_process,

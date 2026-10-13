@@ -77,6 +77,49 @@ class TestFrameCodec:
         assert FrameDecoder().feed(encode_frame(payload)) == [payload]
 
 
+class TestImageVerifier:
+    """镜像白名单兼容 uv 链接，但不能随对端路径的链接变化放行。"""
+
+    @pytest.mark.parametrize("use_resolved_image", [False, True])
+    def test_accepts_allowlisted_uv_link_and_target(self, monkeypatch, use_resolved_image) -> None:
+        from jiuwenswarm.common import np_transport
+
+        link = r"C:\uv\cpython-3.13-windows-x86_64-none\python.exe"
+        target = r"C:\uv\cpython-3.13.13-windows-x86_64-none\python.exe"
+        realpath = os.path.realpath
+        monkeypatch.setattr(
+            np_transport.os.path, "realpath", lambda p: target if p == link else realpath(p)
+        )
+        monkeypatch.setattr(
+            np_transport.win32process,
+            "GetModuleFileNameEx",
+            lambda _handle, _module: target if use_resolved_image else link,
+        )
+
+        assert np_transport.make_image_verifier([link])(os.getpid()) is True
+
+    def test_rejects_unlisted_image_after_directory_retarget(self, monkeypatch) -> None:
+        from jiuwenswarm.common import np_transport
+
+        trusted = r"C:\trusted\python.exe"
+        image = r"C:\untrusted\python.exe"
+        targets = {image: image}
+        realpath = os.path.realpath
+        monkeypatch.setattr(
+            np_transport.os.path, "realpath", lambda p: targets[p] if p in targets else realpath(p)
+        )
+        monkeypatch.setattr(
+            np_transport.win32process, "GetModuleFileNameEx", lambda _handle, _module: image
+        )
+        verify = np_transport.make_image_verifier([trusted])
+        assert verify(os.getpid()) is False
+
+        # 进程启动后原目录被改名，并在原位置创建指向可信目录的 Junction。
+        # 已加载的镜像不变，即使当前磁盘路径解析到白名单，也必须继续拒绝。
+        targets[image] = trusted
+        assert verify(os.getpid()) is False
+
+
 class TestPipeRoundtrip:
     """真实命名管道 roundtrip（本机）。"""
 

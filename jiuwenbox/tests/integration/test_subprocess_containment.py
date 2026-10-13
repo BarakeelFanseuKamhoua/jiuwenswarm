@@ -2,8 +2,12 @@
 """Native exec lifecycle checks; these do not require a deployed sandbox server."""
 
 import json
+import os
 from pathlib import Path
+import shlex
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -12,6 +16,79 @@ import pytest
 
 from jiuwenbox.supervisor import sandbox_daemon, win_exec
 from jiuwenbox.supervisor.daemon_ipc import recv_frame
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows soft-delete DLL")
+@pytest.mark.parametrize("entry", ["bin", "usr/bin"], ids=["git-launcher", "msys-runtime"])
+def test_soft_delete_bash_normal_exit_preserves_hooked_background(tmp_path, entry):
+    candidates = []
+    if os.environ.get("GIT_BASH"):
+        candidates.append(Path(os.environ["GIT_BASH"]))
+    git = shutil.which("git")
+    if git:
+        candidates.append(Path(git).parent.parent / "bin" / "bash.exe")
+    for key in ("ProgramFiles", "ProgramFiles(x86)"):
+        if os.environ.get(key):
+            candidates.append(Path(os.environ[key]) / "Git" / "bin" / "bash.exe")
+    git_root = next((path.parent.parent for path in candidates
+                     if path.is_file() and (path.parent.parent / "usr/bin/msys-2.0.dll").is_file()), None)
+    if git_root is None:
+        pytest.skip("requires Git for Windows with its native Bash launcher")
+    bash = git_root / entry / "bash.exe"
+    dll = Path(os.environ["JIUWENBOX_SOFT_DELETE_DLL"]) if os.environ.get("JIUWENBOX_SOFT_DELETE_DLL") else (
+        Path(win_exec.__file__).resolve().parents[1] / "native" / "jiuwen_softdelete.dll"
+    )
+    if not dll.is_file():
+        pytest.skip("requires built soft-delete DLL")
+
+    marker = tmp_path / "background.txt"
+    worker = tmp_path / "background.py"
+    worker.write_text(
+        "import ctypes,pathlib,time\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        "marker.write_text('STARTED')\n"
+        "time.sleep(2)\n"
+        "kernel=ctypes.WinDLL('kernel32')\n"
+        "kernel.GetModuleHandleW.argtypes=[ctypes.c_wchar_p]\n"
+        "kernel.GetModuleHandleW.restype=ctypes.c_void_p\n"
+        "deadline=time.monotonic()+5\n"
+        "while not kernel.GetModuleHandleW('jiuwen_softdelete.dll') and time.monotonic()<deadline:\n"
+        "    time.sleep(0.02)\n"
+        "hooked=bool(kernel.GetModuleHandleW('jiuwen_softdelete.dll'))\n"
+        "marker.write_text('DONE hooked='+str(hooked))\n",
+        encoding="utf-8",
+    )
+    command = (f'{shlex.quote(Path(sys.executable).as_posix())} '
+               f'{shlex.quote(worker.as_posix())} >/dev/null 2>&1 & echo $!')
+    # Load the DLL in a separate host, as LOCAL mode does. Its debug worker
+    # must survive Git's launcher exit and still hook the native descendant.
+    host = tmp_path / "host.py"
+    host.write_text(
+        "import ctypes,pathlib,subprocess,time\n"
+        f"ctypes.WinDLL({str(dll)!r})\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        f"proc=subprocess.Popen([{str(bash)!r},'-lc',{command!r}], "
+        "stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE, "
+        "creationflags=subprocess.CREATE_NO_WINDOW)\n"
+        "stdout,stderr=proc.communicate(timeout=15)\n"
+        "assert proc.returncode==0,stderr\n"
+        "assert stdout.strip(), 'shell did not report a background PID'\n"
+        "assert not marker.exists() or not marker.read_text().startswith('DONE'), "
+        "'shell waited for the background process'\n"
+        "deadline=time.monotonic()+10\n"
+        "while time.monotonic()<deadline:\n"
+        "    if marker.exists() and marker.read_text().startswith('DONE'): break\n"
+        "    time.sleep(0.02)\n"
+        "assert marker.exists(), 'background process never started'\n"
+        "assert marker.read_text()=='DONE hooked=True', marker.read_text()\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, "JIUWENBOX_SOFT_DELETE": "1",
+           "JIUWENBOX_SOFT_DELETE_ARCHIVE": str(tmp_path / "archive"),
+           "JIUWENBOX_SOFT_DELETE_DLL": str(dll)}
+    result = subprocess.run([sys.executable, str(host)], env=env, capture_output=True,
+                            text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture
@@ -213,6 +290,72 @@ def test_exec_reaps_children_and_grandchildren(tmp_path, monkeypatch, exec_backe
         worker.join(8)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="normal-exit Job cleanup is Windows behavior")
-def test_normal_exit_closes_exec_job(tmp_path, monkeypatch):
-    test_exec_reaps_children_and_grandchildren(tmp_path, monkeypatch, "windows", "normal")
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Jobs")
+@pytest.mark.parametrize("redirect_output,delay", [
+    pytest.param(False, 1, id="inherited-pipe"),
+    pytest.param(True, 1, id="background"),
+    pytest.param(False, 6, id="output-after-drain-grace"),
+])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_windows_normal_exit_preserves_descendants(tmp_path, monkeypatch, redirect_output, delay, exit_code):
+    script = tmp_path / "background.py"
+    marker = tmp_path / "finished"
+    ready = tmp_path / "ready"
+    script.write_text(
+        "import pathlib,subprocess,sys,time\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        f"ready=pathlib.Path({str(ready)!r})\n"
+        "if len(sys.argv)>1:\n"
+        "    if sys.argv[1]=='child':\n"
+        "        subprocess.run([sys.executable,__file__,'grandchild'], check=True)\n"
+        "    else:\n"
+        "        ready.write_text('ready')\n"
+        f"        time.sleep({delay})\n"
+        "        print('background done', flush=True)\n"
+        "        marker.write_text('finished')\n"
+        "else:\n"
+        f"    output=subprocess.DEVNULL if {redirect_output!r} else None\n"
+        "    subprocess.Popen([sys.executable,__file__,'child'], stdin=subprocess.DEVNULL, "
+        "stdout=output, stderr=output)\n"
+        "    deadline=time.monotonic()+3\n"
+        "    while not ready.exists():\n"
+        "        if time.monotonic()>deadline: raise RuntimeError('grandchild missing')\n"
+        "        time.sleep(0.01)\n"
+        f"    sys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(win_exec, "_push_log", lambda *a, **k: None)
+    client, server = socket.socketpair()
+    client.settimeout(10)
+    errors = []
+
+    def run():
+        try:
+            win_exec._handle_exec_request(server, {
+                "command": [sys.executable, str(script)], "timeout": 5,
+            }, None, str(tmp_path), b"")
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            server.close()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        response = json.loads(recv_frame(client, 1024 * 1024))
+        assert response["exit_code"] == exit_code, response
+        assert not response["killed"]
+        if redirect_output:
+            assert not marker.exists(), "exec waited for the background task"
+        elif delay < 5:
+            assert "background done" in response["stdout"]
+        deadline = time.monotonic() + 5
+        while (not marker.exists() or marker.read_text() != "finished") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert marker.read_text() == "finished"
+        worker.join(3)
+        assert not worker.is_alive()
+        assert not errors
+    finally:
+        client.close()
+        worker.join(8)

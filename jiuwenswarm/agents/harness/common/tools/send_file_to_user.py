@@ -24,7 +24,7 @@ from typing import Any, List, Union
 from openjiuwen.core.foundation.tool import LocalFunction, Tool, ToolCard
 from openjiuwen.harness.security.permission_engine.fileguard.outbound_paths import resolve_outbound_path
 
-from .outbound_file_access import OperationProvider, read_outbound_file, stage_outbound_file
+from .outbound_file_access import OperationProvider, read_outbound_file
 
 from jiuwenswarm.agents.harness.common.tools.turn_request_identity import (
     resolve_toolkit_delivery,
@@ -466,15 +466,8 @@ class SendFileToolkit:
         )
 
         try:
-            # Existing channels and download tokens use local paths. Snapshot only
-            # the bytes read through the owning backend; never re-read the source.
-            # 暂存副本以「实体化路径」为名（撞名 (N) 后缀体现在卡片文件名上），
-            # 内容仍是已读字节，不回读磁盘。
-            delivery_paths: dict[str, str] = {}
-            for file_path in valid_files:
-                delivery_paths[file_path] = await asyncio.to_thread(
-                    stage_outbound_file, source_paths[file_path], contents[file_path], delivery.session_id,
-                )
+            # Access has been checked through the owning agent's SysOperation.
+            # Deliver the live source path; no outbound snapshot or version cache.
             from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
 
             server = AgentWebSocketServer.get_instance()
@@ -489,12 +482,11 @@ class SendFileToolkit:
                     source_path = source_paths[file_path]
                     base_name = os.path.basename(source_path)
                     download_info = build_file_download_info(
-                        delivery_paths[file_path], base_name, delivery.session_id
+                        source_path, base_name, delivery.session_id, approved_outbound=True
                     )
                     files_payload.append({
-                        "path": delivery_paths[file_path],
-                        # 展示锚点：权限评估+实体化后的源路径（团队=project_dir 内
-                        # 路径）。下载仍走暂存副本保 TOCTOU，前端展示/stat 优先它。
+                        "path": source_path,
+                        # 展示与下载共用源路径（团队为实体化后的工作区路径）。
                         "source_path": source_path,
                         "name": base_name,
                         # 产物稳定标识：桌面端「对话卡片」与「右侧工作台产物」共用同一个键去重
@@ -511,7 +503,7 @@ class SendFileToolkit:
                 )
                 files_payload = [
                     {
-                        "path": delivery_paths[file_path],
+                        "path": source_paths[file_path],
                         "source_path": source_paths[file_path],
                         "name": os.path.basename(source_paths[file_path]),
                         "artifact_id": artifact_id_for_path(source_paths[file_path]),

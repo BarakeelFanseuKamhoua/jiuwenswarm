@@ -22,6 +22,7 @@ def operation(content=b"sandbox bytes", error=None):
 
 @pytest.fixture
 def delivery(monkeypatch, tmp_path):
+    (tmp_path / "sessions" / "s").mkdir(parents=True)
     monkeypatch.setattr("jiuwenswarm.server.runtime.session.session_history.get_agent_sessions_dir",
                         lambda: tmp_path / "sessions")
     sfu._SENT_FILE_PATHS_BY_SESSION.clear()
@@ -34,36 +35,73 @@ def delivery(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_exists", [True, False])
-async def test_send_delivers_backend_bytes(delivery, tmp_path, host_exists):
+async def test_send_checks_backend_then_delivers_live_source(delivery, tmp_path):
     from jiuwenswarm.agents.harness.common.tools.web_file_download import validate_file_download_token
     from jiuwenswarm.channels.web.app_web import _SpaStaticHandler
 
     source = tmp_path / "report.pdf"
-    if host_exists:
-        source.write_bytes(b"different host content")
-    op, reader = operation()
+    source.write_bytes(b"report-v1")
+    op, reader = operation(b"report-v1")
     toolkit = sfu.SendFileToolkit("r", "s", "web", operation_provider=lambda: op)
     result = await toolkit.get_tools()[0].invoke({"abs_file_path_list": [str(source)]})
     assert result == "Sent 1 files"
     reader.assert_awaited_once_with(str(source.resolve()), mode="bytes")
     entry = delivery[0].send_push.await_args.args[0]["payload"]["files"][0]
-    assert entry["path"] != str(source)
-    token_path = validate_file_download_token(entry["download_token"])["path"]
+    assert entry["path"] == str(source.resolve())
+    assert entry["source_path"] == entry["path"]
+    payload = validate_file_download_token(entry["download_token"])
+    assert payload["purpose"] == "approved-outbound-file"
+    token_path = payload["path"]
     assert token_path == entry["path"]
     source.write_bytes(b"source changed after send")
-    assert Path(token_path).read_bytes() == b"sandbox bytes"
-    assert entry["size"] == len(b"sandbox bytes")
+    assert Path(token_path).read_bytes() == b"source changed after send"
+    assert entry["size"] == len(b"report-v1")
     assert entry["name"] == source.name
     assert entry["artifact_id"] == sfu.artifact_id_for_path(str(source))
     handler = SimpleNamespace(
         command="GET", headers={}, wfile=io.BytesIO(), connection=Mock(),
         send_response=Mock(), send_header=Mock(), end_headers=Mock(),
         _write_json=Mock(), log_error=Mock(),
+        _is_path_under_allowed_root=Mock(return_value=False),
     )
     _SpaStaticHandler._handle_file_download(handler, {"token": entry["download_token"]})
     handler.send_response.assert_called_once_with(200)
-    assert handler.wfile.getvalue() == b"sandbox bytes"
+    assert handler.wfile.getvalue() == b"source changed after send"
+    assert not list(tmp_path.rglob("outbound*"))
+
+
+@pytest.mark.asyncio
+async def test_changed_resends_keep_source_path_without_snapshots(delivery, tmp_path):
+    source = tmp_path / "report.txt"
+    op, reader = operation()
+    toolkit = sfu.SendFileToolkit("r", "s", "web", operation_provider=lambda: op)
+    for index in range(5):
+        content = f"version-{index}".encode()
+        source.write_bytes(content)
+        reader.return_value.data.content = content
+        assert await toolkit.send_file(str(source)) == "Sent 1 files"
+    assert reader.await_count == 5
+    assert delivery[0].send_push.await_count == 5
+    for call in delivery[0].send_push.await_args_list:
+        assert call.args[0]["payload"]["files"][0]["path"] == str(source.resolve())
+    assert source.read_bytes() == b"version-4"
+    assert not list(tmp_path.rglob("outbound*"))
+
+
+@pytest.mark.asyncio
+async def test_same_named_sources_are_delivered_separately(delivery, tmp_path):
+    sources = [tmp_path / str(index) / "report.txt" for index in range(4)]
+    for source in sources:
+        source.parent.mkdir()
+        source.write_bytes(b"same content")
+    op, reader = operation(b"same content")
+    toolkit = sfu.SendFileToolkit("r", "s", "web", operation_provider=lambda: op)
+    assert await toolkit.send_file([str(source) for source in sources]) == "Sent 4 files"
+    entries = delivery[0].send_push.await_args.args[0]["payload"]["files"]
+    assert [entry["path"] for entry in entries] == [str(source.resolve()) for source in sources]
+    assert reader.await_count == 4
+    assert all(source.read_bytes() == b"same content" for source in sources)
+    assert not list(tmp_path.rglob("outbound*"))
 
 
 @pytest.mark.asyncio
@@ -87,13 +125,18 @@ async def test_send_preserves_missing_file_and_relative_path_behavior(delivery, 
         str(agent / "report.pdf"), str(agent / "missing.pdf"),
     ]
     entry = delivery[0].send_push.await_args.args[0]["payload"]["files"][0]
-    assert Path(entry["path"]).read_bytes() == b"sandbox bytes"
+    assert entry["path"] == str(agent / "report.pdf")
+    assert Path(entry["path"]).read_bytes() == b"report"
     assert entry["artifact_id"] == sfu.artifact_id_for_path(str(agent / "report.pdf"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "result", "unbound"])
-async def test_send_failure_never_publishes(delivery, tmp_path, failure):
+async def test_send_failure_never_publishes(delivery, tmp_path, failure, monkeypatch):
+    issuer = Mock(side_effect=AssertionError("denied read must not issue a token"))
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.tools.web_file_download.build_file_download_info", issuer,
+    )
     (tmp_path / "secret.pdf").write_bytes(b"secret")
     op, reader = operation(error=PermissionError("sandbox denied") if failure == "exception" else None)
     if failure == "result":
@@ -105,6 +148,7 @@ async def test_send_failure_never_publishes(delivery, tmp_path, failure):
     assert result.startswith("success=False")
     delivery[0].send_push.assert_not_awaited()
     delivery[1].assert_not_called()
+    issuer.assert_not_called()
 
 
 @pytest.mark.asyncio
