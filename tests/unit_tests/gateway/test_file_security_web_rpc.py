@@ -43,10 +43,23 @@ async def test_sandbox_web_rpc_requires_agent(method):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", [
+    "security.config.get", "security.config.initialize", "security.config.settings.update",
+    "security.config.local.update", "security.config.module.update", "security.config.apply",
+])
+async def test_unified_security_web_rpc_requires_agent(method):
+    channel = Channel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+    await channel.methods[method](None, "test", {}, None)
+    assert channel.send_response.await_args.kwargs["code"] == "AGENT_NOT_READY"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["permissions.file_guard.get", "permissions.file_guard.update",
                                     "permissions.shell_guard.get", "permissions.shell_guard.update",
                                     "permissions.rules.create", "permissions.rules.update", "permissions.rules.delete",
                                     "permissions.net_guard.get", "permissions.net_guard.set", "sandbox.network.sync",
+                                    "security.config.get", "security.config.local.update",
                                     "sandbox.enabled.get", "sandbox.enabled.set", "sandbox.files.sync", "sandbox.restart"])
 async def test_security_web_rpc_forwards_response_and_error(method):
     channel = Channel()
@@ -65,3 +78,18 @@ async def test_security_web_rpc_forwards_response_and_error(method):
     await channel.methods[method](None, "test2", {}, None)
     assert channel.send_response.await_args.kwargs["ok"] is False
     assert channel.send_response.await_args.kwargs["error"] == "cannot apply rule"
+
+
+@pytest.mark.asyncio
+async def test_unified_security_incomplete_apply_keeps_target_status():
+    channel = Channel()
+    payload = {"saved": True, "applied": False, "apply": {"targets": {"sandbox": "external_pending"}}}
+    client = SimpleNamespace(server_ready=True, send_request=AsyncMock(
+        return_value=SimpleNamespace(ok=False, payload=payload),
+    ))
+    _register_web_handlers(WebHandlersBindParams(channel=channel, agent_client=client))
+    await channel.methods["security.config.local.update"](None, "test", {"module": "network"}, None)
+    response = channel.send_response.await_args.kwargs
+    assert response["ok"] is False
+    assert response["code"] == "SECURITY_APPLY_INCOMPLETE"
+    assert response["payload"] == payload

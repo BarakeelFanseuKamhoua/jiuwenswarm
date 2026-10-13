@@ -190,6 +190,12 @@ class ReqMethod(Enum):
     PERMISSIONS_APPROVAL_OVERRIDES_DELETE = "permissions.approval_overrides.delete"
     PERMISSIONS_NET_GUARD_GET = "permissions.net_guard.get"
     PERMISSIONS_NET_GUARD_SET = "permissions.net_guard.set"
+    SECURITY_CONFIG_GET = "security.config.get"
+    SECURITY_CONFIG_INITIALIZE = "security.config.initialize"
+    SECURITY_CONFIG_SETTINGS_UPDATE = "security.config.settings.update"
+    SECURITY_CONFIG_LOCAL_UPDATE = "security.config.local.update"
+    SECURITY_CONFIG_MODULE_UPDATE = "security.config.module.update"
+    SECURITY_CONFIG_APPLY = "security.config.apply"
 
     CHANNEL_FEISHU_GET_CONF = "channel.feishu.get_conf"
     CHANNEL_FEISHU_SET_CONF = "channel.feishu.set_conf"

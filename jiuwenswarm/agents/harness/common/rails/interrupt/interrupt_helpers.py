@@ -297,7 +297,9 @@ def build_permission_rail(
     defer_unmatched = cloud_authorization_enabled(config)
     permission_config = runtime_permission_config(config)
     tools_config = permission_config.setdefault("tools", {})
-    if isinstance(tools_config, dict):
+    composition = permission_config.get("composition")
+    builtin_active = not isinstance(composition, dict) or "builtin" in composition.get("source_order", [])
+    if isinstance(tools_config, dict) and builtin_active:
         tools_config.setdefault("configure_channel", "allow")
         tools_config.setdefault("get_wechat_login_status", "allow")
     logger.info(
@@ -554,7 +556,16 @@ def build_permission_rail(
 
             snapshot = get_permissions_with_session_overlay(session_id=session_id)
             if behavior_enabled:
-                snapshot = {**snapshot, "enabled": True, "defer_unmatched": defer_unmatched}
+                current_defer = (
+                    cloud_authorization_enabled(get_config())
+                    if isinstance(snapshot.get("composition"), dict)
+                    else defer_unmatched
+                )
+                snapshot = {
+                    **snapshot,
+                    "enabled": True,
+                    "defer_unmatched": current_defer,
+                }
             return build_trusted_dirs_permission_config(
                 snapshot,
                 runtime_trusted_dirs_state,

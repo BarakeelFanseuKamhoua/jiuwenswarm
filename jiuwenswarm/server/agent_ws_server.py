@@ -5375,6 +5375,39 @@ class AgentWebSocketServer:
         from jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc import \
             dispatch_permissions_config_request
 
+        from jiuwenswarm.server.security_config_rpc import (
+            dispatch_security_config_request,
+            is_security_config_method,
+        )
+
+        if is_security_config_method(request.req_method):
+            try:
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    payload = await dispatch_security_config_request(
+                        request.req_method, request.params or {},
+                        agent_manager=self._agent_manager,
+                        restart_sandboxes=self._restart_configured_sandboxes,
+                    )
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=payload.get("applied", True), payload=payload,
+                    metadata=request.metadata,
+                )
+            except Exception as exc:
+                logger.exception("[security.config] request failed: %s", exc)
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": "SECURITY_CONFIG_FAILED"},
+                    metadata=request.metadata,
+                )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+
         resp = dispatch_permissions_config_request(request)
 
         # After any successful mutation (delete / update / set / create),

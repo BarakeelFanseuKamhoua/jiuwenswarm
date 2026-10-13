@@ -43,6 +43,7 @@ class BehaviorSecurityRail(DeepAgentRail):
 
     async def before_tool_call(self, ctx):
         ctx.extra["behavior.finished"] = False
+        ctx.extra["behavior.policy_revision"] = self.bridge.policy_revision()
         task = asyncio.current_task()
         if task is not None:
             task.add_done_callback(lambda _: ctx.extra.__setitem__("behavior.finished", True))

@@ -1,0 +1,271 @@
+"""Source storage and guarded publication for security configuration."""
+
+from copy import deepcopy
+
+import pytest
+
+from jiuwenswarm.common.config import dump_yaml_round_trip, load_yaml_round_trip
+from jiuwenswarm.common.security_config_service import SecurityConfigService
+
+
+@pytest.fixture
+def service(tmp_path):
+    path = tmp_path / "config.yaml"
+    dump_yaml_round_trip(path, {
+        "model": "untouched",
+        "permissions": {
+            "enabled": True,
+            "tools": {"bash": "allow"},
+            "rules": [{"id": "user-1", "tools": ["bash"], "pattern": "local *", "action": "allow"}],
+            "file_guard": {"enabled": True, "defaults": {"read": "ask"}, "paths": [{"path": "/private", "read": "deny"}]},
+            "net_guard": {"enabled": True, "defaults": "allow", "urls": {"local.example": "allow"}},
+            "approval_overrides": [{"id": "approved-1"}],
+        },
+        "sandbox": {"enabled": False, "type": "jiuwenbox"},
+    })
+    builtin = {
+        "permissions": {
+            "tools": {"bash": "ask", "builtin_tool": "deny"},
+            "rules": [{"id": "builtin-1", "tools": ["bash"], "pattern": "danger *", "action": "deny"}],
+            "file_guard": {"paths": []},
+            "net_guard": {"urls": {"builtin.example": "deny"}},
+        },
+    }
+    return SecurityConfigService(path, builtin_reader=lambda: deepcopy(builtin))
+
+
+def test_initialize_keeps_live_and_splits_sources(service):
+    before = service.config_path.read_bytes()
+    state = service.initialize_from_live()
+    snapshot = service.get_candidate()
+    assert service.config_path.read_bytes() == before
+    assert service.initial_snapshot_path.is_file()
+    assert snapshot["settings"]["permissions"]["file_guard"] == {"enabled": True, "defaults": {"read": "ask"}}
+    assert snapshot["local"]["permissions"]["file_guard"]["paths"][0]["read"] == "deny"
+    assert snapshot["permissions"]["composition"]["source_order"] == ["user", "cloud", "builtin"]
+    assert snapshot["permissions"]["tools"] == {"bash": "allow", "builtin_tool": "deny"}
+    assert snapshot["permissions"]["approval_overrides"] == [{"id": "approved-1"}]
+    assert state["saved"] and not state["applied"]
+    with pytest.raises(RuntimeError, match="already initialized"):
+        service.initialize_from_live()
+
+
+def test_cloud_versions_priority_and_source_switches(service):
+    service.initialize_from_live()
+    cloud_rules = {
+        "tools": {"bash": "ask", "cloud_tool": "allow"},
+        "net_guard": {"urls": {"local.example": "ask"}},
+    }
+    cloud_state = service.replace_cloud_policy(2, cloud_rules)
+    assert service.replace_cloud_policy(2, cloud_rules)["revision"] == cloud_state["revision"]
+    with pytest.raises(ValueError, match="conflicting"):
+        service.replace_cloud_policy(2, {"tools": {"bash": "deny"}})
+    with pytest.raises(ValueError, match="stale"):
+        service.replace_cloud_policy(1, cloud_rules)
+    current = service.get_candidate()
+    assert current["permissions"]["tools"]["bash"] == "allow"
+    assert current["permissions"]["net_guard"]["urls"]["local.example"] == "allow"
+    reordered = service.update_settings({"policy_sources": [
+        {"id": "cloud", "enabled": True},
+        {"id": "user", "enabled": True},
+        {"id": "builtin", "enabled": True},
+    ]}, expected_revision=cloud_state["revision"])
+    assert service.get_candidate()["permissions"]["tools"]["bash"] == "ask"
+    with pytest.raises(ValueError, match="VERSION_CONFLICT"):
+        service.update_settings({"fail_closed": {"enabled": True}}, expected_revision=cloud_state["revision"])
+    service.replace_cloud_policy(3, {"tools": {"bash": "deny"}})
+    assert service.get_candidate()["permissions"]["tools"]["bash"] == "deny"
+    service.update_settings({"policy_sources": [
+        {"id": "user", "enabled": False},
+        {"id": "cloud", "enabled": True},
+        {"id": "builtin", "enabled": False},
+    ]})
+    candidate = service.get_candidate()["permissions"]
+    assert candidate["approval_overrides"] == []
+    assert candidate["tools"] == {"bash": "deny"}
+    assert candidate["composition"]["source_order"] == ["cloud"]
+    assert reordered["revision"] != cloud_state["revision"]
+
+
+def test_local_module_replacement_and_invalid_input_do_not_touch_live(service):
+    service.initialize_from_live()
+    before = service.config_path.read_bytes()
+    previous = service.local_path.read_bytes()
+    with pytest.raises(ValueError, match="read"):
+        service.update_local("file", [{"path": "/private", "read": "invalid"}])
+    with pytest.raises(ValueError, match="unknown"):
+        service.update_settings({"policy_sources": [{"id": "unregistered", "enabled": True}]})
+    assert service.local_path.read_bytes() == previous
+    assert service.config_path.read_bytes() == before
+    service.update_local("tool", {"mcp_custom": "deny"})
+    service.update_local("network", {"example.com": "ask"})
+    service.update_local("command", [{"id": "new", "tools": ["bash"], "pattern": "echo *", "action": "allow"}])
+    service.update_local("file", [{"path": "/new", "read": "allow", "write": "deny"}])
+    local = service.get_candidate()["local"]["permissions"]
+    assert local["tools"] == {"mcp_custom": "deny"}
+    assert local["net_guard"]["urls"] == {"example.com": "ask"}
+    assert local["rules"][0]["id"] == "new"
+    assert local["file_guard"]["paths"][0]["path"] == "/new"
+    assert service.config_path.read_bytes() == before
+
+
+def test_native_module_settings_stay_out_of_rule_sources(service):
+    service.initialize_from_live()
+    before = service.config_path.read_bytes()
+    service.update_module_settings("file", {"defaults": {"write": "deny"}})
+    service.update_module_settings("network", {"defaults": "ask", "enforce_host_exit": False})
+    service.update_module_settings("command", {"builtin_rules_enabled": False})
+    service.update_module_settings("permissions", {"enabled": False, "permission_mode": "normal"})
+    snapshot = service.get_candidate()
+    settings = snapshot["settings"]["permissions"]
+    assert settings["file_guard"]["defaults"] == {"read": "ask", "write": "deny"}
+    assert settings["net_guard"]["defaults"] == "ask"
+    assert settings["shell_guard"]["builtin_rules_enabled"] is False
+    assert settings["enabled"] is False
+    assert snapshot["local"]["permissions"]["file_guard"]["paths"]
+    with pytest.raises(ValueError, match="belong"):
+        service.update_module_settings("file", {"paths": []})
+    with pytest.raises(ValueError, match="network settings"):
+        service.update_module_settings("network", {"urls": {}})
+    assert service.config_path.read_bytes() == before
+
+
+def test_disabled_source_is_not_parsed_until_reenabled(service):
+    service.initialize_from_live()
+    service.replace_cloud_policy(1, {"tools": {"bash": "deny"}})
+    service.update_settings({"policy_sources": [{"id": "user", "enabled": True}]})
+    service.cloud_path.write_text("not: [valid", encoding="utf-8")
+    assert service.get_candidate()["permissions"]["tools"] == {"bash": "allow"}
+    with pytest.raises(Exception):
+        service.update_settings({"policy_sources": [{"id": "cloud", "enabled": True}]})
+    assert service.get_candidate()["permissions"]["tools"] == {"bash": "allow"}
+
+
+def test_corrupt_enabled_source_can_be_switched_off(service):
+    service.initialize_from_live()
+    service.replace_cloud_policy(1, {"tools": {"bash": "deny"}})
+    service.cloud_path.write_text("not: [valid", encoding="utf-8")
+    with pytest.raises(Exception):
+        service.get_candidate()
+    service.update_settings({"policy_sources": [{"id": "user", "enabled": True}]})
+    assert service.get_candidate()["permissions"]["tools"] == {"bash": "allow"}
+
+
+def test_empty_source_list_skips_builtin_reader_and_keeps_defaults(service):
+    service.initialize_from_live()
+    service._builtin_reader = lambda: pytest.fail("disabled builtin was read")
+    service.update_settings({"policy_sources": []})
+    effective = service.get_candidate()["permissions"]
+    assert effective["composition"]["source_order"] == []
+    assert effective["tools"] == {}
+    assert effective["file_guard"]["defaults"] == {"read": "ask"}
+
+
+def test_package_template_can_be_adopted_without_mutating_live(tmp_path):
+    from jiuwenswarm.common.utils import get_package_resources_dir
+
+    template = (get_package_resources_dir() / "config.yaml").read_bytes()
+    path = tmp_path / "config.yaml"
+    path.write_bytes(template)
+    service = SecurityConfigService(path)
+    service.initialize_from_live()
+    candidate = service.get_candidate()
+    assert candidate["local"]["permissions"]["rules"]
+    assert candidate["permissions"]["rules"]
+    assert path.read_bytes() == template
+
+
+def test_lost_state_and_interrupted_source_write_get_fresh_revision(service):
+    first = service.initialize_from_live()["revision"]
+    service.state_path.unlink()
+    second = service.get_candidate()["apply"]["revision"]
+    assert second != first
+    service.update_local("tool", {"bash": "deny"})
+    third = service.get_candidate()["apply"]["revision"]
+    service.local_path.write_bytes(service.local_path.read_bytes() + b"\n")
+    fourth = service.get_candidate()["apply"]["revision"]
+    assert fourth not in (first, second, third)
+    service.state_path.write_text("{broken", encoding="utf-8")
+    fifth = service.get_candidate()["apply"]["revision"]
+    assert fifth not in (first, second, third, fourth)
+
+
+def test_publish_requires_composition_capable_core(service, monkeypatch):
+    from openjiuwen.harness.security.permission_engine import core
+
+    service.initialize_from_live()
+    before = service.config_path.read_bytes()
+    monkeypatch.setattr(core, "COMPOSITION_SCHEMA_VERSION", 0, raising=False)
+    with pytest.raises(RuntimeError, match="does not support"):
+        service.publish_candidate()
+    assert service.config_path.read_bytes() == before
+
+
+def test_publish_and_record_apply_preserve_unmanaged_config(service):
+    service.initialize_from_live()
+    revision = service.update_settings({"fail_closed": {"enabled": True}})["revision"]
+    result = service.publish_candidate(expected_revision=revision)
+    live = load_yaml_round_trip(service.config_path)
+    assert result["apply"]["revision"] == revision
+    assert live["model"] == "untouched"
+    assert live["sandbox"] == {"enabled": False, "type": "jiuwenbox"}
+    assert live["security"]["fail_closed"] == {"enabled": True}
+    assert live["permissions"]["composition"]["revision"] == revision
+    failed = service.record_apply(revision, {"rail": "applied", "host_exit": "failed", "sandbox": "not_required"})
+    assert failed["status"] == "failed" and not failed["applied"]
+    applied = service.record_apply(revision, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+    assert applied["status"] == "applied" and applied["applied"]
+    with pytest.raises(ValueError, match="VERSION_CONFLICT"):
+        service.record_apply("old", applied["targets"])
+
+
+def test_composed_permanent_approval_stays_in_user_source(service):
+    service.initialize_from_live()
+    service.replace_cloud_policy(1, {"rules": [
+        {"id": "cloud-rule", "tools": ["bash"], "pattern": "danger *", "action": "deny"},
+    ]})
+    grant = {"id": "remembered", "tools": ["bash"], "match_type": "command",
+             "pattern": "safe *", "action": "allow"}
+    assert service.persist_user_approval(grant)
+    snapshot = service.get_candidate()
+    assert snapshot["local"]["permissions"]["approval_overrides"][-1] == grant
+    assert "rules" not in snapshot["local"]["permissions"] or all(
+        rule["id"] != "cloud-rule" for rule in snapshot["local"]["permissions"]["rules"]
+    )
+    live = load_yaml_round_trip(service.config_path)
+    assert live["permissions"]["approval_overrides"][-1] == grant
+    assert snapshot["apply"]["applied"]
+    service.update_settings({"policy_sources": [{"id": "cloud", "enabled": True}]})
+    assert not service.persist_user_approval({**grant, "id": "disabled"})
+    assert [item["id"] for item in service._read_yaml(service.local_path)["permissions"]["approval_overrides"]] == [
+        "approved-1", "remembered",
+    ]
+
+
+def test_composed_file_projection_accepts_read_deny_implied_exec_on_windows(tmp_path):
+    import sys
+    from jiuwenswarm.common.file_guard_config import project_file_guard_to_sandbox
+
+    if sys.platform != "win32":
+        pytest.skip("Windows filesystem sandbox semantics")
+    target = tmp_path / "private"
+    target.mkdir()
+    files, skipped = project_file_guard_to_sandbox({"paths": [
+        {"path": str(target), "read": "deny", "layer": "user"},
+    ]})
+    assert not skipped
+    assert files == [{"path": str(target), "read": "deny", "write": "deny"}]
+
+
+def test_external_permission_write_invalidates_applied_state_without_overwrite(service):
+    service.initialize_from_live()
+    revision = service.publish_candidate()["apply"]["revision"]
+    service.record_apply(revision, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+    live = load_yaml_round_trip(service.config_path)
+    live["permissions"]["tools"]["external_tool"] = "deny"
+    dump_yaml_round_trip(service.config_path, live)
+    before = service.config_path.read_bytes()
+    state = service.get_candidate()["apply"]
+    assert state["revision"] != revision
+    assert not state["applied"]
+    assert service.config_path.read_bytes() == before

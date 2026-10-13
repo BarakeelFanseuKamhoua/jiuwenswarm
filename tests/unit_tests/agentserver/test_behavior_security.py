@@ -66,6 +66,47 @@ async def test_unknown_one_waited_request_and_no_second_report(decision, expecte
     assert 'businessId' not in events[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fail_closed,expected', [
+    (True, PermissionLevel.DENY), (False, PermissionLevel.ASK),
+])
+async def test_cloud_unavailable_respects_total_fail_closed_switch(fail_closed, expected):
+    b, _ = bridge(decision='unavailable')
+    b.config['security'] = {'fail_closed': {'enabled': fail_closed}}
+    b.config['permissions']['permission_mode'] = 'strict'
+    result = await b.decide(raw_event(context(), 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
+    assert result.permission == expected
+    await b.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_revision_changes_event_identity_and_discards_old_reply():
+    b, _ = bridge(decision='allow')
+    ctx = context()
+    rail = BehaviorSecurityRail(b)
+    await rail.before_tool_call(ctx)
+    old_event = raw_event(ctx, 'tool.before')
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(_event):
+        started.set()
+        await release.wait()
+        return {'decision': 'allow'}
+
+    b._send = delayed
+    pending = asyncio.create_task(b.decide(old_event, PermissionResult(PermissionLevel.UNDETERMINED)))
+    await started.wait()
+    changed = dict(b.config)
+    changed['security'] = {'fail_closed': {'enabled': True}}
+    b.update_config(changed)
+    await rail.before_tool_call(ctx)
+    assert raw_event(ctx, 'tool.before')['eventId'] != old_event['eventId']
+    release.set()
+    assert (await pending).permission == PermissionLevel.DENY
+    assert not b.decisions
+    await b.close()
+
+
 @pytest.mark.parametrize('enabled,expected', [
     (True, True), (False, False), (None, False), ('false', False), ('flase', False), (1, False),
 ])

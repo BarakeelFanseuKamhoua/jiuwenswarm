@@ -5737,6 +5737,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         from jiuwenswarm.common.behavior_security import runtime_permission_config
 
         config_base = config_base or {}
+        behavior_rail = getattr(self, "_cspl_sentinel_rail", None)
+        bridge = getattr(behavior_rail, "bridge", None)
+        if bridge is not None and hasattr(bridge, "update_config"):
+            bridge.update_config(config_base)
         permission_config = runtime_permission_config(config_base)
         if self._permission_rail is not None:
             self._permission_rail.update_config(permission_config)

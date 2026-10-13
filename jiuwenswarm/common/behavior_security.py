@@ -56,7 +56,8 @@ def _event_id(ctx: Any, stage: str, suffix: str = "") -> str:
     call = ctx.inputs.tool_call
     turn = ctx.extra.get("behavior.turn_id", "")
     args = json.dumps(ctx.inputs.tool_args, sort_keys=True, ensure_ascii=False, default=str)
-    raw = f"{_session_id(ctx)}:{turn}:{getattr(call, 'id', '')}:{ctx.inputs.tool_name}:{args}:{stage}:{suffix}"
+    revision = ctx.extra.get("behavior.policy_revision", "")
+    raw = f"{revision}:{_session_id(ctx)}:{turn}:{getattr(call, 'id', '')}:{ctx.inputs.tool_name}:{args}:{stage}:{suffix}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -87,6 +88,21 @@ class BehaviorSecurityBridge:
         self.decisions: OrderedDict[str, PermissionResult] = OrderedDict()
         self.local_decisions: OrderedDict[str, PermissionResult] = OrderedDict()
 
+    def policy_revision(self) -> str:
+        permissions = self.config.get("permissions", {})
+        composition = permissions.get("composition", {}) if isinstance(permissions, dict) else {}
+        identity = (
+            composition.get("revision") if isinstance(composition, dict) else None,
+            cloud_authorization_enabled(self.config),
+            self.config.get("security", {}).get("fail_closed", {}).get("enabled") is True,
+        )
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def update_config(self, config: dict) -> None:
+        self.config = config
+        self.decisions.clear()
+        self.local_decisions.clear()
+
     async def _send(self, event: dict) -> dict:
         section = self.config.get("xiaoyi_work_security", {}).get("cloud_authorization", {})
         timeout = max(0.1, min(float(section.get("timeout_ms", 4000)) / 1000, 30))
@@ -113,6 +129,7 @@ class BehaviorSecurityBridge:
         task.add_done_callback(self.tasks.discard)
 
     async def decide(self, event: dict, local: PermissionResult) -> PermissionResult:
+        revision = self.policy_revision()
         key = event["eventId"]
         if key in self.decisions:
             return self.decisions[key]
@@ -146,7 +163,13 @@ class BehaviorSecurityBridge:
             elif decision == "deny":
                 result = PermissionResult(PermissionLevel.DENY, reason=str(reply.get("reason") or "云端拒绝本次操作"))
             else:
-                result = PermissionResult(PermissionLevel.ASK, reason="云端不可用，请授权本次操作")
+                fail_closed = self.config.get("security", {}).get("fail_closed", {}).get("enabled") is True
+                result = PermissionResult(
+                    PermissionLevel.DENY if fail_closed else PermissionLevel.ASK,
+                    reason="云端不可用，拒绝本次操作" if fail_closed else "云端不可用，请授权本次操作",
+                )
+        if revision != self.policy_revision():
+            return PermissionResult(PermissionLevel.DENY, reason="安全策略已变更，请重新发起操作")
         self.decisions[key] = result
         if len(self.decisions) > 512:
             self.decisions.popitem(last=False)

@@ -37,12 +37,13 @@ def project_net_guard_to_sandbox(guard):
 
 
 def sync_net_guard_to_sandbox():
+    from jiuwenswarm.common.behavior_security import runtime_permission_config
     from jiuwenswarm.common.config import update_config
 
     skipped = []
 
     def mutate(data):
-        permissions = data.get("permissions") or {}
+        permissions = runtime_permission_config(data)
         guard = permissions.get("net_guard") or {}
         if (data.get("sandbox") or {}).get("type", "jiuwenbox") != "jiuwenbox":
             raise ValueError("sandbox.network.sync currently supports jiuwenbox only")

@@ -399,6 +399,10 @@ def apply_session_permissions_overlay(
     merged: dict[str, Any] = deepcopy(base) if isinstance(base, dict) else {}
     if not isinstance(overlay, dict) or not overlay:
         return merged
+    composition = merged.get("composition")
+    composed = isinstance(composition, dict)
+    if composed and "user" not in composition.get("source_order", []):
+        return merged
 
     ov_fg = overlay.get("file_guard")
     if isinstance(ov_fg, dict):
@@ -410,15 +414,20 @@ def apply_session_permissions_overlay(
                 path = str(entry.get("path") or "")
                 if not path:
                     continue
-                merged, _wrote = merge_file_guard_path_rule(
-                    merged,
-                    path,
-                    read=str(entry.get("read") or "allow"),
-                    write=str(entry.get("write") or "ask"),
-                    exec_=str(entry.get("exec") or "ask"),
-                    match=str(entry.get("match") or "prefix"),
-                )
-        if ov_fg.get("enabled") is True:
+                if composed:
+                    merged.setdefault("file_guard", {}).setdefault("paths", []).append(
+                        {**deepcopy(entry), "layer": "user"}
+                    )
+                else:
+                    merged, _wrote = merge_file_guard_path_rule(
+                        merged,
+                        path,
+                        read=str(entry.get("read") or "allow"),
+                        write=str(entry.get("write") or "ask"),
+                        exec_=str(entry.get("exec") or "ask"),
+                        match=str(entry.get("match") or "prefix"),
+                    )
+        if ov_fg.get("enabled") is True and not composed:
             fg = merged.get("file_guard")
             if isinstance(fg, dict):
                 fg["enabled"] = True
@@ -566,6 +575,19 @@ def persist_merged_allow_rule_snapshot(permissions: dict[str, Any], *, approval_
     """HITL「永久记住」：把相对模板多出的场景 list 写入 config.yaml。"""
     if not isinstance(permissions, dict):
         return False
+    from jiuwenswarm.common.config import get_config
+
+    live = get_config().get("permissions") or {}
+    if isinstance(live.get("composition"), dict):
+        if approval_grant is None:
+            return False
+        try:
+            from jiuwenswarm.common.security_config_service import SecurityConfigService
+
+            return SecurityConfigService().persist_user_approval(approval_grant)
+        except Exception:
+            logger.warning("[PermissionPersist] composed approval persist failed", exc_info=True)
+            return False
     # Never promote other session grants when one operation is remembered forever.
     if approval_grant is not None:
         permissions = {"approval_overrides": [approval_grant]}
