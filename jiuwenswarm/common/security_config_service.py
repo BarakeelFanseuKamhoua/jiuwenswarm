@@ -148,6 +148,37 @@ class SecurityConfigService:
         local, cloud = self._load_sources(settings)
         return settings, local, cloud
 
+    def is_initialized(self) -> bool:
+        ready = self.settings_path.is_file() and self.local_path.is_file()
+        if not ready and any(path.exists() for path in (
+            self.settings_path, self.local_path, self.cloud_path, self.state_path,
+            self.initial_snapshot_path,
+        )):
+            raise RuntimeError("security sources are only partially initialized")
+        return ready
+
+    def edit_native(self, mutate: Callable[[dict[str, Any], dict[str, Any]], Any]) -> tuple[Any, dict[str, Any]]:
+        """Apply one legacy module patch to its original-shaped source and settings."""
+        with self._thread_lock, self._locked():
+            settings = validate_settings(self._read_yaml(self.settings_path))
+            local = validate_source(self._read_yaml(self.local_path))
+            cloud = (
+                validate_source(self._read_yaml(self.cloud_path), cloud=True)
+                if self.cloud_path.is_file() and any(
+                    item["id"] == "cloud" and item["enabled"]
+                    for item in settings["security"]["policy_sources"]
+                ) else {"permissions": {}}
+            )
+            result = mutate(settings, local)
+            settings = validate_settings(settings)
+            local = validate_source(local)
+            state = self._pending_state()
+            compose_candidate(settings, self._sources(settings, local, cloud), state["revision"])
+            dump_yaml_round_trip(self.settings_path, settings)
+            dump_yaml_round_trip(self.local_path, local)
+            self._write_state(state)
+            return result, deepcopy(state)
+
     def _sources(self, settings: dict[str, Any], local: dict[str, Any], cloud: dict[str, Any]) -> dict[str, dict[str, Any]]:
         sources = {"user": local, "cloud": cloud}
         if any(item["id"] == "builtin" and item["enabled"] for item in settings["security"]["policy_sources"]):
@@ -157,7 +188,10 @@ class SecurityConfigService:
     def initialize_from_live(self) -> dict[str, Any]:
         """Adopt the old config once; never extract from a derived snapshot again."""
         with self._thread_lock, self._locked():
-            if any(path.exists() for path in (self.settings_path, self.local_path, self.cloud_path, self.state_path)):
+            if any(path.exists() for path in (
+                self.settings_path, self.local_path, self.cloud_path,
+                self.state_path, self.initial_snapshot_path,
+            )):
                 raise RuntimeError("security sources already initialized or partially initialized")
             live = self._read_yaml(self.config_path)
             permissions = deepcopy(live.get("permissions") or {})

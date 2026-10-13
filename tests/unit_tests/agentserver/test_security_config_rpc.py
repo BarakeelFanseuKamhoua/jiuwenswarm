@@ -252,3 +252,34 @@ async def test_independent_sandbox_urls_are_not_overwritten(service, monkeypatch
     assert not result["applied"]
     assert "independently managed" in result["apply"]["targets"]["sandbox"]
     assert service.config_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_cloud_domain_deny_reaches_real_core_host_exit(service):
+    from openjiuwen.harness.security.outbound import policy as host_exit
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    host_exit.reset_host_exit_policy()
+    try:
+        initialized = await dispatch_security_config_request(
+            ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=Manager(),
+            restart_sandboxes=no_restart, service=service,
+        )
+        assert initialized["applied"]
+        enabled = await dispatch_security_config_request(
+            ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
+            {"module": "network", "patch": {"enabled": True}},
+            agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
+        )
+        assert enabled["applied"]
+        cloud = await apply_trusted_cloud_policy(
+            1, {"net_guard": {"urls": {"blocked.example.org": "deny"}}},
+            agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
+        )
+        assert cloud["applied"]
+        with pytest.raises(host_exit.OutboundBlockedError):
+            host_exit.check_outbound_url("https://blocked.example.org/resource")
+    finally:
+        host_exit.reset_host_exit_policy()

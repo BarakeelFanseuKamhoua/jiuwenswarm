@@ -6118,7 +6118,19 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
         ac = _resolve(agent_client)
         if ac is None or not getattr(ac, "server_ready", False):
-            if req_method.value.startswith(("sandbox.", "security.config.")):
+            from jiuwenswarm.common.security_config_service import SecurityConfigService
+            from jiuwenswarm.server.security_config_legacy_rpc import is_managed_permissions_method
+
+            try:
+                managed = SecurityConfigService().is_initialized()
+            except RuntimeError as exc:
+                await channel.send_response(
+                    ws, req_id, ok=False, error=str(exc), code="SOURCE_UNAVAILABLE",
+                )
+                return
+            if req_method.value.startswith(("sandbox.", "security.config.")) or (
+                managed and is_managed_permissions_method(req_method)
+            ):
                 await channel.send_response(
                     ws, req_id, ok=False, error="AgentServer is not ready", code="AGENT_NOT_READY",
                 )
@@ -6166,7 +6178,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             return
         if not resp.ok:
             pl = resp.payload if isinstance(resp.payload, dict) else {}
-            if req_method.value.startswith("security.config.") and pl.get("saved"):
+            if pl.get("saved") and not pl.get("applied", False):
                 await channel.send_response(
                     ws, req_id, ok=False, payload=pl,
                     error="security policy was saved but not fully applied",

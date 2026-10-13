@@ -93,3 +93,29 @@ async def test_unified_security_incomplete_apply_keeps_target_status():
     assert response["ok"] is False
     assert response["code"] == "SECURITY_APPLY_INCOMPLETE"
     assert response["payload"] == payload
+
+
+@pytest.mark.asyncio
+async def test_managed_legacy_permissions_do_not_write_while_agent_offline(monkeypatch):
+    from jiuwenswarm.common.security_config_service import SecurityConfigService
+
+    monkeypatch.setattr(SecurityConfigService, "is_initialized", lambda self: True)
+    channel = Channel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+    await channel.methods["permissions.tools.set"](None, "test", {"tools": {"bash": "deny"}}, None)
+    assert channel.send_response.await_args.kwargs["code"] == "AGENT_NOT_READY"
+
+
+@pytest.mark.asyncio
+async def test_managed_legacy_incomplete_apply_keeps_target_status():
+    channel = Channel()
+    payload = {"tools": {"bash": "deny"}, "saved": True, "applied": False,
+               "apply": {"targets": {"sandbox": "external_pending"}}}
+    client = SimpleNamespace(server_ready=True, send_request=AsyncMock(
+        return_value=SimpleNamespace(ok=False, payload=payload),
+    ))
+    _register_web_handlers(WebHandlersBindParams(channel=channel, agent_client=client))
+    await channel.methods["permissions.tools.set"](None, "test", {"tools": {"bash": "deny"}}, None)
+    response = channel.send_response.await_args.kwargs
+    assert response["code"] == "SECURITY_APPLY_INCOMPLETE"
+    assert response["payload"] == payload

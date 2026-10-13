@@ -50,6 +50,14 @@ def test_initialize_keeps_live_and_splits_sources(service):
         service.initialize_from_live()
 
 
+def test_partial_initialization_never_reopens_legacy_writer(service):
+    service.initial_snapshot_path.write_text("permissions: {}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="partially initialized"):
+        service.is_initialized()
+    with pytest.raises(RuntimeError, match="already initialized"):
+        service.initialize_from_live()
+
+
 def test_cloud_versions_priority_and_source_switches(service):
     service.initialize_from_live()
     cloud_rules = {

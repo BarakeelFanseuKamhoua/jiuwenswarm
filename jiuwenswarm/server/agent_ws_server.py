@@ -5379,18 +5379,45 @@ class AgentWebSocketServer:
             dispatch_security_config_request,
             is_security_config_method,
         )
+        from jiuwenswarm.server.security_config_legacy_rpc import (
+            dispatch_managed_permissions_request,
+            is_managed_permissions_method,
+        )
+        from jiuwenswarm.common.security_config_service import SecurityConfigService
 
-        if is_security_config_method(request.req_method):
+        service = SecurityConfigService()
+        try:
+            managed_legacy = service.is_initialized() and is_managed_permissions_method(request.req_method)
+        except RuntimeError as exc:
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=False, payload={"error": str(exc), "code": "SOURCE_UNAVAILABLE"},
+                metadata=request.metadata,
+            )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+        if is_security_config_method(request.req_method) or managed_legacy:
             try:
                 apply_lock = getattr(self, "_security_config_apply_lock", None)
                 if apply_lock is None:
                     apply_lock = self._security_config_apply_lock = asyncio.Lock()
                 async with apply_lock:
-                    payload = await dispatch_security_config_request(
-                        request.req_method, request.params or {},
-                        agent_manager=self._agent_manager,
-                        restart_sandboxes=self._restart_configured_sandboxes,
-                    )
+                    if managed_legacy:
+                        payload = await dispatch_managed_permissions_request(
+                            request.req_method, request.params or {},
+                            agent_manager=self._agent_manager,
+                            restart_sandboxes=self._restart_configured_sandboxes,
+                            service=service,
+                        )
+                    else:
+                        payload = await dispatch_security_config_request(
+                            request.req_method, request.params or {},
+                            agent_manager=self._agent_manager,
+                            restart_sandboxes=self._restart_configured_sandboxes,
+                            service=service,
+                        )
                 resp = AgentResponse(
                     request_id=request.request_id, channel_id=request.channel_id,
                     ok=payload.get("applied", True), payload=payload,
@@ -5398,9 +5425,10 @@ class AgentWebSocketServer:
                 )
             except Exception as exc:
                 logger.exception("[security.config] request failed: %s", exc)
+                code = "NOT_FOUND" if isinstance(exc, LookupError) else "BAD_REQUEST" if isinstance(exc, ValueError) else "SECURITY_CONFIG_FAILED"
                 resp = AgentResponse(
                     request_id=request.request_id, channel_id=request.channel_id,
-                    ok=False, payload={"error": str(exc), "code": "SECURITY_CONFIG_FAILED"},
+                    ok=False, payload={"error": str(exc), "code": code},
                     metadata=request.metadata,
                 )
             wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
@@ -5408,7 +5436,35 @@ class AgentWebSocketServer:
                 await send_wire_payload(ws, wire)
             return
 
-        resp = dispatch_permissions_config_request(request)
+        apply_lock = getattr(self, "_security_config_apply_lock", None)
+        if apply_lock is None:
+            apply_lock = self._security_config_apply_lock = asyncio.Lock()
+        used_legacy_direct = False
+        async with apply_lock:
+            try:
+                if service.is_initialized() and is_managed_permissions_method(request.req_method):
+                    payload = await dispatch_managed_permissions_request(
+                        request.req_method, request.params or {},
+                        agent_manager=self._agent_manager,
+                        restart_sandboxes=self._restart_configured_sandboxes,
+                        service=service,
+                    )
+                    resp = AgentResponse(
+                        request_id=request.request_id, channel_id=request.channel_id,
+                        ok=payload.get("applied", True), payload=payload,
+                        metadata=request.metadata,
+                    )
+                else:
+                    used_legacy_direct = True
+                    resp = dispatch_permissions_config_request(request)
+            except Exception as exc:
+                logger.exception("[security.config] legacy request failed: %s", exc)
+                code = "NOT_FOUND" if isinstance(exc, LookupError) else "BAD_REQUEST" if isinstance(exc, ValueError) else "SOURCE_UNAVAILABLE"
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": code},
+                    metadata=request.metadata,
+                )
 
         # After any successful mutation (delete / update / set / create),
         # reload agent config so the PermissionInterruptRail picks up the
@@ -5418,7 +5474,7 @@ class AgentWebSocketServer:
             get_permissions_read_only_req_methods,
         )
 
-        if resp.ok and request.req_method not in get_permissions_read_only_req_methods():
+        if resp.ok and used_legacy_direct and request.req_method not in get_permissions_read_only_req_methods():
             # 后台异步重载: 不阻塞权限 RPC 回包(避免 reload 慢导致 AgentServer
             # request timed out)。reload_agents_config 内部有 _reload_lock 串行化
             # + fingerprint 去重,fire-and-forget 安全。
