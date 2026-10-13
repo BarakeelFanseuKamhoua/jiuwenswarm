@@ -179,6 +179,8 @@ async def apply_trusted_cloud_policy(
     """Trusted cloud ingress only; intentionally absent from public ReqMethod."""
     service = service or SecurityConfigService()
     state = service.replace_cloud_policy(policy_version, permissions)
+    if state["applied"]:
+        return {"saved": True, "applied": True, "apply": state}
     return await dispatch_security_config_request(
         ReqMethod.SECURITY_CONFIG_APPLY,
         {"expected_revision": state["revision"]},

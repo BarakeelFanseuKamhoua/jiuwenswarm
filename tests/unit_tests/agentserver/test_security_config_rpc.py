@@ -279,6 +279,95 @@ async def test_trusted_cloud_policy_uses_same_apply_path(service, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trusted_cloud_policy_duplicate_skips_apply_but_failed_apply_retries(service, monkeypatch):
+    manager = Manager()
+    attempts = []
+
+    def publish(_config):
+        attempts.append("host_exit")
+        if len(attempts) == 2:
+            raise RuntimeError("temporary failure")
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        publish,
+    )
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    initialized = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert initialized["applied"]
+    failed = await apply_trusted_cloud_policy(
+        1, {"tools": {"bash": "deny"}}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert not failed["applied"]
+    assert len(manager.configs) == 2
+    retried = await apply_trusted_cloud_policy(
+        1, {"tools": {"bash": "deny"}}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert retried["applied"]
+    assert retried["apply"]["revision"] == failed["apply"]["revision"]
+    assert len(manager.configs) == 3
+    repeated = await apply_trusted_cloud_policy(
+        1, {"tools": {"bash": "deny"}}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert repeated == retried
+    assert len(manager.configs) == 3
+
+
+@pytest.mark.asyncio
+async def test_disabled_cloud_source_saves_policy_without_enforcing_until_enabled(service, monkeypatch):
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        lambda _config: None,
+    )
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    manager = Manager()
+    await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    disabled = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SETTINGS_UPDATE,
+        {"patch": {"policy_sources": [
+            {"id": "user", "enabled": True},
+            {"id": "cloud", "enabled": False},
+            {"id": "builtin", "enabled": True},
+        ]}},
+        agent_manager=manager, restart_sandboxes=no_restart, service=service,
+    )
+    assert disabled["applied"]
+    received = await apply_trusted_cloud_policy(
+        1, {"tools": {"cloud_only": "deny"}}, agent_manager=manager,
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert received["applied"]
+    assert service.cloud_path.is_file()
+    assert "cloud_only" not in manager.configs[-1]["permissions"]["tools"]
+    enabled = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SETTINGS_UPDATE,
+        {"patch": {"policy_sources": [
+            {"id": "user", "enabled": True},
+            {"id": "cloud", "enabled": True},
+            {"id": "builtin", "enabled": True},
+        ]}},
+        agent_manager=manager, restart_sandboxes=no_restart, service=service,
+    )
+    assert enabled["applied"]
+    assert manager.configs[-1]["permissions"]["tools"]["cloud_only"] == "deny"
+
+
+@pytest.mark.asyncio
 async def test_network_source_uses_native_sandbox_sync(service, monkeypatch):
     from jiuwenswarm.common import config as config_module
 
@@ -316,6 +405,59 @@ async def test_network_source_uses_native_sandbox_sync(service, monkeypatch):
     assert live["permissions"]["net_guard"]["urls"] == {"example.org": "deny"}
     assert live["sandbox"]["urls"] == {"example.org": "deny"}
     assert restarts
+
+
+@pytest.mark.asyncio
+async def test_cloud_network_source_switch_updates_sandbox_projection(service, monkeypatch):
+    from jiuwenswarm.common import config as config_module
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        lambda _config: None,
+    )
+    restarts = []
+
+    async def restart(params):
+        restarts.append(params)
+        return {"status": "applied"}
+
+    manager = Manager()
+    initialized = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=manager,
+        restart_sandboxes=restart, service=service,
+    )
+    assert initialized["applied"]
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["enabled"] = True
+    dump_yaml_round_trip(service.config_path, live)
+    enabled = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
+        {"module": "network", "patch": {"enabled": True}},
+        agent_manager=manager, restart_sandboxes=restart, service=service,
+    )
+    assert enabled["applied"]
+    restarts_before_cloud = len(restarts)
+    cloud = await apply_trusted_cloud_policy(
+        1, {"net_guard": {"urls": {"blocked.example.org": "deny"}}},
+        agent_manager=manager, restart_sandboxes=restart, service=service,
+    )
+    assert cloud["applied"]
+    assert load_yaml_round_trip(service.config_path)["sandbox"]["urls"] == {
+        "blocked.example.org": "deny",
+    }
+    disabled = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SETTINGS_UPDATE,
+        {"patch": {"policy_sources": [
+            {"id": "user", "enabled": True},
+            {"id": "cloud", "enabled": False},
+            {"id": "builtin", "enabled": True},
+        ]}},
+        agent_manager=manager, restart_sandboxes=restart, service=service,
+    )
+    assert disabled["applied"]
+    assert load_yaml_round_trip(service.config_path)["sandbox"]["urls"] == {}
+    assert len(restarts) == restarts_before_cloud + 2
 
 
 @pytest.mark.asyncio
