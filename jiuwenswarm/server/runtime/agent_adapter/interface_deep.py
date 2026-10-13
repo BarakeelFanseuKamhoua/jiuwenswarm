@@ -6356,18 +6356,18 @@ class JiuWenSwarmDeepAdapter:
     @staticmethod
     def _build_model_from_entry(mcc: dict, mco: dict) -> Model:
         """根据单个模型条目的 model_client_config / model_config_obj 构建 Model 实例。"""
-        # 档位关键字（fast/balanced/extreme/auto）是 relay 前端的选择器，不是模型 id。
+        # 档位关键字（fast/balanced/extreme/auto）是宿主前端的选择器，不是模型 id。
         # 无 rail 的消费方（子代理继承 _deep_config.model、code 模式、DeepResearch 子进程）
-        # 会把它直送 MaaS → ModelArts.81009。在构建 Model 的唯一入口翻成具体模型；只改
+        # 会把它直送上游 → Invalid model。在构建 Model 的唯一入口翻成具体模型；只改
         # Model 的请求模型名，不动 mcc（cache key / identity 仍按档位登记）。
         from jiuwenswarm.agents.harness.common.model_gears import resolve_model_gear
 
         name = resolve_model_gear(mcc.get("model_name", ""))
-        # models.json 在 relay spawn 前落盘；未登录时 maas 条目 api_base/api_key 为空，
+        # models.json 在宿主 spawn 前落盘；未登录时官方通道条目 api_base/api_key 为空，
         # Model 构建会失败（整批跳过，四档路由只能 keep current）。登录后 invoke 同步
-        # 把 maas 凭证 env（API_BASE/API_KEY/default_headers）注入 tip，这里在 api_base
-        # 缺失时原位回填：仅当候选 base 命中 maas 端点标记才填，避免把自定义 OpenAI
-        # 网关误配给 maas 模型。原位修改 mcc 使 _register_model_cache_entry 的
+        # 把官方通道凭证 env（API_BASE/API_KEY/default_headers）注入 tip，这里在 api_base
+        # 缺失时原位回填：仅当候选 base 命中官方通道端点标记才填，避免把自定义 OpenAI
+        # 网关误配给官方通道模型。原位修改 mcc 使 _register_model_cache_entry 的
         # model_ref 哈希与注入后的一致。
         if not str(mcc.get("api_base") or "").strip():
             try:
@@ -7017,6 +7017,7 @@ class JiuWenSwarmDeepAdapter:
         react_agent = getattr(self._instance, "_react_agent", None)
         if react_agent is None:
             return
+        previous_model = getattr(react_agent, "_llm", None)
         if callable(getattr(react_agent, "set_llm", None)):
             react_agent.set_llm(model)
         config = getattr(react_agent, "_config", None)
@@ -7024,6 +7025,29 @@ class JiuWenSwarmDeepAdapter:
             config.model_name = model.model_config.model_name
             config.model_client_config = model.model_client_config
             config.model_config_obj = model.model_config
+        # 与 ModelRoutingRail 同口径：主模型切换后同步压缩器，避免压缩仍用无效模型名。
+        try:
+            from jiuwenswarm.agents.harness.common.model_gears import (
+                sync_agent_compressor_models,
+            )
+
+            synced = sync_agent_compressor_models(
+                react_agent,
+                model,
+                host=self._instance,
+                previous_model=previous_model,
+            )
+            if synced:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] compressor models synced after set_llm: count=%s model=%s",
+                    synced,
+                    getattr(model.model_config, "model_name", ""),
+                )
+        except Exception:
+            logger.debug(
+                "[JiuWenSwarmDeepAdapter] compressor model sync skipped",
+                exc_info=True,
+            )
         self._model_request_config = model.model_config
         # Keep adapter default + DeepAgent parent model in sync so omitted
         # task_tool model_* selectors inherit the currently switched model.

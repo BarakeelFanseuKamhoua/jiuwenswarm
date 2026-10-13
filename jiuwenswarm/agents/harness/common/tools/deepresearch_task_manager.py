@@ -285,9 +285,9 @@ class DeepResearchTaskManager:
         llm_model_name = read("LLM_MODEL_NAME").strip() or read("MODEL_NAME").strip()
         # 档位关键字（fast/balanced/extreme/auto）只对**单 agent 主链路**成立：那里
         # ModelRoutingRail 会读 request param 把它翻成具体模型。DeepResearch 子进程
-        # 走的是 env 通道（relay OFFICE_CLAW_EFFECTIVE_MODEL → MODEL_NAME），**没有
-        # rail 也没有 request params**，裸档位关键字会被当真实模型名直送 MaaS →
-        # ModelArts.81009 Invalid model。故在把配置交给隔离子进程前先翻成具体模型 id。
+        # 走的是 env 通道（宿主有效模型 env → MODEL_NAME），**没有 rail 也没有
+        # request params**，裸档位关键字会被当真实模型名直送上游 → Invalid model。
+        # 故在把配置交给隔离子进程前先翻成具体模型 id。
         if is_model_gear(llm_model_name):
             resolved_gear_model = resolve_model_gear(llm_model_name)
             logger.info(
