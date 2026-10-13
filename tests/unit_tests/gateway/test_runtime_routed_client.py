@@ -221,11 +221,22 @@ async def test_reverse_rpc_over_real_http_sse(monkeypatch, stream):
         await chat()
         assert registry.subscriber_count() == 1
         # Force SSE EOF, then verify the next chat waits for re-registration.
+        push_eof = asyncio.Event()
+        push_ready = client._pod_clients[base]._push_ready
+        clear_push_ready = push_ready.clear
+
+        def on_push_eof():
+            clear_push_ready()
+            push_eof.set()
+
+        monkeypatch.setattr(push_ready, "clear", on_push_eof)
         old_subscriber = next(iter(registry._subscribers))
         await registry._subscribers[old_subscriber].sink.finish()
         async with asyncio.timeout(5):
             while old_subscriber in registry._subscribers:
                 await asyncio.sleep(0.01)
+            # Server unregistration can precede the client's receipt of EOF.
+            await push_eof.wait()
         assert (await asyncio.wait_for(chat(), 5)).payload["total"] == 1
         if not stream:
             from jiuwenswarm.gateway.a2a_manager.tool_rpc import A2A_TOOL_DISPATCH_TASK
