@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from openjiuwen.core.runner.callback.errors import AbortError
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
@@ -75,6 +75,13 @@ def _permission_choice_label(payload: Any) -> str:
 
 class SkillAuthorizationPermissionRail(PermissionInterruptRail):
     """PermissionInterruptRail 子类：Skill 门禁已裁决的调用跳过权限 Rail。"""
+
+    def set_skill_scope_resolver(
+        self,
+        resolver: Callable[[AgentCallbackContext], tuple[str, str] | None],
+    ) -> None:
+        """由宿主绑定同一 Agent 的技能授权作用域解析器。"""
+        self._skill_scope_resolver = resolver
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
         if self._skill_authorization_gate_handled(ctx):
@@ -136,19 +143,29 @@ class SkillAuthorizationPermissionRail(PermissionInterruptRail):
         )
 
         authorization = get_skill_authorization_context()
+        scope = None
         if (
-            authorization is None
-            or not authorization.session_id
-            or not authorization.agent_scope_id
+            authorization is not None
+            and authorization.session_id
+            and authorization.agent_scope_id
         ):
+            scope = authorization.session_id, authorization.agent_scope_id
+        else:
+            resolver = getattr(self, "_skill_scope_resolver", None)
+            if resolver is not None:
+                scope = resolver(ctx)
+        if scope is None:
+            logger.debug("[PermissionEngine] skill_overlay.fallback reason=no_scope")
             super()._refresh_permissions_for_tool_call(ctx)
             return
+        session_id, agent_scope_id = scope
         grant_store = get_skill_grant_store()
-        active = grant_store.get_active(
-            authorization.session_id,
-            authorization.agent_scope_id,
-        )
+        active = grant_store.get_active(session_id, agent_scope_id)
         if active is None:
+            logger.debug(
+                "[PermissionEngine] skill_overlay.fallback reason=no_active_grant session=%s scope=%s",
+                session_id, agent_scope_id,
+            )
             super()._refresh_permissions_for_tool_call(ctx)
             return
         base_config = super()._get_permissions_snapshot(ctx)
@@ -156,11 +173,15 @@ class SkillAuthorizationPermissionRail(PermissionInterruptRail):
             base_config = self._static_config
         effective_config = _compose_active_skill_permissions(
             base_config,
-            authorization.session_id,
-            authorization.agent_scope_id,
+            session_id,
+            agent_scope_id,
             grant_store,
         )
         self._engine.update_config(effective_config)
+        logger.info(
+            "[PermissionEngine] skill_overlay.applied session=%s scope=%s skill=%s tool=%s",
+            session_id, agent_scope_id, active.skill_name, _tool_name_from_ctx(ctx),
+        )
 
     def _skill_authorization_gate_handled(self, ctx: AgentCallbackContext) -> bool:
         """本次 skill_tool/skill_complete 是否已被动态授权门禁接管。"""
