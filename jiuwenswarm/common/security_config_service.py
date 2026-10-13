@@ -399,6 +399,49 @@ class SecurityConfigService:
             self._write_state(state)
             return deepcopy(state)
 
+    def update_permission_profile(self, patch: dict[str, Any], *, expected_revision: str | None = None) -> dict[str, Any]:
+        """Apply the desktop permission preset to settings and user tool baselines together."""
+        fields = {"enabled", "permission_mode", "bash_level", "network_level", "file_guard_default_rw"}
+        if not isinstance(patch, dict) or set(patch) != fields:
+            raise ValueError("permission profile requires enabled/mode/tool/file levels")
+        if (not isinstance(patch["enabled"], bool) or not isinstance(patch["permission_mode"], str)
+                or patch["permission_mode"] not in {"normal", "strict"}):
+            raise ValueError("invalid permission profile mode")
+        for key in ("bash_level", "network_level", "file_guard_default_rw"):
+            if not isinstance(patch[key], str) or patch[key] not in {"allow", "ask"}:
+                raise ValueError(f"invalid permission profile {key}")
+        with self._thread_lock, self._locked():
+            self._check_revision(expected_revision)
+            settings, local, cloud = self._load()
+            if not any(
+                item["id"] == "user" and item["enabled"]
+                for item in settings["security"]["policy_sources"]
+            ):
+                local = validate_source(self._read_yaml(self.local_path))
+            permissions = settings.setdefault("permissions", {})
+            permissions["enabled"] = patch["enabled"]
+            permissions["permission_mode"] = patch["permission_mode"]
+            file_guard = permissions.setdefault("file_guard", {})
+            file_guard.setdefault("enabled", True)
+            defaults = file_guard.setdefault("defaults", {})
+            defaults.setdefault("exec", "allow")
+            defaults.update(read=patch["file_guard_default_rw"], write=patch["file_guard_default_rw"])
+            tools = local.setdefault("permissions", {}).setdefault("tools", {})
+            tools.update({
+                "bash": patch["bash_level"],
+                "mcp_free_search": patch["network_level"],
+                "mcp_paid_search": patch["network_level"],
+                "mcp_fetch_webpage": patch["network_level"],
+            })
+            settings = validate_settings(settings)
+            local = validate_source(local)
+            state = self._pending_state()
+            compose_candidate(settings, self._sources(settings, local, cloud), state["revision"])
+            dump_yaml_round_trip(self.settings_path, settings)
+            dump_yaml_round_trip(self.local_path, local)
+            self._write_state(state)
+            return deepcopy(state)
+
     def persist_user_approval(self, grant: dict[str, Any]) -> bool:
         """Persist one Rail-generated grant without copying composed rules to user."""
         if not isinstance(grant, dict) or not isinstance(grant.get("id"), str) or not grant["id"]:

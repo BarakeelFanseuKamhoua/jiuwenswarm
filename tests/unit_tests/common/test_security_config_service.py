@@ -50,6 +50,66 @@ def test_initialize_keeps_live_and_splits_sources(service):
         service.initialize_from_live()
 
 
+def test_permission_profile_updates_settings_and_local_without_touching_cloud(service):
+    first = service.initialize_from_live()
+    cloud = service.replace_cloud_policy(1, {"tools": {"bash": "deny"}})
+    profile = {
+        "enabled": False, "permission_mode": "normal", "bash_level": "allow",
+        "network_level": "allow", "file_guard_default_rw": "allow",
+    }
+    updated = service.update_permission_profile(profile, expected_revision=cloud["revision"])
+    candidate = service.get_candidate()
+    assert updated["revision"] != first["revision"]
+    assert candidate["settings"]["permissions"]["enabled"] is False
+    assert candidate["settings"]["permissions"]["file_guard"]["defaults"]["write"] == "allow"
+    assert candidate["local"]["permissions"]["tools"]["mcp_free_search"] == "allow"
+    assert candidate["cloud"]["permissions"]["tools"] == {"bash": "deny"}
+    assert candidate["permissions"]["tools"]["bash"] == "deny"
+    with pytest.raises(ValueError, match="VERSION_CONFLICT"):
+        service.update_permission_profile(profile, expected_revision=cloud["revision"])
+    with pytest.raises(ValueError, match="invalid permission profile"):
+        service.update_permission_profile({**profile, "network_level": ["allow"]})
+
+
+def test_permission_profile_preserves_existing_file_guard_switch_and_exec_default(service):
+    service.initialize_from_live()
+    settings = load_yaml_round_trip(service.settings_path)
+    settings["permissions"]["file_guard"].update(
+        enabled=False, defaults={"read": "ask", "write": "ask", "exec": "deny"},
+    )
+    dump_yaml_round_trip(service.settings_path, settings)
+    revision = service.get_candidate()["apply"]["revision"]
+    service.update_permission_profile({
+        "enabled": True, "permission_mode": "normal", "bash_level": "allow",
+        "network_level": "allow", "file_guard_default_rw": "allow",
+    }, expected_revision=revision)
+    guard = service.get_candidate()["settings"]["permissions"]["file_guard"]
+    assert guard["enabled"] is False
+    assert guard["defaults"] == {"read": "allow", "write": "allow", "exec": "deny"}
+
+
+def test_profile_change_preserves_disabled_user_rules(service):
+    service.initialize_from_live()
+    sources = [
+        {"id": "user", "enabled": False},
+        {"id": "cloud", "enabled": True},
+        {"id": "builtin", "enabled": True},
+    ]
+    disabled = service.update_settings({"policy_sources": sources})
+    profile = {
+        "enabled": True, "permission_mode": "strict", "bash_level": "ask",
+        "network_level": "ask", "file_guard_default_rw": "ask",
+    }
+    service.update_permission_profile(profile, expected_revision=disabled["revision"])
+    stored = load_yaml_round_trip(service.local_path)["permissions"]
+    assert stored["rules"][0]["id"] == "user-1"
+    assert stored["file_guard"]["paths"][0]["path"] == "/private"
+    assert stored["tools"]["bash"] == "ask"
+    sources[0]["enabled"] = True
+    service.update_settings({"policy_sources": sources})
+    assert service.get_candidate()["local"]["permissions"]["rules"][0]["id"] == "user-1"
+
+
 def test_partial_initialization_never_reopens_legacy_writer(service):
     service.initial_snapshot_path.write_text("permissions: {}\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="partially initialized"):

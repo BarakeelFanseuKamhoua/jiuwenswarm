@@ -34,6 +34,20 @@ def service(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_reports_uninitialized_without_adopting_live_config(service):
+    async def unexpected_restart(_params):
+        pytest.fail("read must not apply sandbox")
+
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_GET, {}, agent_manager=Manager(),
+        restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert result == {"initialized": False}
+    assert not service.settings_path.exists()
+    assert not service.local_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_initialize_and_update_apply_without_sandbox_restart(service, monkeypatch):
     manager = Manager()
     published = []
@@ -50,6 +64,12 @@ async def test_initialize_and_update_apply_without_sandbox_restart(service, monk
         restart_sandboxes=unexpected_restart, service=service,
     )
     assert first["applied"] and first["apply"]["targets"]["sandbox"] == "not_required"
+    queried = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_GET, {}, agent_manager=manager,
+        restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert queried["initialized"] is True
+    assert queried["apply"]["revision"] == first["apply"]["revision"]
     second = await dispatch_security_config_request(
         ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
         {"module": "tool", "value": {"bash": "deny"}, "expected_revision": first["apply"]["revision"]},
@@ -59,6 +79,70 @@ async def test_initialize_and_update_apply_without_sandbox_restart(service, monk
     assert manager.configs[-1]["permissions"]["tools"]["bash"] == "deny"
     assert published[-1]["permissions"]["composition"]["revision"] == second["apply"]["revision"]
     assert service.get_candidate()["apply"]["status"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_profile_defaults_change_does_not_restart_sandbox(service, monkeypatch):
+    from jiuwenswarm.common import config as config_module
+
+    service._builtin_reader = lambda: {"permissions": {}}
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["enabled"] = True
+    live["permissions"]["file_guard"] = {
+        "enabled": True, "defaults": {"read": "allow", "write": "allow", "exec": "allow"}, "paths": [],
+    }
+    live["permissions"]["net_guard"] = {"enabled": True, "defaults": "allow", "urls": {}}
+    dump_yaml_round_trip(service.config_path, live)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        lambda _config: None,
+    )
+
+    async def unexpected_restart(_params):
+        pytest.fail("file defaults are not a sandbox ACL change")
+
+    first = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=Manager(),
+        restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert service.get_candidate()["permissions"]["file_guard"]["paths"] == []
+    assert first["applied"], first["apply"]["targets"]
+    profile = {
+        "enabled": True, "permission_mode": "strict", "bash_level": "ask",
+        "network_level": "ask", "file_guard_default_rw": "ask",
+    }
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_PROFILE_UPDATE,
+        {"patch": profile, "expected_revision": first["apply"]["revision"]},
+        agent_manager=Manager(), restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert result["applied"], result["apply"]["targets"]
+    assert result["apply"]["targets"]["sandbox"] == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_initialization_keeps_existing_sandbox_when_builtin_paths_cannot_project(service):
+    service._builtin_reader = lambda: {"permissions": {"file_guard": {"paths": [
+        {"path": "**/.ssh/**", "match": "glob", "read": "deny", "write": "deny", "exec": "deny"},
+    ]}}}
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"].update(enabled=True, files=[])
+    live["permissions"]["file_guard"] = {"enabled": True, "paths": []}
+    dump_yaml_round_trip(service.config_path, live)
+    manager = Manager()
+
+    async def unexpected_restart(_params):
+        pytest.fail("unrepresentable builtins must not restart the sandbox")
+
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_INITIALIZE, {}, agent_manager=manager,
+        restart_sandboxes=unexpected_restart, service=service,
+    )
+    assert result["saved"] and not result["applied"]
+    assert "UNSUPPORTED_COVERAGE" in result["apply"]["targets"]["sandbox"]
+    assert load_yaml_round_trip(service.config_path) == live
+    assert not manager.configs
 
 
 @pytest.mark.asyncio

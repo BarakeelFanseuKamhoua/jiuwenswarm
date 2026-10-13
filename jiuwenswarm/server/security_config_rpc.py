@@ -15,6 +15,7 @@ _METHODS = frozenset({
     ReqMethod.SECURITY_CONFIG_SETTINGS_UPDATE,
     ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
     ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
+    ReqMethod.SECURITY_CONFIG_PROFILE_UPDATE,
     ReqMethod.SECURITY_CONFIG_APPLY,
     ReqMethod.SECURITY_CONFIG_SANDBOX_GET,
     ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE,
@@ -66,8 +67,8 @@ def _check_sandbox_coverage(permissions: dict[str, Any], live: dict[str, Any]) -
     from jiuwenswarm.common.net_guard_config import project_net_guard_to_sandbox
 
     previous = live.get("permissions") or {}
-    file_changed = previous.get("file_guard") != permissions.get("file_guard")
-    net_changed = previous.get("net_guard") != permissions.get("net_guard")
+    file_changed = _sandbox_rule_fields_changed(previous, permissions, "file_guard", "paths")
+    net_changed = _sandbox_rule_fields_changed(previous, permissions, "net_guard", "urls")
     sandbox = live.get("sandbox") or {}
     if not sandbox.get("enabled") or not (file_changed or net_changed):
         return
@@ -104,6 +105,12 @@ def _check_sandbox_coverage(permissions: dict[str, Any], live: dict[str, Any]) -
         _, skipped = project_net_guard_to_sandbox(guard)
         if skipped:
             raise ValueError(f"UNSUPPORTED_COVERAGE network: {skipped}")
+
+
+def _sandbox_rule_fields_changed(before: dict[str, Any], after: dict[str, Any], module: str, field: str) -> bool:
+    old = before.get(module) or {}
+    new = after.get(module) or {}
+    return old.get(field) != new.get(field) or old.get("enabled") != new.get("enabled")
 
 
 def _get_native_sandbox_config(service: SecurityConfigService) -> dict[str, Any]:
@@ -267,7 +274,9 @@ async def dispatch_security_config_request(
     if method == ReqMethod.SECURITY_CONFIG_GET:
         if params:
             raise ValueError("security.config.get accepts no parameters")
-        return service.get_candidate()
+        if not service.is_initialized():
+            return {"initialized": False}
+        return {"initialized": True, **service.get_candidate()}
     if method == ReqMethod.SECURITY_BUILTIN_GET:
         if set(params) != {"module"}:
             raise ValueError("security.builtin.get requires module only")
@@ -292,6 +301,8 @@ async def dispatch_security_config_request(
         state = service.update_local(params.get("module"), params.get("value"), expected_revision=expected)
     elif method == ReqMethod.SECURITY_CONFIG_MODULE_UPDATE:
         state = service.update_module_settings(params.get("module"), params.get("patch"), expected_revision=expected)
+    elif method == ReqMethod.SECURITY_CONFIG_PROFILE_UPDATE:
+        state = service.update_permission_profile(params.get("patch"), expected_revision=expected)
     elif method == ReqMethod.SECURITY_CONFIG_APPLY:
         state = service.get_candidate()["apply"]
         if expected is not None and state["revision"] != expected:
@@ -318,8 +329,8 @@ async def dispatch_security_config_request(
     before = previous.get("permissions") or {}
     after = config.get("permissions") or {}
     sandbox = config.get("sandbox") or {}
-    file_changed = before.get("file_guard") != after.get("file_guard")
-    net_changed = before.get("net_guard") != after.get("net_guard")
+    file_changed = _sandbox_rule_fields_changed(before, after, "file_guard", "paths")
+    net_changed = _sandbox_rule_fields_changed(before, after, "net_guard", "urls")
 
     from jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc import (
         publish_host_exit_policy_from_config,

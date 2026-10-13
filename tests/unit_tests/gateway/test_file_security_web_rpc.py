@@ -45,7 +45,8 @@ async def test_sandbox_web_rpc_requires_agent(method):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", [
     "security.config.get", "security.config.initialize", "security.config.settings.update",
-    "security.config.local.update", "security.config.module.update", "security.config.apply",
+    "security.config.local.update", "security.config.module.update", "security.config.profile.update",
+    "security.config.apply",
     "security.config.sandbox.get", "security.config.sandbox.update", "security.builtin.get",
 ])
 async def test_unified_security_web_rpc_requires_agent(method):

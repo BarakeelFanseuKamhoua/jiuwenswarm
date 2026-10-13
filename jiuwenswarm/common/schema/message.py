@@ -195,6 +195,7 @@ class ReqMethod(Enum):
     SECURITY_CONFIG_SETTINGS_UPDATE = "security.config.settings.update"
     SECURITY_CONFIG_LOCAL_UPDATE = "security.config.local.update"
     SECURITY_CONFIG_MODULE_UPDATE = "security.config.module.update"
+    SECURITY_CONFIG_PROFILE_UPDATE = "security.config.profile.update"
     SECURITY_CONFIG_APPLY = "security.config.apply"
     SECURITY_CONFIG_SANDBOX_GET = "security.config.sandbox.get"
     SECURITY_CONFIG_SANDBOX_UPDATE = "security.config.sandbox.update"
