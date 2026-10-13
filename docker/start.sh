@@ -25,5 +25,21 @@ if ! /usr/local/bin/python3 "${SCRIPT_DIR}/update_conf.py"; then
     exit 1
 fi
 
+# AGENT_RUNTIME_ENABLED=false（不部署 agent-runtime）时，关断 gateway 的 runtime
+# 路由扩展
+if [ "${ROLE}" = "gateway" ] && [ "${AGENT_RUNTIME_ENABLED}" == "false" ]; then
+    ext_dir="${EXTENSION_DIRS:-packages/jiuwenclaw-ee/gateway/extensions}"
+    if [ -z "${EXTENSION_DIRS:-}" ]; then
+        echo "[start.sh] WARNING: EXTENSION_DIRS not set, fallback to '${ext_dir}'" >&2
+    fi
+    file="${ext_dir}/runtime_management_extension/extension.yaml"
+    if [ -f "${file}" ]; then
+        yq -i '.enabled = false' "${file}"
+        echo "[start.sh] AGENT_RUNTIME_ENABLED=false → runtime extension disabled: ${file}"
+    else
+        echo "[start.sh] WARNING: runtime extension file not found, skip disabling: ${file}" >&2
+    fi
+fi
+
 echo "[start.sh] starting jiuwenswarm-${ROLE}"
 exec "jiuwenswarm-${ROLE}"
