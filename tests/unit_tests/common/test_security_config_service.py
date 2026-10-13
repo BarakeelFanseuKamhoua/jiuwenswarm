@@ -71,6 +71,17 @@ def test_builtin_rules_are_read_only_even_when_source_is_disabled(service):
         service.get_builtin("sandbox")
 
 
+def test_builtin_package_change_invalidates_applied_revision(service):
+    service.initialize_from_live()
+    first = service.publish_candidate()["apply"]["revision"]
+    service.record_apply(first, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+    service._builtin_reader = lambda: {"permissions": {"tools": {"new_builtin": "deny"}}}
+    snapshot = service.get_candidate()
+    assert snapshot["apply"]["revision"] != first
+    assert snapshot["apply"]["status"] == "applying"
+    assert snapshot["permissions"]["tools"]["new_builtin"] == "deny"
+
+
 def test_cloud_versions_priority_and_source_switches(service):
     service.initialize_from_live()
     cloud_rules = {

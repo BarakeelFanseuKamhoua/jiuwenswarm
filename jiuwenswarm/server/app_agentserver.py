@@ -237,6 +237,14 @@ async def _run(host: str, port: int) -> None:
 
     server = AgentWebSocketServer.get_instance(host=host, port=port)
 
+    from jiuwenswarm.server.security_config_rpc import resume_managed_security_on_start
+
+    await resume_managed_security_on_start(
+        agent_manager=server.get_agent_manager(),
+        restart_sandboxes=server._restart_configured_sandboxes,
+    )
+    full_cfg = get_config()
+
     stop_event = asyncio.Event()
 
     # 桌面 E2A stdio 形态（密钥包 e2aTransport=='stdio'——字段判定而非密钥包存在，

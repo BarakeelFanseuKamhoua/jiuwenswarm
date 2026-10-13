@@ -110,10 +110,16 @@ class SecurityConfigService:
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     def _source_hashes(self) -> dict[str, str | None]:
-        return {
+        hashes = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
             for path in (self.settings_path, self.local_path, self.cloud_path)
         }
+        if self.settings_path.is_file():
+            settings = validate_settings(self._read_yaml(self.settings_path))
+            if any(item["id"] == "builtin" and item["enabled"] for item in settings["security"]["policy_sources"]):
+                builtin = json.dumps(self._builtin_reader(), sort_keys=True, ensure_ascii=False, default=str)
+                hashes["builtin"] = hashlib.sha256(builtin.encode("utf-8")).hexdigest()
+        return hashes
 
     def _write_state(self, state: dict[str, Any]) -> None:
         from jiuwenswarm.common.config import _atomic_replace

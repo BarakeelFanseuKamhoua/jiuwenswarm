@@ -7,7 +7,11 @@ import pytest
 from jiuwenswarm.common.config import dump_yaml_round_trip, load_yaml_round_trip
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.security_config_service import SecurityConfigService
-from jiuwenswarm.server.security_config_rpc import apply_trusted_cloud_policy, dispatch_security_config_request
+from jiuwenswarm.server.security_config_rpc import (
+    apply_trusted_cloud_policy,
+    dispatch_security_config_request,
+    resume_managed_security_on_start,
+)
 
 
 class Manager:
@@ -72,6 +76,75 @@ async def test_builtin_get_does_not_publish_or_restart(service):
         await dispatch_security_config_request(
             ReqMethod.SECURITY_BUILTIN_GET, {"module": "tool", "other": 1},
             agent_manager=Manager(), restart_sandboxes=unexpected_restart, service=service,
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_replays_pending_sources_before_ready(service, monkeypatch):
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        lambda _config: None,
+    )
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    assert await resume_managed_security_on_start(
+        agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
+    ) is None
+    service.initialize_from_live()
+    manager = Manager()
+    state = await resume_managed_security_on_start(
+        agent_manager=manager, restart_sandboxes=no_restart, service=service,
+    )
+    assert state["applied"] and manager.configs
+    already_applied = Manager()
+    await resume_managed_security_on_start(
+        agent_manager=already_applied, restart_sandboxes=no_restart, service=service,
+    )
+    assert not already_applied.configs
+    service.update_local("tool", {"bash": "deny"})
+    resumed = Manager()
+    state = await resume_managed_security_on_start(
+        agent_manager=resumed, restart_sandboxes=no_restart, service=service,
+    )
+    assert state["applied"]
+    assert resumed.configs[-1]["permissions"]["tools"]["bash"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_announce_ready_after_apply_failure(service, monkeypatch):
+    service.initialize_from_live()
+
+    def fail(_config):
+        raise RuntimeError("host exit unavailable")
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc.publish_host_exit_policy_from_config",
+        fail,
+    )
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        await resume_managed_security_on_start(
+            agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
+        )
+    assert service.get_candidate()["apply"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_startup_rejects_old_core_even_for_applied_state(service, monkeypatch):
+    from openjiuwen.harness.security.permission_engine import core
+
+    service.initialize_from_live()
+    revision = service.publish_candidate()["apply"]["revision"]
+    service.record_apply(revision, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+    monkeypatch.setattr(core, "COMPOSITION_SCHEMA_VERSION", 0)
+    with pytest.raises(RuntimeError, match="does not support"):
+        await resume_managed_security_on_start(
+            agent_manager=Manager(), restart_sandboxes=None, service=service,
         )
 
 

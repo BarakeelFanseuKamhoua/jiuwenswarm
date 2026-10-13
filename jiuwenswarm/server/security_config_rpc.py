@@ -186,3 +186,30 @@ async def apply_trusted_cloud_policy(
         restart_sandboxes=restart_sandboxes,
         service=service,
     )
+
+
+async def resume_managed_security_on_start(
+    *, agent_manager: Any, restart_sandboxes: Any,
+    service: SecurityConfigService | None = None,
+) -> dict[str, Any] | None:
+    """Restore the latest source revision before AgentServer accepts requests."""
+    service = service or SecurityConfigService()
+    if not service.is_initialized():
+        return None
+    from openjiuwen.harness.security.permission_engine import core as permission_core
+
+    if getattr(permission_core, "COMPOSITION_SCHEMA_VERSION", None) != 1:
+        raise RuntimeError("installed core does not support security composition v1")
+    state = service.get_candidate()["apply"]
+    if state["applied"]:
+        return state
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_APPLY,
+        {"expected_revision": state["revision"]},
+        agent_manager=agent_manager,
+        restart_sandboxes=restart_sandboxes,
+        service=service,
+    )
+    if not result["applied"]:
+        raise RuntimeError(f"managed security configuration is not ready: {result['apply']['targets']}")
+    return result["apply"]
