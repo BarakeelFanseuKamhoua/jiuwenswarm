@@ -134,6 +134,23 @@ def test_composed_overlay_cannot_replace_cloud_deny(tmp_path):
     assert pp.apply_session_permissions_overlay(base, overlay)["file_guard"]["enabled"] is False
 
 
+@pytest.mark.parametrize("overlay_enabled,with_path", [(True, False), (None, True), (True, True)])
+def test_session_overlay_preserves_explicit_file_guard_disable(overlay_enabled, with_path):
+    pp = _load_permissions_persist()
+    base = {"enabled": True, "file_guard": {"enabled": False, "paths": []}}
+    guard = {}
+    if overlay_enabled is not None:
+        guard["enabled"] = overlay_enabled
+    if with_path:
+        guard["paths"] = [{"path": "D:/remembered", "read": "allow"}]
+
+    merged = pp.apply_session_permissions_overlay(base, {"file_guard": guard})
+
+    assert merged["file_guard"]["enabled"] is False
+    assert bool(merged["file_guard"]["paths"]) is with_path
+    assert base["file_guard"] == {"enabled": False, "paths": []}
+
+
 def test_persist_session_allow_rule_writes_overlay(sessions_root):
     pp = _load_permissions_persist()
     token = CURRENT_SESSION_ID.set("sess-abc")

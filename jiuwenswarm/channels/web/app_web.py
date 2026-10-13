@@ -1139,6 +1139,8 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
         try:
             from jiuwenswarm.agents.harness.common.tools.web_file_download import (
+                OUTBOUND_DOWNLOAD_PURPOSE,
+                open_outbound_download,
                 validate_file_download_token,
             )
         except ImportError:
@@ -1155,17 +1157,30 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             self._write_json(404, {"error": "file_not_found"})
             return
         candidate = Path(file_path)
-        if not self._is_path_under_allowed_root(candidate):
+        approved_outbound = payload.get("purpose") == OUTBOUND_DOWNLOAD_PURPOSE
+        if not approved_outbound and not self._is_path_under_allowed_root(candidate):
             self._write_json(403, {"error": "forbidden_path"})
             return
-        resolved = candidate.resolve()
-        if not resolved.is_file():
-            self._write_json(404, {"error": "file_not_found"})
-            return
-        file_path = str(resolved)
+        if not approved_outbound:
+            resolved = candidate.resolve()
+            if not resolved.is_file():
+                self._write_json(404, {"error": "file_not_found"})
+                return
+            file_path = str(resolved)
 
+        download_file = None
         try:
-            file_size = os.path.getsize(file_path)
+            try:
+                download_file = (
+                    open_outbound_download(file_path) if approved_outbound else open(file_path, "rb")
+                )
+            except FileNotFoundError:
+                self._write_json(404, {"error": "file_not_found"})
+                return
+            except OSError:
+                self._write_json(403, {"error": "forbidden_path"})
+                return
+            file_size = os.fstat(download_file.fileno()).st_size
             file_name = os.path.basename(file_path)
 
             mime_type, _ = mimetypes.guess_type(file_name)
@@ -1218,34 +1233,33 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 self.connection.settimeout(30)
                 last_progress = time.time()
                 try:
-                    with open(file_path, "rb") as f:
-                        f.seek(start)
-                        remaining = content_length
-                        while remaining > 0:
-                            chunk = f.read(min(65536, remaining))
-                            if not chunk:
-                                break
-                            try:
-                                self.wfile.write(chunk)
-                                last_progress = time.time()
-                                remaining -= len(chunk)
-                            except (
-                                socket.timeout,
-                                TimeoutError,
-                                BrokenPipeError,
-                                ConnectionResetError,
-                                ConnectionError,
-                            ) as werr:
-                                self.log_error(
-                                    "file download write failed/timeout: %s", werr
-                                )
-                                break
-                            if time.time() - last_progress > 120:
-                                self.log_error(
-                                    "file download stalled over 120s, aborting: %s",
-                                    file_path,
-                                )
-                                break
+                    download_file.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = download_file.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                            last_progress = time.time()
+                            remaining -= len(chunk)
+                        except (
+                            socket.timeout,
+                            TimeoutError,
+                            BrokenPipeError,
+                            ConnectionResetError,
+                            ConnectionError,
+                        ) as werr:
+                            self.log_error(
+                                "file download write failed/timeout: %s", werr
+                            )
+                            break
+                        if time.time() - last_progress > 120:
+                            self.log_error(
+                                "file download stalled over 120s, aborting: %s",
+                                file_path,
+                            )
+                            break
                 finally:
                     try:
                         self.connection.settimeout(None)
@@ -1254,6 +1268,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         except Exception as exc:
             # 头已发出，不再回 JSON（原 _write_json 在 Content-Length 已发后必失败且可能踩坏连接）
             self.log_error("file download error: %s", exc)
+        finally:
+            if download_file is not None:
+                download_file.close()
 
     def _handle_file_api_post(self, parsed) -> None:
         if parsed.path == "/file-api/rebuild-agent-data":

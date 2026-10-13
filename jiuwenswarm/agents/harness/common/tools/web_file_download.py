@@ -20,15 +20,64 @@ import json
 import logging
 import os
 import secrets
+import stat
+import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXPIRES_SECONDS = 600
 _SECRET_ENV_KEY = "JIUWENSWARM_FILE_DOWNLOAD_SECRET"
 _SECRET_FILE_NAME = ".file_download_secret"
+OUTBOUND_DOWNLOAD_PURPOSE = "approved-outbound-file"
+_SESSION_DOWNLOAD_KEY_FILE = ".outbound_download_key"
+
+
+def _session_download_generation(session_id: str, *, create: bool = False) -> str:
+    """Bind downloads to one session lifetime, without a revocation database.
+
+    Never create a session here. An atomic hard link publishes a complete random
+    key so concurrent issuers share one generation, even across processes. Only
+    its digest is included in tokens; deleting the session removes the key.
+    """
+    from jiuwenswarm.common.utils import is_persistable_session_id
+    from jiuwenswarm.server.runtime.session.session_history import resolve_session_dir
+
+    if not isinstance(session_id, str) or not is_persistable_session_id(session_id):
+        raise ValueError("outbound download requires an existing session")
+    session_dir, _ = resolve_session_dir(session_id)
+    if session_dir is None or not session_dir.is_dir():
+        raise ValueError("outbound download requires an existing session")
+    key_path = session_dir / _SESSION_DOWNLOAD_KEY_FILE
+
+    def read_generation() -> str:
+        with open_outbound_download(str(key_path)) as stream:
+            key = stream.read(33)
+        if len(key) != 32:
+            raise ValueError("invalid session download key")
+        return hashlib.sha256(key).hexdigest()
+
+    try:
+        return read_generation()
+    except FileNotFoundError:
+        if not create:
+            raise
+    # Do not replace an existing key: that would revoke concurrent deliveries.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=session_dir, prefix=".download-key-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(secrets.token_bytes(32))
+        try:
+            os.link(temporary, key_path)
+        except FileExistsError:
+            pass
+        return read_generation()
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _get_secret_file_path() -> Path:
@@ -90,12 +139,21 @@ class WebFileDownloadManager:
         file_path: str,
         session_id: str = "",
         expires_in: int = _DEFAULT_EXPIRES_SECONDS,
+        *,
+        approved_outbound: bool = False,
     ) -> str:
         payload = {
             "path": file_path,
             "exp": int(time.time()) + expires_in,
             "sid": session_id,
         }
+        if approved_outbound:
+            # The caller must have checked this exact path through SysOperation.
+            # Do not resolve again here: a replaced link must not gain authority.
+            if not Path(file_path).is_absolute():
+                raise ValueError("outbound download requires an absolute path")
+            payload["purpose"] = OUTBOUND_DOWNLOAD_PURPOSE
+            payload["session_generation"] = _session_download_generation(session_id, create=True)
         payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         payload_b64 = base64.urlsafe_b64encode(
             payload_json.encode("utf-8")
@@ -125,6 +183,12 @@ class WebFileDownloadManager:
             payload = json.loads(payload_json)
             if not isinstance(payload, dict):
                 return None
+            if payload.get("purpose") == OUTBOUND_DOWNLOAD_PURPOSE:
+                generation = payload.get("session_generation")
+                if not isinstance(generation, str) or not hmac.compare_digest(
+                    generation, _session_download_generation(payload.get("sid")),
+                ):
+                    return None
             return payload
         except Exception:
             logger.debug("[WebFileDownload] 令牌解析异常", exc_info=True)
@@ -139,9 +203,11 @@ def generate_file_download_token(
     file_path: str,
     session_id: str = "",
     expires_in: int = _DEFAULT_EXPIRES_SECONDS,
+    *,
+    approved_outbound: bool = False,
 ) -> str:
     return WebFileDownloadManager.get_instance().generate_token(
-        file_path, session_id, expires_in
+        file_path, session_id, expires_in, approved_outbound=approved_outbound
     )
 
 
@@ -154,8 +220,12 @@ def build_file_download_info(
     file_name: str,
     session_id: str = "",
     expires_in: int = _DEFAULT_EXPIRES_SECONDS,
+    *,
+    approved_outbound: bool = False,
 ) -> dict[str, Any]:
-    token = generate_file_download_token(file_path, session_id, expires_in)
+    token = generate_file_download_token(
+        file_path, session_id, expires_in, approved_outbound=approved_outbound
+    )
     download_url = WebFileDownloadManager.get_instance().generate_download_url(token)
 
     file_size = 0
@@ -178,3 +248,61 @@ def build_file_download_info(
         "download_url": download_url,
         "download_token": token,
     }
+
+
+def open_outbound_download(file_path: str) -> BinaryIO:
+    """Open the signed live path without allowing link redirection.
+
+    Validate the Windows handle before reading; on POSIX walk directory handles
+    with O_NOFOLLOW. The caller must stream this same handle, never reopen by path.
+    """
+    path = Path(file_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise PermissionError("forbidden_path")
+    fd = None
+    try:
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            fd = os.open(path, os.O_RDONLY | os.O_BINARY)
+            get_path = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+            get_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+            get_path.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_path(msvcrt.get_osfhandle(fd), buffer, len(buffer), 0)
+            if not length or length >= len(buffer):
+                raise PermissionError("forbidden_path")
+
+            def normalized(value: str) -> str:
+                if value.startswith("\\\\?\\UNC\\"):
+                    value = "\\\\" + value[8:]
+                elif value.startswith("\\\\?\\"):
+                    value = value[4:]
+                return os.path.normcase(os.path.normpath(value))
+
+            if normalized(buffer.value) != normalized(file_path):
+                raise PermissionError("forbidden_path")
+        else:
+            directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                for part in path.parts[1:-1]:
+                    next_directory = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory,
+                    )
+                    os.close(directory)
+                    directory = next_directory
+                fd = os.open(
+                    path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory,
+                )
+            finally:
+                os.close(directory)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise PermissionError("forbidden_path")
+        stream = os.fdopen(fd, "rb")
+        fd = None
+        return stream
+    finally:
+        if fd is not None:
+            os.close(fd)

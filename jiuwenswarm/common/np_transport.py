@@ -491,7 +491,18 @@ def make_image_verifier(allowed_image_paths: Collection[str]) -> Callable[[int],
 
     与「spawn 前 exe 验签」叠加构成闭环：exe 本身可信（启动时验签）→ 连接者确为该 exe。
     """
-    normalized = {os.path.normcase(os.path.normpath(p)) for p in allowed_image_paths}
+    def _norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(p))
+
+    def _norm_real(p: str) -> str:
+        # uv 的 python 安装目录（如 cpython-3.13-...）是指向 cpython-3.13.13-... 的
+        # Junction/符号链接：sys._base_executable 报告链接路径，而进程真实镜像是
+        # 解析后的目标路径，仅做字符串归一会永久误判为仿冒进程（WriteFile 233 拒连）。
+        return _norm(os.path.realpath(p))
+
+    normalized = {_norm(p) for p in allowed_image_paths} | {
+        _norm_real(p) for p in allowed_image_paths
+    }
 
     def verify(pid: int) -> bool:
         try:
@@ -506,7 +517,8 @@ def make_image_verifier(allowed_image_paths: Collection[str]) -> Callable[[int],
                 win32api.CloseHandle(handle)
         except (pywintypes.error, OSError):
             return False
-        return os.path.normcase(os.path.normpath(image)) in normalized
+        # 只解析构造白名单时的可信路径；对端路径的当前链接目标不能证明已加载的镜像身份。
+        return _norm(image) in normalized
 
     return verify
 

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import io
 import json
+import os
 import time
 from pathlib import Path
 from unittest.mock import Mock
@@ -243,3 +244,218 @@ def test_download_handler_rejects_path_outside_allowed_root(
     assert handler.status == 403
     assert handler.json_payload == {"error": "forbidden_path"}
     assert str(file_path) not in str(handler.json_payload)
+
+
+@pytest.fixture
+def signed_download(tmp_path, monkeypatch):
+    """Exercise real signatures and the production root predicate together."""
+    from jiuwenswarm.channels.web import app_web
+
+    sessions = tmp_path / "sessions"
+    (sessions / "session-1").mkdir(parents=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.session.session_history.get_agent_sessions_dir", lambda: sessions,
+    )
+    manager = WebFileDownloadManager(secret="download-test-" * 4)
+    monkeypatch.setattr(WebFileDownloadManager, "_instance", manager)
+    monkeypatch.setattr(app_web, "_web_file_limit_bytes", lambda: 1024)
+    source = tmp_path / "user-project" / "report.txt"
+    source.parent.mkdir()
+    source.write_bytes(b"0123456789")
+
+    class Handler(_DownloadHandlerStub):
+        workspace_root = tmp_path / "workspace"
+        agent_teams_root = tmp_path / "teams"
+        logs_root = tmp_path / "logs"
+        auto_harness_root = tmp_path / "harness"
+        _is_path_under_allowed_root = classmethod(
+            _SpaStaticHandler._is_path_under_allowed_root.__func__
+        )
+
+        def _write_json(self, status, payload):
+            self.status = status
+            self.json_payload = payload
+
+    def serve(token, *, command="GET", headers=None, **query):
+        handler = Handler(command=command, headers=headers)
+        _SpaStaticHandler._handle_file_download(handler, {"token": token, **query})
+        return handler
+
+    return manager, source, serve
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_signed_external_download_requires_outbound_purpose(signed_download, approved):
+    manager, source, serve = signed_download
+    info = web_file_download.build_file_download_info(
+        str(source), source.name, "session-1", approved_outbound=approved,
+    )
+    assert info["download_url"].endswith(info["download_token"])
+    payload = manager.validate_token(info["download_token"])
+    assert ("purpose" in payload) is approved
+    # Query parameters cannot grant the exception.
+    handler = serve(info["download_token"], purpose=web_file_download.OUTBOUND_DOWNLOAD_PURPOSE)
+    assert handler.status == (200 if approved else 403)
+    assert handler.wfile.getvalue() == (b"0123456789" if approved else b"")
+
+
+def test_ordinary_signed_download_still_serves_allowed_root(signed_download, tmp_path):
+    manager, _, serve = signed_download
+    source = tmp_path / "workspace" / "normal.txt"
+    source.parent.mkdir()
+    source.write_bytes(b"normal")
+    handler = serve(manager.generate_token(str(source)))
+    assert handler.status == 200
+    assert handler.wfile.getvalue() == b"normal"
+
+
+@pytest.mark.parametrize("field", ["path", "purpose"])
+def test_outbound_path_and_purpose_cannot_be_forged(signed_download, field):
+    manager, source, serve = signed_download
+    token = manager.generate_token(str(source), "session-1", approved_outbound=(field == "path"))
+    encoded, signature = token.split(".")
+    payload = json.loads(base64.urlsafe_b64decode(encoded))
+    payload[field] = str(source.parent / "secret.txt") if field == "path" else web_file_download.OUTBOUND_DOWNLOAD_PURPOSE
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    handler = serve(f"{encoded}.{signature}")
+    assert handler.status == 403
+    assert handler.wfile.getvalue() == b""
+
+
+@pytest.mark.parametrize("command,headers,status,body", [
+    ("GET", {}, 413, b""),
+    ("HEAD", {}, 413, b""),
+    ("GET", {"Range": "bytes=2-4"}, 206, b"234"),
+    ("HEAD", {"Range": "bytes=2-4"}, 206, b""),
+    ("GET", {"Range": "bytes=30-40"}, 416, b""),
+])
+def test_outbound_download_keeps_limits_and_ranges(
+    signed_download, monkeypatch, command, headers, status, body,
+):
+    from jiuwenswarm.channels.web import app_web
+
+    manager, source, serve = signed_download
+    monkeypatch.setattr(app_web, "_web_file_limit_bytes", lambda: 4)
+    token = manager.generate_token(str(source), "session-1", approved_outbound=True)
+    handler = serve(token, command=command, headers=headers)
+    assert handler.status == status
+    assert handler.wfile.getvalue() == body
+
+
+def test_outbound_download_missing_source_returns_404(signed_download):
+    manager, source, serve = signed_download
+    token = manager.generate_token(str(source), "session-1", approved_outbound=True)
+    source.unlink()
+    assert serve(token).status == 404
+
+
+@pytest.mark.parametrize("redirect_parent", [False, True])
+def test_outbound_download_rejects_replaced_symlink(signed_download, tmp_path, redirect_parent):
+    manager, source, serve = signed_download
+    token = manager.generate_token(str(source), "session-1", approved_outbound=True)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    secret = secret_dir / source.name
+    secret.write_bytes(b"secret")
+    source.unlink()
+    try:
+        if redirect_parent:
+            source.parent.rmdir()
+            source.parent.symlink_to(secret_dir, target_is_directory=True)
+        else:
+            source.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink is not permitted in this environment")
+    handler = serve(token)
+    assert handler.status == 403
+    assert handler.wfile.getvalue() == b""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction")
+def test_outbound_download_rejects_replaced_junction(signed_download, tmp_path):
+    import _winapi
+
+    manager, source, serve = signed_download
+    token = manager.generate_token(str(source), "session-1", approved_outbound=True)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / source.name).write_bytes(b"secret")
+    source.unlink()
+    source.parent.rmdir()
+    _winapi.CreateJunction(str(secret_dir), str(source.parent))
+    try:
+        handler = serve(token)
+        assert handler.status == 403
+        assert handler.wfile.getvalue() == b""
+    finally:
+        # Remove the junction itself, leaving its target intact.
+        os.rmdir(source.parent)
+
+
+def test_session_deletion_revokes_only_its_downloads(signed_download, tmp_path):
+    manager, source, serve = signed_download
+    session = tmp_path / "sessions" / "session-1"
+    other = session.parent / "session-2"
+    other.mkdir()
+    token = manager.generate_token(str(source), session.name, approved_outbound=True)
+    other_token = manager.generate_token(str(source), other.name, approved_outbound=True)
+    assert serve(token).status == 200
+    # The session contains only the 32-byte key, not a source-file copy.
+    files = list(session.iterdir())
+    assert len(files) == 1 and files[0].stat().st_size == 32
+    files[0].unlink()
+    session.rmdir()
+    assert serve(token).status == 403
+    assert source.read_bytes() == b"0123456789"
+    assert serve(other_token).status == 200
+    assert not session.exists()  # Validation must never recreate deleted sessions.
+
+    session.mkdir()
+    assert serve(token).status == 403
+    replacement = manager.generate_token(str(source), session.name, approved_outbound=True)
+    assert serve(replacement).status == 200
+    assert serve(token).status == 403  # Same sid, different lifetime.
+
+
+def test_session_generation_is_shared_across_issuers(signed_download, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager, source, _ = signed_download
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tokens = list(pool.map(
+            lambda _: WebFileDownloadManager(secret="download-test-" * 4).generate_token(
+                str(source), "session-1", approved_outbound=True,
+            ), range(32),
+        ))
+    generations = {manager.validate_token(token)["session_generation"] for token in tokens}
+    assert len(generations) == 1
+    assert len(list((tmp_path / "sessions" / "session-1").iterdir())) == 1
+
+
+@pytest.mark.parametrize("sid", ["", "default", "missing-session", "../escape", "session-1/child", None, []])
+def test_outbound_token_requires_existing_valid_session(signed_download, tmp_path, sid):
+    manager, source, _ = signed_download
+    with pytest.raises(ValueError):
+        manager.generate_token(str(source), sid, approved_outbound=True)
+    assert sorted(p.name for p in (tmp_path / "sessions").iterdir()) == ["session-1"]
+    assert not list((tmp_path / "sessions" / "session-1").iterdir())
+
+
+def test_outbound_token_without_generation_is_rejected(signed_download):
+    _, source, serve = signed_download
+    token = _signed_token("download-test-" * 4, {
+        "path": str(source), "sid": "session-1",
+        "purpose": web_file_download.OUTBOUND_DOWNLOAD_PURPOSE,
+    })
+    assert serve(token).status == 403
+
+
+def test_corrupt_session_key_fails_closed_without_replacing_it(signed_download, tmp_path):
+    manager, source, serve = signed_download
+    token = manager.generate_token(str(source), "session-1", approved_outbound=True)
+    key = next((tmp_path / "sessions" / "session-1").iterdir())
+    key.write_bytes(b"corrupt")
+    assert serve(token).status == 403
+    with pytest.raises(ValueError, match="invalid session download key"):
+        manager.generate_token(str(source), "session-1", approved_outbound=True)
+    assert key.read_bytes() == b"corrupt"

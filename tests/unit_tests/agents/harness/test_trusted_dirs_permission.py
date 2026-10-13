@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from openjiuwen.harness.security.permission_engine.models import PermissionLevel
 from openjiuwen.harness.security.permission_engine.toolguard.tool_policy import (
     evaluate_tiered_policy,
@@ -120,6 +122,42 @@ def test_permission_snapshot_reapplies_runtime_project_dir(tmp_path, monkeypatch
         if entry.get("path") == expected
     )
     assert project_rule["exec"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_file_guard_switch_survives_runtime_snapshot_and_reload(tmp_path, monkeypatch):
+    from jiuwenswarm.common import config
+
+    permissions = _base_permissions()
+    permissions["tools"]["write_file"] = "allow"
+    permissions["file_guard"]["enabled"] = False
+    outside = tmp_path / "outside"
+    permissions["file_guard"]["paths"] = [
+        {"path": (outside / "*.js").as_posix(), "match": "glob", "write": "ask"}
+    ]
+    overlay = {
+        "file_guard": {
+            "enabled": True,
+            "paths": [{"path": (tmp_path / "remembered").as_posix(), "read": "allow"}],
+        }
+    }
+    monkeypatch.delenv("CLAW_BEHAVIOR_SECURITY", raising=False)
+    monkeypatch.setattr(config, "get_config", lambda: {"permissions": permissions})
+    monkeypatch.setattr(permissions_persist, "load_session_permissions_overlay", lambda _: overlay)
+    rail = build_permission_rail({"permissions": permissions})
+    assert rail is not None
+
+    for enabled in (False, True, False):
+        permissions["file_guard"]["enabled"] = enabled
+        snapshot = rail._host.get_permissions_snapshot(session_id="test-session")
+        rail.update_config(snapshot)
+        apply_permission_trusted_dirs(rail, [str(tmp_path / "trusted")])
+        assert rail._engine.config["file_guard"]["enabled"] is enabled
+        result = await rail._engine.check_permission(
+            "write_file", {"file_path": str(outside / "test.js"), "content": "test"}
+        )
+        assert result.permission == (PermissionLevel.ASK if enabled else PermissionLevel.ALLOW)
+        assert ("file_guard" in (result.matched_rule or "")) is enabled
 
 
 def test_session_overlay_does_not_persist_request_scoped_runtime_path(tmp_path):

@@ -269,6 +269,28 @@ def create_exec_job() -> int:
     return int(job_handle)
 
 
+def release_exec_job(job_handle: int) -> None:
+    """Release a completed exec's Job without killing its background descendants.
+
+    Exec Jobs have no resource limits, only KILL_ON_JOB_CLOSE. Descendants
+    remain in the sandbox's outer Job until they exit or the sandbox stops.
+    If clearing the flag fails, closing the unchanged Job still kills them.
+    """
+    _require_windows()
+    kernel32 = get_kernel32()
+    try:
+        limits = JobObjExtenLimit()
+        if not kernel32.SetInformationJobObject(
+            wintypes.HANDLE(job_handle), const.JobObjectExtendedLimitInformation,
+            ctypes.byref(limits), ctypes.sizeof(limits),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if not kernel32.CloseHandle(wintypes.HANDLE(job_handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    logger.debug("释放已完成 exec Job: handle=%s, 保留后台进程", job_handle)
+
+
 def teardown(job_handle: int | None) -> None:
     """teardown: 关闭 Job (best-effort, 不抛错)."""
     if job_handle is None:
