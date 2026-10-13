@@ -58,6 +58,20 @@ def test_partial_initialization_never_reopens_legacy_writer(service):
         service.initialize_from_live()
 
 
+def test_ambiguous_existing_sandbox_network_is_not_silently_imported(service):
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["urls"] = {"old.example": "deny"}
+    dump_yaml_round_trip(service.config_path, live)
+    dump_yaml_round_trip(service.config_path.parent / "windows-policy.runtime.yaml", {
+        "windows": {"network": {"disable_all": False, "egress": {
+            "allowed_domains": [], "blocked_domains": ["old.example"],
+        }}},
+    })
+    with pytest.raises(ValueError, match="origin is ambiguous"):
+        service.initialize_from_live()
+    assert not service.settings_path.exists()
+
+
 def test_builtin_rules_are_read_only_even_when_source_is_disabled(service):
     service.initialize_from_live()
     assert service.get_builtin("tool") == {

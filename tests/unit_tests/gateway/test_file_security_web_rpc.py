@@ -46,7 +46,7 @@ async def test_sandbox_web_rpc_requires_agent(method):
 @pytest.mark.parametrize("method", [
     "security.config.get", "security.config.initialize", "security.config.settings.update",
     "security.config.local.update", "security.config.module.update", "security.config.apply",
-    "security.builtin.get",
+    "security.config.sandbox.get", "security.config.sandbox.update", "security.builtin.get",
 ])
 async def test_unified_security_web_rpc_requires_agent(method):
     channel = Channel()
@@ -61,6 +61,7 @@ async def test_unified_security_web_rpc_requires_agent(method):
                                     "permissions.rules.create", "permissions.rules.update", "permissions.rules.delete",
                                     "permissions.net_guard.get", "permissions.net_guard.set", "sandbox.network.sync",
                                     "security.config.get", "security.config.local.update",
+                                    "security.config.sandbox.get", "security.config.sandbox.update",
                                     "sandbox.enabled.get", "sandbox.enabled.set", "sandbox.files.sync", "sandbox.restart"])
 async def test_security_web_rpc_forwards_response_and_error(method):
     channel = Channel()

@@ -5512,8 +5512,47 @@ class AgentWebSocketServer:
     async def _handle_sandbox_config(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """处理 sandbox.* 配置 E2A 请求 (officeAce 经 WS 控制沙箱开关/启动方式/文件/网络)."""
         from jiuwenswarm.server.sandbox_config_rpc import dispatch_sandbox_config_request
+        from jiuwenswarm.server.security_config_rpc import (
+            dispatch_managed_sandbox_request, is_managed_sandbox_method,
+        )
+        from jiuwenswarm.common.security_config_service import SecurityConfigService
 
-        if request.req_method == ReqMethod.SANDBOX_RESTART:
+        service = SecurityConfigService()
+        try:
+            managed_sandbox = is_managed_sandbox_method(request.req_method) and service.is_initialized()
+        except RuntimeError as exc:
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=False, payload={"error": str(exc), "code": "SOURCE_UNAVAILABLE"},
+                metadata=request.metadata,
+            )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+        if managed_sandbox:
+            try:
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    payload = await dispatch_managed_sandbox_request(
+                        request.req_method, request.params or {},
+                        restart_sandboxes=self._restart_configured_sandboxes,
+                        service=service,
+                    )
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=payload.get("applied", True), payload=payload,
+                    metadata=request.metadata,
+                )
+            except Exception as exc:
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
+                    metadata=request.metadata,
+                )
+        elif request.req_method == ReqMethod.SANDBOX_RESTART:
             try:
                 payload = await self._restart_configured_sandboxes(request.params or {})
                 resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,

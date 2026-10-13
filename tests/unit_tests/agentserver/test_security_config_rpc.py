@@ -9,6 +9,7 @@ from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.security_config_service import SecurityConfigService
 from jiuwenswarm.server.security_config_rpc import (
     apply_trusted_cloud_policy,
+    dispatch_managed_sandbox_request,
     dispatch_security_config_request,
     resume_managed_security_on_start,
 )
@@ -458,6 +459,239 @@ async def test_cloud_network_source_switch_updates_sandbox_projection(service, m
     assert disabled["applied"]
     assert load_yaml_round_trip(service.config_path)["sandbox"]["urls"] == {}
     assert len(restarts) == restarts_before_cloud + 2
+
+
+@pytest.mark.asyncio
+async def test_native_sandbox_facade_preserves_four_axes_and_reports_apply(service, monkeypatch, tmp_path):
+    from jiuwenswarm.common import config as config_module
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    service.initialize_from_live()
+    source_revision = service.publish_candidate()["apply"]["revision"]
+    service.record_apply(source_revision, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+    restarts = []
+
+    async def restart(params):
+        restarts.append(params)
+        return {"status": "applied"}
+
+    files = {
+        "allow_read": ["C:/read-only"], "allow_write": ["C:/write-only"],
+        "deny_read": ["C:/blocked-read"], "deny_write": ["C:/blocked-write"],
+    }
+    config = {
+        "enabled": False,
+        "filesystem": files,
+        "network": {"disable_all": False, "allow_domains": ["native.example"],
+                    "deny_domains": ["blocked.example"]},
+    }
+    stored = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE, {"config": config},
+        agent_manager=Manager(), restart_sandboxes=restart, service=service,
+    )
+    assert stored["applied"] and stored["targets"]["sandbox"] == "not_required"
+    assert not restarts
+    queried = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_GET, {},
+        agent_manager=Manager(), restart_sandboxes=restart, service=service,
+    )
+    assert queried["config"] == {**config, "startup_mode": "internal"}
+    assert render.get_sandbox_files_axes() == files
+    assert service.get_candidate()["apply"]["revision"] == source_revision
+    assert service.get_candidate()["apply"]["applied"]
+
+    async def enabled_change(_kind, *, strict=False):
+        assert strict
+
+    monkeypatch.setattr("jiuwenswarm.server.sandbox_config_rpc._apply_sandbox_change", enabled_change)
+    enabled = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE,
+        {"config": {**config, "enabled": True}},
+        agent_manager=Manager(), restart_sandboxes=restart, service=service,
+    )
+    assert enabled["applied"] and len(restarts) == 1
+    live = load_yaml_round_trip(service.config_path)
+    assert live["sandbox"]["enabled"] is True
+    assert live["sandbox"]["security_config_user_set"] is True
+
+
+@pytest.mark.asyncio
+async def test_managed_legacy_sandbox_set_uses_native_facade(service, monkeypatch, tmp_path):
+    from jiuwenswarm.common import config as config_module
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    service.initialize_from_live()
+
+    async def mode_change(_kind, *, strict=False):
+        assert strict
+
+    monkeypatch.setattr("jiuwenswarm.server.sandbox_config_rpc._apply_sandbox_change", mode_change)
+
+    async def no_restart(_params):
+        pytest.fail("sandbox is disabled")
+
+    network = await dispatch_managed_sandbox_request(
+        ReqMethod.SANDBOX_NETWORK_SET,
+        {"disable_all": False, "allow_domains": ["native.example"], "deny_domains": []},
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert network["applied"]
+    assert network["network"]["allow_domains"] == ["native.example"]
+    files = await dispatch_managed_sandbox_request(
+        ReqMethod.SANDBOX_FILES_SET,
+        {"allow": ["C:/shared"], "deny": []},
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert files["applied"]
+    assert render.get_sandbox_files_axes()["allow_write"] == ["C:/shared"]
+    mode = await dispatch_managed_sandbox_request(
+        ReqMethod.SANDBOX_STARTUP_MODE_SET, {"startup_mode": "external"},
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert mode["applied"] and mode["startup_mode"] == "external"
+    assert load_yaml_round_trip(service.config_path)["sandbox"]["startup_mode"] == "external"
+
+
+@pytest.mark.asyncio
+async def test_native_sandbox_facade_reports_restart_failure(service, monkeypatch, tmp_path):
+    from jiuwenswarm.common import config as config_module
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    service.initialize_from_live()
+
+    async def enabled_change(_kind, *, strict=False):
+        assert strict
+
+    async def fail_restart(_params):
+        raise RuntimeError("box unavailable")
+
+    monkeypatch.setattr("jiuwenswarm.server.sandbox_config_rpc._apply_sandbox_change", enabled_change)
+    config = {
+        "enabled": True,
+        "filesystem": {key: [] for key in ("allow_read", "allow_write", "deny_read", "deny_write")},
+        "network": {"disable_all": False, "allow_domains": [], "deny_domains": []},
+    }
+    result = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE, {"config": config},
+        agent_manager=Manager(), restart_sandboxes=fail_restart, service=service,
+    )
+    assert result["saved"] and not result["applied"]
+    assert "box unavailable" in result["targets"]["sandbox"]
+    assert (await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_GET, {},
+        agent_manager=Manager(), restart_sandboxes=fail_restart, service=service,
+    ))["apply"]["status"] == "failed"
+
+    async def retry_restart(_params):
+        return {"status": "applied"}
+
+    retried = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE, {"config": config},
+        agent_manager=Manager(), restart_sandboxes=retry_restart, service=service,
+    )
+    assert retried["applied"]
+    assert retried["targets"]["sandbox"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_startup_retries_unapplied_native_sandbox_config(service, monkeypatch, tmp_path):
+    from jiuwenswarm.common import config as config_module
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    service.initialize_from_live()
+    revision = service.publish_candidate()["apply"]["revision"]
+    service.record_apply(revision, {"rail": "applied", "host_exit": "applied", "sandbox": "not_required"})
+
+    async def enabled_change(_kind, *, strict=False):
+        assert strict
+
+    async def fail_restart(_params):
+        raise RuntimeError("box unavailable")
+
+    monkeypatch.setattr("jiuwenswarm.server.sandbox_config_rpc._apply_sandbox_change", enabled_change)
+    config = {
+        "enabled": True,
+        "filesystem": {key: [] for key in ("allow_read", "allow_write", "deny_read", "deny_write")},
+        "network": {"disable_all": False, "allow_domains": [], "deny_domains": []},
+    }
+    failed = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE, {"config": config},
+        agent_manager=Manager(), restart_sandboxes=fail_restart, service=service,
+    )
+    assert not failed["applied"]
+
+    async def retry_restart(_params):
+        return {"status": "applied"}
+
+    state = await resume_managed_security_on_start(
+        agent_manager=Manager(), restart_sandboxes=retry_restart, service=service,
+    )
+    assert state["applied"]
+    assert (await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_GET, {},
+        agent_manager=Manager(), restart_sandboxes=retry_restart, service=service,
+    ))["apply"]["status"] == "applied"
+
+
+def test_native_network_and_composed_urls_remain_distinct(service, monkeypatch, tmp_path):
+    from jiuwenswarm.common import config as config_module
+    from jiuwenswarm.common.net_guard_config import render_saved_sandbox_urls
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
+    monkeypatch.setattr(config_module, "get_config_file", lambda: service.config_path)
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    service.initialize_from_live()
+    render.set_native_sandbox_network_config({
+        "disable_all": False, "allow_domains": ["native.example"],
+        "deny_domains": ["native-blocked.example"],
+    })
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["urls"] = {"cloud.example": "deny", "native.example": "deny"}
+    dump_yaml_round_trip(service.config_path, live)
+    render_saved_sandbox_urls(render._runtime_copy_path())
+    assert render.get_sandbox_network_config() == {
+        "disable_all": False, "allow_domains": [],
+        "deny_domains": ["native-blocked.example", "cloud.example", "native.example"],
+    }
+    assert render.get_native_sandbox_network_config()["allow_domains"] == ["native.example"]
+    live["sandbox"]["urls"] = {}
+    dump_yaml_round_trip(service.config_path, live)
+    render_saved_sandbox_urls(render._runtime_copy_path())
+    assert render.get_sandbox_network_config()["allow_domains"] == ["native.example"]
+    assert render.get_sandbox_network_config()["deny_domains"] == ["native-blocked.example"]
+
+
+@pytest.mark.asyncio
+async def test_native_file_acl_is_rejected_on_non_windows(service, monkeypatch, tmp_path):
+    from jiuwenswarm.server import sandbox_policy_render as render
+
+    monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
+    monkeypatch.setattr(render, "_is_windows", lambda: False)
+    config = {
+        "enabled": False,
+        "filesystem": {
+            "allow_read": ["/private"], "allow_write": [], "deny_read": [], "deny_write": [],
+        },
+        "network": {"disable_all": False, "allow_domains": [], "deny_domains": []},
+    }
+
+    async def no_restart(_params):
+        pytest.fail("unsupported ACL must not restart")
+
+    with pytest.raises(NotImplementedError, match="Windows only"):
+        await dispatch_security_config_request(
+            ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE, {"config": config},
+            agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
+        )
 
 
 @pytest.mark.asyncio

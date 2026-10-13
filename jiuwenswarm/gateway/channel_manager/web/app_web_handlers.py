@@ -6211,6 +6211,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     _register_perm("security.config.local.update", _PermReq.SECURITY_CONFIG_LOCAL_UPDATE)
     _register_perm("security.config.module.update", _PermReq.SECURITY_CONFIG_MODULE_UPDATE)
     _register_perm("security.config.apply", _PermReq.SECURITY_CONFIG_APPLY)
+    _register_perm("security.config.sandbox.get", _PermReq.SECURITY_CONFIG_SANDBOX_GET)
+    _register_perm("security.config.sandbox.update", _PermReq.SECURITY_CONFIG_SANDBOX_UPDATE)
     _register_perm("security.builtin.get", _PermReq.SECURITY_BUILTIN_GET)
     _register_perm("permissions.shell_guard.get", _PermReq.PERMISSIONS_SHELL_GUARD_GET)
     _register_perm("permissions.shell_guard.update", _PermReq.PERMISSIONS_SHELL_GUARD_UPDATE)

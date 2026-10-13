@@ -90,7 +90,9 @@ def render_saved_sandbox_urls(policy_path):
         _is_windows,
         _linux_runtime_copy_path,
         _runtime_copy_path,
+        get_native_sandbox_network_config,
         get_sandbox_network_config,
+        has_native_sandbox_network_config,
         set_sandbox_network_config,
     )
 
@@ -99,11 +101,22 @@ def render_saved_sandbox_urls(policy_path):
     expected = _runtime_copy_path() if _is_windows() else _linux_runtime_copy_path()
     if policy_path is None or Path(policy_path).resolve() != expected.resolve():
         raise ValueError("sandbox.urls requires the platform runtime policy copy")
-    current = get_sandbox_network_config()
+    current = get_native_sandbox_network_config()
+    native_allowed = current["allow_domains"] if has_native_sandbox_network_config() else []
+    native_denied = current["deny_domains"] if has_native_sandbox_network_config() else []
+    allowed = list(dict.fromkeys([
+        *native_allowed,
+        *(domain for domain, action in urls.items() if action == "allow"),
+    ]))
+    denied = list(dict.fromkeys([
+        *native_denied,
+        *(domain for domain, action in urls.items() if action == "deny"),
+    ]))
+    allowed = [domain for domain in allowed if domain not in denied]
     stored = set_sandbox_network_config(
         current["disable_all"],
-        [domain for domain, action in urls.items() if action == "allow"],
-        [domain for domain, action in urls.items() if action == "deny"],
+        allowed,
+        denied,
     )
     if get_sandbox_network_config() != stored:
         raise OSError("Sandbox network configuration could not be saved")

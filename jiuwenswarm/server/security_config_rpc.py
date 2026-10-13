@@ -1,5 +1,8 @@
 """AgentServer adapter for the security configuration facade."""
 
+import json
+import os
+import uuid
 from typing import Any
 
 from jiuwenswarm.common.schema.message import ReqMethod
@@ -13,12 +16,47 @@ _METHODS = frozenset({
     ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
     ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
     ReqMethod.SECURITY_CONFIG_APPLY,
+    ReqMethod.SECURITY_CONFIG_SANDBOX_GET,
+    ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE,
     ReqMethod.SECURITY_BUILTIN_GET,
+})
+
+_MANAGED_SANDBOX_METHODS = frozenset({
+    ReqMethod.SANDBOX_ENABLED_GET, ReqMethod.SANDBOX_ENABLED_SET,
+    ReqMethod.SANDBOX_STARTUP_MODE_GET, ReqMethod.SANDBOX_STARTUP_MODE_SET,
+    ReqMethod.SANDBOX_FILES_GET, ReqMethod.SANDBOX_FILES_SET,
+    ReqMethod.SANDBOX_NETWORK_GET, ReqMethod.SANDBOX_NETWORK_SET,
 })
 
 
 def is_security_config_method(method: ReqMethod) -> bool:
     return method in _METHODS
+
+
+def is_managed_sandbox_method(method: ReqMethod) -> bool:
+    return method in _MANAGED_SANDBOX_METHODS
+
+
+def _native_sandbox_state(service: SecurityConfigService) -> dict[str, Any] | None:
+    path = service.config_path.parent / "security.sandbox-apply-state.json"
+    if not path.is_file():
+        return None
+    with path.open(encoding="utf-8") as stream:
+        state = json.load(stream)
+    if not isinstance(state, dict) or state.get("status") not in {"pending", "failed", "applied"}:
+        raise ValueError("invalid native sandbox apply state")
+    return state
+
+
+def _write_native_sandbox_state(service: SecurityConfigService, state: dict[str, Any]) -> None:
+    path = service.config_path.parent / "security.sandbox-apply-state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _check_sandbox_coverage(permissions: dict[str, Any], live: dict[str, Any]) -> None:
@@ -68,6 +106,156 @@ def _check_sandbox_coverage(permissions: dict[str, Any], live: dict[str, Any]) -
             raise ValueError(f"UNSUPPORTED_COVERAGE network: {skipped}")
 
 
+def _get_native_sandbox_config(service: SecurityConfigService) -> dict[str, Any]:
+    from jiuwenswarm.server.sandbox_policy_render import (
+        get_native_sandbox_network_config, get_sandbox_files_axes,
+    )
+
+    sandbox = service._read_yaml(service.config_path).get("sandbox") or {}
+    startup_mode = sandbox.get("startup_mode")
+    return {
+        "enabled": bool(sandbox.get("enabled", False)),
+        "startup_mode": startup_mode if startup_mode in {"internal", "external"} else "internal",
+        "filesystem": get_sandbox_files_axes(),
+        "network": get_native_sandbox_network_config(),
+    }
+
+
+async def _update_native_sandbox_config(
+    params: dict[str, Any], *, restart_sandboxes: Any, service: SecurityConfigService,
+) -> dict[str, Any]:
+    from jiuwenswarm.common.config import update_config, update_sandbox_runtime
+    from jiuwenswarm.server.sandbox_config_rpc import _apply_sandbox_change
+    from jiuwenswarm.server.sandbox_policy_render import (
+        _is_windows, get_sandbox_files_axes, initialize_native_sandbox_network,
+        set_native_sandbox_network_config, set_sandbox_files_axes,
+        validate_native_sandbox_network, validate_sandbox_files_axes,
+    )
+
+    if set(params) != {"config"} or not isinstance(params["config"], dict):
+        raise ValueError("security.config.sandbox.update requires config")
+    value = params["config"]
+    if not {"enabled", "filesystem", "network"} <= set(value) or set(value) - {
+        "enabled", "startup_mode", "filesystem", "network",
+    } or not isinstance(value["enabled"], bool):
+        raise ValueError("sandbox config requires enabled/filesystem/network")
+    files = validate_sandbox_files_axes(value["filesystem"])
+    if not _is_windows() and any(files.values()):
+        raise NotImplementedError("native filesystem ACL is supported on Windows only")
+    network = validate_native_sandbox_network(value["network"])
+    previous = _get_native_sandbox_config(service)
+    value = {**value, "startup_mode": value.get("startup_mode", previous["startup_mode"])}
+    if not isinstance(value["startup_mode"], str) or value["startup_mode"] not in {"internal", "external"}:
+        raise ValueError("startup_mode must be internal or external")
+    state = _native_sandbox_state(service)
+    live = service._read_yaml(service.config_path)
+    if (live.get("sandbox") or {}).get("type", "jiuwenbox") != "jiuwenbox":
+        raise ValueError("native sandbox config supports jiuwenbox only")
+    if value == previous and state is not None and state["status"] == "applied" and state.get("config") == value:
+        return {"saved": True, "applied": True, "targets": {"sandbox": "not_required"}, "config": previous}
+    initialize_native_sandbox_network(service.config_path, (live.get("sandbox") or {}).get("urls") or {})
+    _write_native_sandbox_state(service, {"status": "pending", "config": value, "target": "pending"})
+    if files != previous["filesystem"]:
+        set_sandbox_files_axes(files)
+        if get_sandbox_files_axes() != files:
+            raise OSError("sandbox filesystem configuration could not be saved")
+    if network != previous["network"]:
+        set_native_sandbox_network_config(network)
+    if value["enabled"] != previous["enabled"]:
+        update_sandbox_runtime({"enabled": value["enabled"]})
+    if value["startup_mode"] != previous["startup_mode"]:
+        def set_startup_mode(data):
+            data.setdefault("sandbox", {})["startup_mode"] = value["startup_mode"]
+            return data
+
+        update_config(set_startup_mode)
+    if value["enabled"]:
+        def mark_explicit(data):
+            data.setdefault("sandbox", {})["security_config_user_set"] = True
+            return data
+
+        update_config(mark_explicit)
+    try:
+        if value["startup_mode"] != previous["startup_mode"]:
+            await _apply_sandbox_change("startup_mode", strict=True)
+        if not value["enabled"]:
+            if previous["enabled"]:
+                await _apply_sandbox_change("enabled", strict=True)
+            status = "not_required"
+        else:
+            if not previous["enabled"]:
+                await _apply_sandbox_change("enabled", strict=True)
+            restarted = await restart_sandboxes({})
+            needs_network_confirmation = network != previous["network"] or not previous["enabled"]
+            status = (
+                "external_pending"
+                if needs_network_confirmation and restarted.get("network_status") == "externally_managed"
+                else "applied"
+            )
+    except Exception as exc:
+        status = f"failed: {exc}"
+    applied = status in {"applied", "not_required"}
+    _write_native_sandbox_state(service, {
+        "status": "applied" if applied else "failed", "config": value, "target": status,
+    })
+    return {
+        "saved": True, "applied": applied,
+        "targets": {"sandbox": status}, "config": _get_native_sandbox_config(service),
+    }
+
+
+async def dispatch_managed_sandbox_request(
+    method: ReqMethod, params: dict[str, Any], *, restart_sandboxes: Any,
+    service: SecurityConfigService | None = None,
+) -> dict[str, Any]:
+    """Keep the old sandbox RPC shapes while routing writes through the facade."""
+    service = service or SecurityConfigService()
+    if method not in _MANAGED_SANDBOX_METHODS or not isinstance(params, dict):
+        raise ValueError("unsupported managed sandbox request")
+    current = _get_native_sandbox_config(service)
+    if method == ReqMethod.SANDBOX_ENABLED_GET:
+        return {"enabled": current["enabled"]}
+    if method == ReqMethod.SANDBOX_STARTUP_MODE_GET:
+        return {"startup_mode": current["startup_mode"]}
+    if method == ReqMethod.SANDBOX_FILES_GET:
+        files = current["filesystem"]
+        return {"files": {"allow": files["allow_read"], "deny": files["deny_read"]}}
+    if method == ReqMethod.SANDBOX_NETWORK_GET:
+        return {"network": current["network"]}
+    if method == ReqMethod.SANDBOX_ENABLED_SET:
+        if set(params) != {"enabled"} or not isinstance(params["enabled"], bool):
+            raise ValueError("enabled must be boolean")
+        current["enabled"] = params["enabled"]
+    elif method == ReqMethod.SANDBOX_STARTUP_MODE_SET:
+        if set(params) != {"startup_mode"}:
+            raise ValueError("startup_mode is required")
+        current["startup_mode"] = params["startup_mode"]
+    elif method == ReqMethod.SANDBOX_FILES_SET:
+        if set(params) != {"allow", "deny"} or not isinstance(params["allow"], list) or not isinstance(params["deny"], list):
+            raise ValueError("allow and deny must be lists")
+        current["filesystem"] = {
+            "allow_read": params["allow"], "allow_write": params["allow"],
+            "deny_read": params["deny"], "deny_write": params["deny"],
+        }
+    elif method == ReqMethod.SANDBOX_NETWORK_SET:
+        if set(params) != {"disable_all", "allow_domains", "deny_domains"}:
+            raise ValueError("network requires disable_all/allow_domains/deny_domains")
+        current["network"] = params
+    result = await _update_native_sandbox_config(
+        {"config": current}, restart_sandboxes=restart_sandboxes, service=service,
+    )
+    if method == ReqMethod.SANDBOX_ENABLED_SET:
+        result["enabled"] = result["config"]["enabled"]
+    elif method == ReqMethod.SANDBOX_STARTUP_MODE_SET:
+        result["startup_mode"] = result["config"]["startup_mode"]
+    elif method == ReqMethod.SANDBOX_FILES_SET:
+        files = result["config"]["filesystem"]
+        result["files"] = {"allow": files["allow_read"], "deny": files["deny_read"]}
+    else:
+        result["network"] = result["config"]["network"]
+    return result
+
+
 async def dispatch_security_config_request(
     method: ReqMethod, params: dict[str, Any], *, agent_manager: Any,
     restart_sandboxes: Any, service: SecurityConfigService | None = None,
@@ -84,6 +272,12 @@ async def dispatch_security_config_request(
         if set(params) != {"module"}:
             raise ValueError("security.builtin.get requires module only")
         return service.get_builtin(params["module"])
+    if method == ReqMethod.SECURITY_CONFIG_SANDBOX_GET:
+        if params:
+            raise ValueError("security.config.sandbox.get accepts no parameters")
+        return {"config": _get_native_sandbox_config(service), "apply": _native_sandbox_state(service)}
+    if method == ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE:
+        return await _update_native_sandbox_config(params, restart_sandboxes=restart_sandboxes, service=service)
 
     expected = params.get("expected_revision")
     if expected is not None and not isinstance(expected, str):
@@ -196,22 +390,30 @@ async def resume_managed_security_on_start(
 ) -> dict[str, Any] | None:
     """Restore the latest source revision before AgentServer accepts requests."""
     service = service or SecurityConfigService()
-    if not service.is_initialized():
-        return None
-    from openjiuwen.harness.security.permission_engine import core as permission_core
+    source_state = None
+    if service.is_initialized():
+        from openjiuwen.harness.security.permission_engine import core as permission_core
 
-    if getattr(permission_core, "COMPOSITION_SCHEMA_VERSION", None) != 1:
-        raise RuntimeError("installed core does not support security composition v1")
-    state = service.get_candidate()["apply"]
-    if state["applied"]:
-        return state
-    result = await dispatch_security_config_request(
-        ReqMethod.SECURITY_CONFIG_APPLY,
-        {"expected_revision": state["revision"]},
-        agent_manager=agent_manager,
-        restart_sandboxes=restart_sandboxes,
-        service=service,
-    )
-    if not result["applied"]:
-        raise RuntimeError(f"managed security configuration is not ready: {result['apply']['targets']}")
-    return result["apply"]
+        if getattr(permission_core, "COMPOSITION_SCHEMA_VERSION", None) != 1:
+            raise RuntimeError("installed core does not support security composition v1")
+        source_state = service.get_candidate()["apply"]
+        if not source_state["applied"]:
+            result = await dispatch_security_config_request(
+                ReqMethod.SECURITY_CONFIG_APPLY,
+                {"expected_revision": source_state["revision"]},
+                agent_manager=agent_manager,
+                restart_sandboxes=restart_sandboxes,
+                service=service,
+            )
+            if not result["applied"]:
+                raise RuntimeError(f"managed security configuration is not ready: {result['apply']['targets']}")
+            source_state = result["apply"]
+    native_state = _native_sandbox_state(service)
+    if native_state is not None and native_state["status"] != "applied":
+        result = await _update_native_sandbox_config(
+            {"config": native_state["config"]},
+            restart_sandboxes=restart_sandboxes, service=service,
+        )
+        if not result["applied"]:
+            raise RuntimeError(f"native sandbox configuration is not ready: {result['targets']}")
+    return source_state

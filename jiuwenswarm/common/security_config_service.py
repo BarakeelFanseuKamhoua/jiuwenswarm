@@ -218,6 +218,8 @@ class SecurityConfigService:
             local = validate_source({"permissions": local_permissions})
             state = self._pending_state()
             compose_candidate(settings, self._sources(settings, local, {"permissions": {}}), state["revision"])
+            from jiuwenswarm.server.sandbox_policy_render import initialize_native_sandbox_network
+            initialize_native_sandbox_network(self.config_path, (live.get("sandbox") or {}).get("urls") or {})
             dump_yaml_round_trip(self.initial_snapshot_path, live)
             dump_yaml_round_trip(self.settings_path, settings)
             dump_yaml_round_trip(self.local_path, local)
