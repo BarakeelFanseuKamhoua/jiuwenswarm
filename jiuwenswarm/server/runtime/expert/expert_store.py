@@ -288,7 +288,17 @@ class HttpRepoExpertPackageSource:
         if resp.status_code == 404:
             raise ExpertNotFound(f"专家包不存在: {expert_id}")
         if resp.status_code != 200:
-            raise ExpertRepoUnavailable(f"专家仓库下载接口返回 {resp.status_code}")
+            # 仓库错误响应的 detail 携带用户可读原因（桌面端签名校验失败即走此通道），
+            # 拼进异常文案随 REPO_UNAVAILABLE 错误链路上抛 UI
+            detail = ""
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    detail = str(parsed.get("detail", "") or "").strip()
+            except ValueError:
+                detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise ExpertRepoUnavailable(f"专家仓库下载接口返回 {resp.status_code}{suffix}")
         target_dir = get_expert_cache_dir() / expert_id
         try:
             _extract_zip(resp.content, target_dir)

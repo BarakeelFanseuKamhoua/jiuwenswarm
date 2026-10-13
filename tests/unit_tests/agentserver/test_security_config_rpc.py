@@ -581,13 +581,19 @@ async def test_native_sandbox_facade_preserves_four_axes_and_reports_apply(servi
         ReqMethod.SECURITY_CONFIG_SANDBOX_GET, {},
         agent_manager=Manager(), restart_sandboxes=restart, service=service,
     )
-    assert queried["config"] == {**config, "startup_mode": "internal"}
+    assert queried["config"] == {
+        **config, "startup_mode": "internal",
+        "limits": {"max_file_mb": 100, "exec_timeout_seconds": 600},
+    }
     assert render.get_sandbox_files_axes() == files
     assert service.get_candidate()["apply"]["revision"] == source_revision
     assert service.get_candidate()["apply"]["applied"]
 
-    async def enabled_change(_kind, *, strict=False):
+    apply_kinds = []
+
+    async def enabled_change(kind, *, strict=False):
         assert strict
+        apply_kinds.append(kind)
 
     monkeypatch.setattr("jiuwenswarm.server.sandbox_config_rpc._apply_sandbox_change", enabled_change)
     enabled = await dispatch_security_config_request(
@@ -599,6 +605,15 @@ async def test_native_sandbox_facade_preserves_four_axes_and_reports_apply(servi
     live = load_yaml_round_trip(service.config_path)
     assert live["sandbox"]["enabled"] is True
     assert live["sandbox"]["security_config_user_set"] is True
+    limited = await dispatch_security_config_request(
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE,
+        {"config": {**queried["config"], "enabled": True,
+                    "limits": {"max_file_mb": 12, "exec_timeout_seconds": 90}}},
+        agent_manager=Manager(), restart_sandboxes=restart, service=service,
+    )
+    assert limited["applied"] and len(restarts) == 2
+    assert apply_kinds == ["enabled", "limits"]
+    assert limited["config"]["limits"] == {"max_file_mb": 12, "exec_timeout_seconds": 90}
 
 
 @pytest.mark.asyncio
@@ -638,6 +653,17 @@ async def test_managed_legacy_sandbox_set_uses_native_facade(service, monkeypatc
     )
     assert mode["applied"] and mode["startup_mode"] == "external"
     assert load_yaml_round_trip(service.config_path)["sandbox"]["startup_mode"] == "external"
+    limits = await dispatch_managed_sandbox_request(
+        ReqMethod.SANDBOX_LIMITS_SET, {"limits": {"max_file_mb": 12}},
+        restart_sandboxes=no_restart, service=service,
+    )
+    assert limits["applied"] and limits["limits"] == {
+        "max_file_mb": 12, "exec_timeout_seconds": 600,
+    }
+    queried_limits = await dispatch_managed_sandbox_request(
+        ReqMethod.SANDBOX_LIMITS_GET, {}, restart_sandboxes=no_restart, service=service,
+    )
+    assert queried_limits == {"limits": limits["limits"]}
 
 
 @pytest.mark.asyncio
@@ -822,10 +848,14 @@ async def test_cloud_domain_deny_reaches_real_core_host_exit(service):
         assert initialized["applied"]
         enabled = await dispatch_security_config_request(
             ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
-            {"module": "network", "patch": {"enabled": True}},
+            {"module": "network", "patch": {
+                "enabled": True, "max_request_mb": 2, "timeout_seconds": 7,
+            }},
             agent_manager=Manager(), restart_sandboxes=no_restart, service=service,
         )
         assert enabled["applied"]
+        assert host_exit.get_host_exit_state().policy.max_request_mb == 2
+        assert host_exit.get_host_exit_state().policy.timeout_seconds == 7
         cloud = await apply_trusted_cloud_policy(
             1, {"net_guard": {"urls": {"blocked.example.org": "deny"}}},
             agent_manager=Manager(), restart_sandboxes=no_restart, service=service,

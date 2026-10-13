@@ -368,8 +368,8 @@ class SecurityConfigService:
                 patch_file_guard(settings, patch)
             elif module == "network":
                 from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist import normalize_net_guard_patch
-                if set(patch) - {"enabled", "defaults", "enforce_host_exit"}:
-                    raise ValueError("network settings accept enabled/defaults/enforce_host_exit")
+                if set(patch) - {"enabled", "defaults", "enforce_host_exit", "max_request_mb", "timeout_seconds"}:
+                    raise ValueError("network settings accept enabled/defaults/enforce_host_exit/max_request_mb/timeout_seconds")
                 normalized = normalize_net_guard_patch(patch)
                 settings.setdefault("permissions", {}).setdefault("net_guard", {}).update(normalized)
             elif module == "command":

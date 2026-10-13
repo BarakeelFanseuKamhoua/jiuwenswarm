@@ -189,6 +189,47 @@ def test_cancelled_terminal_chunk_encodes_as_final_error_envelope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_team_followup_deferred_stream_emits_single_terminal_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """follow-up 受理短流（deferred 占位）：全流恰有一个终止帧（facade 收尾）。
+
+    2026-10-08 专家团 HITL 续跑事故：team_helpers 自发终帧 + facade 收尾帧 =
+    双终止帧上线，桌面端 deferred 守卫一次性消费后被第二帧穿透误判回合完成
+    （计费 FINISH 提前收口、会话上报链 final 断链）。team_helpers 已不再自发
+    终帧，本用例在 facade 出口钉死「恰一个终止帧」。
+    """
+
+    class FollowupAckAdapter:
+        @staticmethod
+        async def process_message_stream_impl(*_args, **_kwargs):
+            # team_helpers follow-up 受理分支的真实产出形态：只有 deferred 占位帧
+            yield AgentResponseChunk(
+                request_id="req-followup-ack",
+                channel_id="desktop",
+                payload={
+                    "event_type": "chat.processing_status_deferred",
+                    "session_id": "sess-req-followup-ack",
+                },
+                is_complete=False,
+            )
+
+    _patch_common(monkeypatch, FollowupAckAdapter)
+    swarm = interface_module.JiuWenSwarm()
+    chunks = [
+        chunk async for chunk in swarm.process_message_stream(_request("req-followup-ack"))
+    ]
+
+    assert chunks[0].payload == {
+        "event_type": "chat.processing_status_deferred",
+        "session_id": "sess-req-followup-ack",
+    }
+    assert chunks[0].is_complete is False
+    finals = [c for c in chunks if c.is_complete]
+    assert len(finals) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("already_flushed", [False, True])
 @pytest.mark.parametrize("cancel_producer", [False, True])
 async def test_cancel_persists_stop_without_pending_text(

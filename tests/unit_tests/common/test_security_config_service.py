@@ -219,13 +219,18 @@ def test_native_module_settings_stay_out_of_rule_sources(service):
     service.initialize_from_live()
     before = service.config_path.read_bytes()
     service.update_module_settings("file", {"defaults": {"write": "deny"}})
-    service.update_module_settings("network", {"defaults": "ask", "enforce_host_exit": False})
+    service.update_module_settings("network", {
+        "defaults": "ask", "enforce_host_exit": False,
+        "max_request_mb": 20, "timeout_seconds": 90,
+    })
     service.update_module_settings("command", {"builtin_rules_enabled": False})
     service.update_module_settings("permissions", {"enabled": False, "permission_mode": "normal"})
     snapshot = service.get_candidate()
     settings = snapshot["settings"]["permissions"]
     assert settings["file_guard"]["defaults"] == {"read": "ask", "write": "deny"}
     assert settings["net_guard"]["defaults"] == "ask"
+    assert settings["net_guard"]["max_request_mb"] == 20
+    assert settings["net_guard"]["timeout_seconds"] == 90
     assert settings["shell_guard"]["builtin_rules_enabled"] is False
     assert settings["enabled"] is False
     assert snapshot["local"]["permissions"]["file_guard"]["paths"]
@@ -233,6 +238,8 @@ def test_native_module_settings_stay_out_of_rule_sources(service):
         service.update_module_settings("file", {"paths": []})
     with pytest.raises(ValueError, match="network settings"):
         service.update_module_settings("network", {"urls": {}})
+    with pytest.raises(ValueError, match="max_request_mb"):
+        service.update_module_settings("network", {"max_request_mb": 0})
     assert service.config_path.read_bytes() == before
 
 

@@ -25,6 +25,7 @@ _METHODS = frozenset({
 _MANAGED_SANDBOX_METHODS = frozenset({
     ReqMethod.SANDBOX_ENABLED_GET, ReqMethod.SANDBOX_ENABLED_SET,
     ReqMethod.SANDBOX_STARTUP_MODE_GET, ReqMethod.SANDBOX_STARTUP_MODE_SET,
+    ReqMethod.SANDBOX_LIMITS_GET, ReqMethod.SANDBOX_LIMITS_SET,
     ReqMethod.SANDBOX_FILES_GET, ReqMethod.SANDBOX_FILES_SET,
     ReqMethod.SANDBOX_NETWORK_GET, ReqMethod.SANDBOX_NETWORK_SET,
 })
@@ -114,6 +115,7 @@ def _sandbox_rule_fields_changed(before: dict[str, Any], after: dict[str, Any], 
 
 
 def _get_native_sandbox_config(service: SecurityConfigService) -> dict[str, Any]:
+    from jiuwenswarm.common.config import _ensure_sandbox_runtime_shape
     from jiuwenswarm.server.sandbox_policy_render import (
         get_native_sandbox_network_config, get_sandbox_files_axes,
     )
@@ -123,6 +125,7 @@ def _get_native_sandbox_config(service: SecurityConfigService) -> dict[str, Any]
     return {
         "enabled": bool(sandbox.get("enabled", False)),
         "startup_mode": startup_mode if startup_mode in {"internal", "external"} else "internal",
+        "limits": _ensure_sandbox_runtime_shape(sandbox)["limits"],
         "filesystem": get_sandbox_files_axes(),
         "network": get_native_sandbox_network_config(),
     }
@@ -131,7 +134,7 @@ def _get_native_sandbox_config(service: SecurityConfigService) -> dict[str, Any]
 async def _update_native_sandbox_config(
     params: dict[str, Any], *, restart_sandboxes: Any, service: SecurityConfigService,
 ) -> dict[str, Any]:
-    from jiuwenswarm.common.config import update_config, update_sandbox_runtime
+    from jiuwenswarm.common.config import _ensure_sandbox_runtime_shape, update_config, update_sandbox_runtime
     from jiuwenswarm.server.sandbox_config_rpc import _apply_sandbox_change
     from jiuwenswarm.server.sandbox_policy_render import (
         _is_windows, get_sandbox_files_axes, initialize_native_sandbox_network,
@@ -143,7 +146,7 @@ async def _update_native_sandbox_config(
         raise ValueError("security.config.sandbox.update requires config")
     value = params["config"]
     if not {"enabled", "filesystem", "network"} <= set(value) or set(value) - {
-        "enabled", "startup_mode", "filesystem", "network",
+        "enabled", "startup_mode", "limits", "filesystem", "network",
     } or not isinstance(value["enabled"], bool):
         raise ValueError("sandbox config requires enabled/filesystem/network")
     files = validate_sandbox_files_axes(value["filesystem"])
@@ -151,7 +154,8 @@ async def _update_native_sandbox_config(
         raise NotImplementedError("native filesystem ACL is supported on Windows only")
     network = validate_native_sandbox_network(value["network"])
     previous = _get_native_sandbox_config(service)
-    value = {**value, "startup_mode": value.get("startup_mode", previous["startup_mode"])}
+    limits = _ensure_sandbox_runtime_shape({"limits": value.get("limits", previous["limits"])})["limits"]
+    value = {**value, "startup_mode": value.get("startup_mode", previous["startup_mode"]), "limits": limits}
     if not isinstance(value["startup_mode"], str) or value["startup_mode"] not in {"internal", "external"}:
         raise ValueError("startup_mode must be internal or external")
     state = _native_sandbox_state(service)
@@ -170,6 +174,8 @@ async def _update_native_sandbox_config(
         set_native_sandbox_network_config(network)
     if value["enabled"] != previous["enabled"]:
         update_sandbox_runtime({"enabled": value["enabled"]})
+    if limits != previous["limits"]:
+        update_sandbox_runtime({"limits": limits})
     if value["startup_mode"] != previous["startup_mode"]:
         def set_startup_mode(data):
             data.setdefault("sandbox", {})["startup_mode"] = value["startup_mode"]
@@ -185,6 +191,8 @@ async def _update_native_sandbox_config(
     try:
         if value["startup_mode"] != previous["startup_mode"]:
             await _apply_sandbox_change("startup_mode", strict=True)
+        if limits != previous["limits"]:
+            await _apply_sandbox_change("limits", strict=True)
         if not value["enabled"]:
             if previous["enabled"]:
                 await _apply_sandbox_change("enabled", strict=True)
@@ -224,6 +232,8 @@ async def dispatch_managed_sandbox_request(
         return {"enabled": current["enabled"]}
     if method == ReqMethod.SANDBOX_STARTUP_MODE_GET:
         return {"startup_mode": current["startup_mode"]}
+    if method == ReqMethod.SANDBOX_LIMITS_GET:
+        return {"limits": current["limits"]}
     if method == ReqMethod.SANDBOX_FILES_GET:
         files = current["filesystem"]
         return {"files": {"allow": files["allow_read"], "deny": files["deny_read"]}}
@@ -237,6 +247,11 @@ async def dispatch_managed_sandbox_request(
         if set(params) != {"startup_mode"}:
             raise ValueError("startup_mode is required")
         current["startup_mode"] = params["startup_mode"]
+    elif method == ReqMethod.SANDBOX_LIMITS_SET:
+        limits = params.get("limits") if isinstance(params.get("limits"), dict) else params
+        if not isinstance(limits, dict):
+            raise ValueError("limits must be an object")
+        current["limits"] = {**current["limits"], **limits}
     elif method == ReqMethod.SANDBOX_FILES_SET:
         if set(params) != {"allow", "deny"} or not isinstance(params["allow"], list) or not isinstance(params["deny"], list):
             raise ValueError("allow and deny must be lists")
@@ -255,6 +270,8 @@ async def dispatch_managed_sandbox_request(
         result["enabled"] = result["config"]["enabled"]
     elif method == ReqMethod.SANDBOX_STARTUP_MODE_SET:
         result["startup_mode"] = result["config"]["startup_mode"]
+    elif method == ReqMethod.SANDBOX_LIMITS_SET:
+        result["limits"] = result["config"]["limits"]
     elif method == ReqMethod.SANDBOX_FILES_SET:
         files = result["config"]["filesystem"]
         result["files"] = {"allow": files["allow_read"], "deny": files["deny_read"]}
