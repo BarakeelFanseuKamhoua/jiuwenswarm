@@ -190,6 +190,7 @@ typedef BOOL(WINAPI *FnCreateProcessInternalW)(
     HANDLE *);
 
 static HMODULE g_module;
+static wchar_t g_self_path[PATH_CAP];
 static CRITICAL_SECTION g_lock;
 static int g_lock_ready;
 #if defined(__GNUC__)
@@ -2139,6 +2140,90 @@ static int build_loader(uint8_t *code, uint64_t load_library, uint64_t get_last_
     return n;
 }
 
+/* The thread stopped at the initial breakpoint still owns the loader lock.
+ * LoadLibrary on a second thread never returns. This stub runs on the
+ * stopped thread: load, record the result, then jump back to the saved
+ * instruction. A failed load spins, so the program does not start. */
+#define STOP_DONE_OFF 0x80
+#define STOP_RESULT_OFF 0x88
+#define STOP_RSP_OFF 0x90
+#define STOP_PATH_OFF 0x100
+
+static int build_stopped_loader(uint8_t *code, uint64_t load_library, uint64_t resume) {
+    int n = 0;
+    int at;
+    int jz_at;
+    int32_t disp;
+    code[n++] = 0x48;
+    code[n++] = 0x89;
+    code[n++] = 0x25;
+    at = n;
+    n += 4;
+    disp = (int32_t)(STOP_RSP_OFF - (at + 4));
+    memcpy(code + at, &disp, sizeof disp);
+    code[n++] = 0x48;
+    code[n++] = 0x83;
+    code[n++] = 0xE4;
+    code[n++] = 0xF0;
+    code[n++] = 0x48;
+    code[n++] = 0x83;
+    code[n++] = 0xEC;
+    code[n++] = 0x20;
+    code[n++] = 0x48;
+    code[n++] = 0x8D;
+    code[n++] = 0x0D;
+    at = n;
+    n += 4;
+    disp = (int32_t)(STOP_PATH_OFF - (at + 4));
+    memcpy(code + at, &disp, sizeof disp);
+    code[n++] = 0x48;
+    code[n++] = 0xB8;
+    memcpy(code + n, &load_library, sizeof load_library);
+    n += (int)sizeof load_library;
+    code[n++] = 0xFF;
+    code[n++] = 0xD0;
+    code[n++] = 0x48;
+    code[n++] = 0x89;
+    code[n++] = 0x05;
+    at = n;
+    n += 4;
+    disp = (int32_t)(STOP_RESULT_OFF - (at + 4));
+    memcpy(code + at, &disp, sizeof disp);
+    code[n++] = 0xC7;
+    code[n++] = 0x05;
+    at = n;
+    n += 4;
+    disp = (int32_t)(STOP_DONE_OFF - (at + 8));
+    memcpy(code + at, &disp, sizeof disp);
+    code[n++] = 1;
+    code[n++] = 0;
+    code[n++] = 0;
+    code[n++] = 0;
+    code[n++] = 0x48;
+    code[n++] = 0x85;
+    code[n++] = 0xC0;
+    jz_at = n;
+    code[n++] = 0x74;
+    code[n++] = 0;
+    code[n++] = 0x48;
+    code[n++] = 0x8B;
+    code[n++] = 0x25;
+    at = n;
+    n += 4;
+    disp = (int32_t)(STOP_RSP_OFF - (at + 4));
+    memcpy(code + at, &disp, sizeof disp);
+    code[n++] = 0x48;
+    code[n++] = 0xB8;
+    memcpy(code + n, &resume, sizeof resume);
+    n += (int)sizeof resume;
+    code[n++] = 0xFF;
+    code[n++] = 0xE0;
+    code[jz_at + 1] = (uint8_t)(n - (jz_at + 2));
+    code[n++] = 0xEB;
+    code[n++] = 0xFE;
+    return n;
+}
+
 static int inject_dll(HANDLE process) {
     wchar_t self_path[PATH_CAP];
     uint8_t code[128];
@@ -2320,15 +2405,18 @@ static void fail_created_process(LPPROCESS_INFORMATION pi) {
 }
 
 /* A debug event has to be continued before the next one can be read.
- * LoadLibrary on a debuggee raises LOAD_DLL events, so the inject runs
- * on another thread while this thread keeps continuing those events. */
+ * Loading raises LOAD_DLL events, and this loop continues them. */
 #define DEBUG_CHILD_MAX 64
 
 typedef struct DebugChild {
     DWORD pid;
     HANDLE process;
     HANDLE thread;
+    HANDLE watch;
+    uint8_t *remote;
+    DWORD started;
     int armed;
+    int injecting;
 } DebugChild;
 
 /* One Git Bash and the processes it starts. Owned by the thread that
@@ -2341,17 +2429,22 @@ typedef struct DebugTree {
     DebugChild children[DEBUG_CHILD_MAX];
 } DebugTree;
 
-typedef struct InjectReq {
-    HANDLE process;
-    HANDLE done;
-    int ok;
-} InjectReq;
-
-static DWORD WINAPI inject_worker(LPVOID arg) {
-    InjectReq *req = (InjectReq *)arg;
-    req->ok = inject_dll(req->process);
-    SetEvent(req->done);
-    return 0;
+static void close_debug_child_handles(DebugChild *slot) {
+    if (slot->watch != NULL) {
+        CloseHandle(slot->watch);
+        slot->watch = NULL;
+    }
+    if (slot->process != NULL) {
+        CloseHandle(slot->process);
+        slot->process = NULL;
+    }
+    if (slot->thread != NULL) {
+        CloseHandle(slot->thread);
+        slot->thread = NULL;
+    }
+    slot->remote = NULL;
+    slot->started = 0;
+    slot->injecting = 0;
 }
 
 static int debug_continue_status(const DEBUG_EVENT *ev) {
@@ -2372,12 +2465,7 @@ static void forget_debug_child(DebugTree *tree, DWORD pid) {
         if (tree->children[i].pid != pid) {
             continue;
         }
-        if (tree->children[i].process != NULL) {
-            CloseHandle(tree->children[i].process);
-        }
-        if (tree->children[i].thread != NULL) {
-            CloseHandle(tree->children[i].thread);
-        }
+        close_debug_child_handles(&tree->children[i]);
         memset(&tree->children[i], 0, sizeof(tree->children[i]));
         return;
     }
@@ -2470,51 +2558,128 @@ static void on_debug_create(DebugTree *tree, DEBUG_EVENT *ev) {
     close_create_handles(info);
 }
 
-static int dispatch_debug_event(DebugTree *tree, DEBUG_EVENT *ev);
-
-static int inject_at_breakpoint(DebugTree *tree, DebugChild *slot, DEBUG_EVENT *held) {
-    InjectReq req;
-    HANDLE worker;
-    memset(&req, 0, sizeof req);
-    req.process = slot->process;
-    req.done = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (req.done == NULL) {
-        TerminateProcess(slot->process, 1);
-        return 0;
+/* Arrange LoadLibrary on the stopped thread, then return. The outer debug
+ * pump continues later events. Waiting here would recurse on the next
+ * child's breakpoint and overflow this thread's stack. */
+static int inject_at_breakpoint(DebugChild *slot, DEBUG_EVENT *held) {
+    CONTEXT ctx;
+    uint8_t code[128];
+    uint8_t *remote = NULL;
+    HANDLE opened = NULL;
+    HANDLE thread = NULL;
+    HANDLE watch = NULL;
+    SIZE_T written = 0;
+    SIZE_T path_bytes;
+    int code_len;
+    int continued = 0;
+    BOOL wow = FALSE;
+    FARPROC load_library;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_FULL;
+    thread = slot->thread;
+    if (thread == NULL) {
+        opened = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+            FALSE, held->dwThreadId);
+        thread = opened;
+    }
+    load_library = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+    /* 入口断点这条线程拿着加载锁。模块必须由它自己装，装完再回到原来的指令。
+     * 调试事件马上放行，后面的装载事件才能送到，bash 也不会停住。 */
+    if (slot->process == NULL || thread == NULL || load_library == NULL
+        || g_self_path[0] == L'\0'
+        || (IsWow64Process(slot->process, &wow) && wow)
+        || SuspendThread(thread) == (DWORD)-1
+        || !GetThreadContext(thread, &ctx)) {
+        goto stop_child;
+    }
+    code_len = build_stopped_loader(
+        code, (uint64_t)(uintptr_t)load_library, (uint64_t)ctx.Rip);
+    path_bytes = ((size_t)wcslen(g_self_path) + 1) * sizeof(wchar_t);
+    remote = (uint8_t *)VirtualAllocEx(
+        slot->process, NULL, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (code_len <= 0 || code_len >= STOP_DONE_OFF || remote == NULL
+        || STOP_PATH_OFF + path_bytes > 8192
+        || !WriteProcessMemory(slot->process, remote, code, (SIZE_T)code_len, &written)
+        || !WriteProcessMemory(
+            slot->process, remote + STOP_PATH_OFF, g_self_path, path_bytes, &written)
+        || !FlushInstructionCache(slot->process, remote, (SIZE_T)code_len)
+        || !DuplicateHandle(
+            GetCurrentProcess(), slot->process, GetCurrentProcess(), &watch,
+            0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        goto stop_child;
+    }
+    ctx.Rip = (DWORD64)(uintptr_t)remote;
+    if (!SetThreadContext(thread, &ctx) || ResumeThread(thread) == (DWORD)-1) {
+        goto stop_child;
     }
     ContinueDebugEvent(held->dwProcessId, held->dwThreadId, DBG_CONTINUE);
-    worker = CreateThread(NULL, 0, inject_worker, &req, 0, NULL);
-    if (worker == NULL) {
-        req.ok = 0;
-        SetEvent(req.done);
+    continued = 1;
+    if (opened != NULL) {
+        CloseHandle(opened);
+        opened = NULL;
     }
-    while (WaitForSingleObject(req.done, 0) != WAIT_OBJECT_0) {
-        DEBUG_EVENT nested;
-        if (!WaitForDebugEvent(&nested, 100)) {
-            continue;
-        }
-        if (!dispatch_debug_event(tree, &nested)) {
-            ContinueDebugEvent(
-                nested.dwProcessId, nested.dwThreadId, debug_continue_status(&nested));
-        }
-    }
-    if (worker != NULL) {
-        WaitForSingleObject(worker, 20000);
-        CloseHandle(worker);
-    }
-    CloseHandle(req.done);
-    if (!req.ok) {
+    slot->watch = watch;
+    slot->remote = remote;
+    slot->started = GetTickCount();
+    slot->injecting = 1;
+    return 1;
+stop_child:
+    if (watch != NULL) {
+        TerminateProcess(watch, 1);
+        CloseHandle(watch);
+    } else if (slot->process != NULL) {
         TerminateProcess(slot->process, 1);
     }
-    if (slot->process != NULL) {
-        CloseHandle(slot->process);
-        slot->process = NULL;
+    if (!continued) {
+        ContinueDebugEvent(held->dwProcessId, held->dwThreadId, DBG_CONTINUE);
     }
-    if (slot->thread != NULL) {
-        CloseHandle(slot->thread);
-        slot->thread = NULL;
+    if (opened != NULL) {
+        CloseHandle(opened);
     }
+    close_debug_child_handles(slot);
+    log_line(L"softdelete: breakpoint inject failed, child was stopped");
     return 1;
+}
+
+static void finish_debug_inject(DebugChild *slot, int ok) {
+    if (!ok) {
+        if (slot->watch != NULL) {
+            TerminateProcess(slot->watch, 1);
+        } else if (slot->process != NULL) {
+            TerminateProcess(slot->process, 1);
+        }
+        log_line(L"softdelete: breakpoint inject failed, child was stopped");
+    }
+    close_debug_child_handles(slot);
+}
+
+static void poll_debug_injects(DebugTree *tree) {
+    int i;
+    for (i = 0; i < DEBUG_CHILD_MAX; i++) {
+        DebugChild *slot = &tree->children[i];
+        uint32_t done = 0;
+        uint64_t loaded = 0;
+        SIZE_T got = 0;
+        if (!slot->injecting) {
+            continue;
+        }
+        if (slot->watch == NULL || slot->remote == NULL) {
+            finish_debug_inject(slot, 0);
+            continue;
+        }
+        if (ReadProcessMemory(
+                slot->watch, slot->remote + STOP_DONE_OFF, &done, sizeof done, &got)
+            && done == 1) {
+            ReadProcessMemory(
+                slot->watch, slot->remote + STOP_RESULT_OFF, &loaded, sizeof loaded, &got);
+            finish_debug_inject(slot, loaded != 0);
+            continue;
+        }
+        if (GetTickCount() - slot->started >= 15000) {
+            finish_debug_inject(slot, 0);
+        }
+    }
 }
 
 static int dispatch_debug_event(DebugTree *tree, DEBUG_EVENT *ev) {
@@ -2553,7 +2718,7 @@ static int dispatch_debug_event(DebugTree *tree, DEBUG_EVENT *ev) {
     for (i = 0; i < DEBUG_CHILD_MAX; i++) {
         if (tree->children[i].pid == ev->dwProcessId && tree->children[i].armed) {
             tree->children[i].armed = 0;
-            return inject_at_breakpoint(tree, &tree->children[i], ev);
+            return inject_at_breakpoint(&tree->children[i], ev);
         }
     }
     return 0;
@@ -2645,6 +2810,7 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
     SetEvent(req->created);
     while (!debug_tree_finished(&tree)) {
         DEBUG_EVENT ev;
+        poll_debug_injects(&tree);
         if (!WaitForDebugEvent(&ev, 50)) {
             continue;
         }
@@ -2652,6 +2818,7 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
             ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, debug_continue_status(&ev));
         }
     }
+    poll_debug_injects(&tree);
     CloseHandle(tree.root_process);
     return 0;
 }
@@ -3090,6 +3257,12 @@ SOFT_EXPORT void jiuwen_softdelete_set_bypass(int on) {
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = instance;
+        {
+            DWORD n = GetModuleFileNameW(g_module, g_self_path, PATH_CAP);
+            if (n == 0 || n >= PATH_CAP) {
+                g_self_path[0] = L'\0';
+            }
+        }
         DisableThreadLibraryCalls(instance);
         InitializeCriticalSection(&g_lock);
         g_lock_ready = 1;

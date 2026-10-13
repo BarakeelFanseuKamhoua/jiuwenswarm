@@ -241,6 +241,7 @@ class SandboxManager:
 
         self._lock = asyncio.Lock()
         self._sandboxes: dict[str, SandboxRef] = {}
+        self._delete_tasks: dict[str, asyncio.Task[None]] = {}
         self._policies: dict[str, SecurityPolicy] = {}
         # 空闲沙箱淘汰: 后台 reaper task 句柄 + stop event。``None`` 表示当前没有
         # reaper 在跑 (idle_timeout 未配置 / 已被禁用 / 服务尚未 startup)。
@@ -694,6 +695,8 @@ class SandboxManager:
 
     async def _start_sandbox_unlocked(self, sandbox_id: str) -> SandboxRef:
         ref = self._get_sandbox(sandbox_id)
+        if ref.phase == SandboxPhase.DELETING:
+            raise SandboxStateError(f"Cannot start sandbox '{sandbox_id}': state is {ref.phase.value}")
         if ref.phase == SandboxPhase.READY:
             if await self.runtime.is_running(sandbox_id):
                 return ref
@@ -737,6 +740,8 @@ class SandboxManager:
 
     async def _stop_sandbox_unlocked(self, sandbox_id: str) -> SandboxRef:
         ref = self._get_sandbox(sandbox_id)
+        if ref.phase == SandboxPhase.DELETING:
+            raise SandboxStateError(f"Cannot stop sandbox '{sandbox_id}': state is {ref.phase.value}")
         await self.runtime.stop(sandbox_id)
         ref.phase = SandboxPhase.STOPPED
         ref.pid = None
@@ -751,21 +756,35 @@ class SandboxManager:
 
     async def delete_sandbox(self, sandbox_id: str) -> None:
         async with self._lock:
-            ref = self._get_sandbox(sandbox_id)
-            ref.phase = SandboxPhase.DELETING
-            self._save_state(ref)
+            task = self._delete_tasks.get(sandbox_id)
+            if task is None:
+                ref = self._get_sandbox(sandbox_id)
+                ref.phase = SandboxPhase.DELETING
+                self._save_state(ref)
+                task = asyncio.create_task(self._finish_delete(sandbox_id))
+                self._delete_tasks[sandbox_id] = task
+                # A disconnected caller may no longer observe the exception.
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        await asyncio.shield(task)
 
+    async def _finish_delete(self, sandbox_id: str) -> None:
         # Cleanup can wait on processes and namespace teardown. Keep it outside
         # the global state lock so deleting one sandbox does not block unrelated
         # sandbox operations.
-        await self.runtime.cleanup(sandbox_id)
-        self.policy_engine.delete_sandbox_policy(sandbox_id)
-        self.audit.log(AuditEventType.SANDBOX_DELETED, sandbox_id)
-
-        async with self._lock:
-            self._sandboxes.pop(sandbox_id, None)
-            self._policies.pop(sandbox_id, None)
-            self._delete_state(sandbox_id)
+        try:
+            await self.runtime.cleanup(sandbox_id)
+            self.policy_engine.delete_sandbox_policy(sandbox_id)
+            self.audit.log(AuditEventType.SANDBOX_DELETED, sandbox_id)
+            async with self._lock:
+                self._delete_state(sandbox_id)
+                self._sandboxes.pop(sandbox_id, None)
+                self._policies.pop(sandbox_id, None)
+        except Exception:
+            logger.exception("delete_sandbox cleanup failed: sandbox_id=%s", sandbox_id)
+            raise
+        finally:
+            async with self._lock:
+                self._delete_tasks.pop(sandbox_id, None)
 
     async def exec_in_sandbox(
         self,

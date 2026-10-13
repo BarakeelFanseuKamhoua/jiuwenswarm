@@ -533,6 +533,13 @@ def two_hop_spawn(
                 "请重跑安装, 或由域管把 jbx-sandbox / jbx-sandbox-users "
                 "加入「允许本地登录」GPO"
             )
+        elif last_err == 5:
+            runner_py = (os.environ.get("JIUWENBOX_RUNNER_PYTHON") or "").strip() or sys.executable
+            hint = (
+                f"; jbx-sandbox 无法执行 runner Python: {runner_py}. "
+                "请将 JIUWENBOX_RUNNER_PYTHON 指向 Program Files 等公共目录下的标准 CPython "
+                "(不能是 venv/uv 虚拟环境), 或管理员执行 --desktop-run-win-setup --install --force"
+            )
         raise RuntimeError(
             f"两跳第一跳 CreateProcessWithLogonW 失败 (sandbox_id={sandbox_id}): {err}{hint}"
         )
@@ -555,13 +562,24 @@ def two_hop_spawn(
 
 
 def stop_runner(pid: int, process_handle: int, timeout_ms: int = 5000) -> None:
-    """停止 runner: TerminateProcess 兜底."""
+    """Confirm runner exit before releasing its handle; retain it on failure."""
     _require_windows()
     kernel32 = get_kernel32()
-    try:
-        kernel32.TerminateProcess(wintypes.HANDLE(process_handle), 1)
-    finally:
-        kernel32.CloseHandle(wintypes.HANDLE(process_handle))
+    handle = wintypes.HANDLE(process_handle)
+    state = int(kernel32.WaitForSingleObject(handle, 0))
+    if state != 0:
+        if state != 0x102:
+            raise RuntimeError(f"runner pid={pid} exit probe failed: wait={state:#x}")
+        # A failed kill can still race with a cooperative or Job-driven exit.
+        kill_error = None if kernel32.TerminateProcess(handle, 1) else ctypes.get_last_error()
+        state = int(kernel32.WaitForSingleObject(handle, timeout_ms))
+        if state != 0:
+            wait_error = ctypes.get_last_error() if state == 0xFFFFFFFF else None
+            raise RuntimeError(
+                f"runner pid={pid} exit not confirmed after {timeout_ms}ms: wait={state:#x} "
+                f"wait_winerror={wait_error} terminate_winerror={kill_error}"
+            )
+    kernel32.CloseHandle(handle)
 
 
 def is_runner_alive(process_handle: int) -> bool:
@@ -644,10 +662,11 @@ def two_hop_spawn_and_authorize(
     control_port: int,
     env: dict[str, str] | None = None,
     control_token: str | None = None,
+    job_handle: int | None = None,
 ) -> "tuple[int, int]":
     """两跳拉起 runner + 写 token + resume 主线程 (一站式, review #2).
 
-    封装 two_hop_spawn (CREATE_SUSPENDED) → _write_token_to_pipe → CloseHandle
+    封装 two_hop_spawn (CREATE_SUSPENDED) → assign Job → _write_token_to_pipe → CloseHandle
     写端 → resume_process → CloseHandle thread_handle 全流程, 调用方只拿
     (pid, process_handle). 避免 process.py 直接管理 pipe 句柄时序.
 
@@ -669,6 +688,8 @@ def two_hop_spawn_and_authorize(
     )
     kernel32 = get_kernel32()
     try:
+        if job_handle is not None:
+            win_job.assign_process(job_handle, proc_handle)
         # 1. resume 前 (CREATE_SUSPENDED) 把 token 写进 pipe, 关写端让 runner 读到 EOF.
         # review #2 安全关键: token 写入失败必须终止 spawn, 否则 runner 以空 token
         # 跑起来后 accept 循环的 control_token 为空会跳过鉴权 (runner_main 里
@@ -685,15 +706,8 @@ def two_hop_spawn_and_authorize(
                 )
             finally:
                 kernel32.CloseHandle(wintypes.HANDLE(token_write_handle))
+                token_write_handle = 0
         if not token_write_ok and control_token:
-            # token 没传过去, runner 起来也是无鉴权状态 — 杀掉已起的 runner (仍挂起),
-            # 关 process/thread handle, 抛错让调用方走清理路径.
-            kernel32.TerminateProcess(wintypes.HANDLE(proc_handle), 1)
-            kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
-            try:
-                kernel32.CloseHandle(wintypes.HANDLE(thread_handle))
-            except Exception:  # noqa: BLE001
-                pass
             raise RuntimeError(
                 f"control_token 写入 pipe 失败, runner 未启动 (sandbox_id={sandbox_id})"
             )
@@ -707,12 +721,6 @@ def two_hop_spawn_and_authorize(
                     "软删除 DLL 注入失败, 终止 runner spawn (sandbox=%s): %s",
                     sandbox_id, exc,
                 )
-                kernel32.TerminateProcess(wintypes.HANDLE(proc_handle), 1)
-                kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
-                try:
-                    kernel32.CloseHandle(wintypes.HANDLE(thread_handle))
-                except Exception:  # noqa: BLE001
-                    pass
                 raise RuntimeError(
                     f"软删除 DLL 注入失败, runner 未启动 (sandbox_id={sandbox_id})"
                 ) from exc
@@ -724,21 +732,19 @@ def two_hop_spawn_and_authorize(
                 "Windows runner resume 失败 (sandbox=%s)", sandbox_id,
                 exc_info=True,
             )
+            raise
         # 3. thread_handle resume 后不再需要, 关闭避免句柄泄漏.
+    except Exception:
         try:
-            kernel32.CloseHandle(wintypes.HANDLE(thread_handle))
-        except Exception:  # noqa: BLE001
-            logger.debug("CloseHandle thread_handle 失败", exc_info=True)
-    except RuntimeError:
+            stop_runner(runner_pid, proc_handle)
+        except Exception:
+            logger.warning("Failed to reap startup runner pid=%s", runner_pid, exc_info=True)
+            raise
         raise
-    except Exception:  # noqa: BLE001
-        # 未预期异常: 关 process_handle 防泄漏, runner 已起但 resume 异常时
-        # 会被 box-server 当作起不来清理 (调用方负责 stop_runner).
-        try:
-            kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
-        except Exception:  # noqa: BLE001
-            pass
-        raise
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(thread_handle))
+        if token_write_handle:
+            kernel32.CloseHandle(wintypes.HANDLE(token_write_handle))
     return runner_pid, proc_handle
 
 
