@@ -145,7 +145,7 @@ def build_trusted_dirs_permission_config(
     file_guard = config.get("file_guard")
     if not isinstance(file_guard, dict):
         file_guard = {}
-    file_guard["enabled"] = True
+    file_guard.setdefault("enabled", True)
     raw_paths = file_guard.get("paths")
     existing_paths = raw_paths if isinstance(raw_paths, list) else []
     retained_paths: list[Any] = []

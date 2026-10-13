@@ -39,6 +39,7 @@ def _operation(content_map: dict[str, bytes]):
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     """公共环境：假 server/落盘、清空两张 session 登记表、给定 project_root。"""
+    (tmp_path / "sessions" / "sess-1").mkdir(parents=True)
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.session.session_history.get_agent_sessions_dir",
         lambda: tmp_path / "sessions",
@@ -147,8 +148,8 @@ async def test_team_source_outside_root_materialized(env, monkeypatch):
     assert entry["source_path"] == str(materialized)
     assert entry["name"] == "方案.md"
     assert entry["artifact_id"] == sfu.artifact_id_for_path(str(materialized))
-    # 下载载荷仍指暂存副本，不指源/实体化路径
-    assert entry["path"] != entry["source_path"]
+    # 下载直接使用工作区文件，不额外生成发送快照。
+    assert entry["path"] == entry["source_path"]
 
 
 @pytest.mark.asyncio

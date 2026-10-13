@@ -1769,6 +1769,7 @@ def _handle_exec_request(stream, header, restricted_token, workspace, stdin_byte
     # 每次 exec 独立 Job. child 在加入前保持挂起, 不允许派生未归入 Job 的孙进程.
     from jiuwenbox.supervisor import win_job
     exec_job_handle = 0
+    exec_completed = False
     proc_handle = 0
     thread_handle = 0
     stdin_thread = None
@@ -1904,9 +1905,6 @@ def _handle_exec_request(stream, header, restricted_token, workspace, stdin_byte
                           f"exec child {'请求已取消/断开' if disconnected else '超时'} 强杀, "
                           f"cmd={command[:3] if command else []!r}")
                 break
-        # 先回收孙进程, 再等 stdout EOF; 避免孙进程仍持有 pipe 写端.
-        win_job.close_job(exec_job_handle)
-        exec_job_handle = 0
         _confirm_process_exit(kernel32, proc_handle)
         # 进程已退出 (正常或强杀). 等 drain 线程结束 (最多 5s, 防孙进程持写端不 EOF).
         _drain_thread.join(timeout=5.0)
@@ -1973,6 +1971,9 @@ def _handle_exec_request(stream, header, restricted_token, workspace, stdin_byte
             _push_log("INFO",
                       f"exec 成功 exit=0 cmd={cmd_summary!r} "
                       f"stdout_len={len(out_text)}")
+        # Normal completion (including a nonzero exit code) preserves background
+        # descendants. Keep the kill-on-close Job until all error paths are past.
+        exec_completed = True
     except Exception as exc:  # noqa: BLE001
         import traceback as _tb
         tb = _tb.format_exc()
@@ -2000,9 +2001,12 @@ def _handle_exec_request(stream, header, restricted_token, workspace, stdin_byte
                 pass
         if exec_job_handle:
             try:
-                win_job.close_job(exec_job_handle)
-            except Exception:  # noqa: BLE001
-                pass
+                if exec_completed:
+                    win_job.release_exec_job(exec_job_handle)
+                else:
+                    win_job.close_job(exec_job_handle)
+            except Exception as cleanup_error:  # noqa: BLE001
+                _push_log("ERROR", f"exec Job cleanup failed: {cleanup_error}")
             exec_job_handle = 0
         for handle in (child_out_write, child_out_read, child_in_write, child_in_read):
             if handle.value:

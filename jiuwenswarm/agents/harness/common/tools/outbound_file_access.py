@@ -2,8 +2,6 @@
 """Read outbound sources through the owning agent's filesystem backend."""
 
 from collections.abc import Callable
-from pathlib import Path
-import tempfile
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.sys_operation import SysOperation
@@ -25,16 +23,3 @@ async def read_outbound_file(path: str, operation: SysOperation | None) -> bytes
     if not isinstance(content, bytes):
         raise RuntimeError("Outbound file backend did not return binary content")
     return content
-
-
-def stage_outbound_file(path: str, content: bytes, session_id: str) -> str:
-    """Keep the checked bytes for path-based delivery and later downloads."""
-    from jiuwenswarm.server.runtime.session.session_history import resolve_session_dir
-
-    session_dir, error = resolve_session_dir(session_id, create=True)
-    if session_dir is None:
-        raise ValueError(error)
-    directory = Path(tempfile.mkdtemp(prefix="outbound-", dir=session_dir))
-    target = directory / Path(path).name
-    target.write_bytes(content)
-    return str(target)

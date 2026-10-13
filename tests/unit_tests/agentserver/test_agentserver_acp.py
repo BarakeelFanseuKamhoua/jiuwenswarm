@@ -2878,8 +2878,21 @@ async def test_handle_session_delete_initializes_persistent_checkpointer(monkeyp
         params={"session_id": "sess-agent-1"},
     )
 
+    from jiuwenswarm.agents.harness.common.tools.web_file_download import WebFileDownloadManager
+
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.session.session_history.get_agent_sessions_dir", lambda: sessions_root,
+    )
+    source = tmp_path / "delivered.txt"
+    source.write_bytes(b"keep original")
+    downloads = WebFileDownloadManager(secret="session-delete-test-" * 3)
+    token = downloads.generate_token(str(source), "sess-agent-1", approved_outbound=True)
+    assert downloads.validate_token(token) is not None
+
     await server.handle_session_delete_for_test(fake_ws, request, asyncio.Lock())
 
+    assert downloads.validate_token(token) is None
+    assert source.read_bytes() == b"keep original"
     assert ensure_calls == ["called"]
     assert release_calls == ["sess-agent-1"]
     assert cleared_metadata_cache == ["sess-agent-1"]

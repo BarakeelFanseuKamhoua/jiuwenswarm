@@ -110,7 +110,8 @@ def test_native_sandbox_account_runner_exec_and_cleanup(monkeypatch, tmp_path, c
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Jobs")
 @pytest.mark.parametrize("kill_owner", [False, True])
-def test_native_owner_exit_reaps_runner_and_nested_exec(kill_owner):
+@pytest.mark.parametrize("release_exec", [False, True])
+def test_native_owner_exit_reaps_runner_and_nested_exec(kill_owner, release_exec):
     """Exercise real kernel Jobs without changing sandbox-account ACLs."""
     import ctypes
     from ctypes import wintypes
@@ -122,9 +123,11 @@ sys.stdin.readline()
 job = win_job.create_exec_job()
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
 win_job.assign_process(job, int(child._handle))
+RELEASE_EXEC
 print(child.pid, flush=True)
 time.sleep(120)
 """
+    runner_code = runner_code.replace("RELEASE_EXEC", "win_job.release_exec_job(job)" if release_exec else "")
     owner_code = f"""
 import sys, subprocess, json
 from jiuwenbox.supervisor import win_job
@@ -153,6 +156,7 @@ win_job.close_job(job)
             handle = kernel.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
             assert handle, f"cannot observe test process {pid}"
             handles.append(handle)
+            assert kernel.WaitForSingleObject(handle, 0) == 0x102, "released exec killed a descendant"
         if kill_owner:
             owner.kill()
         else:
@@ -167,6 +171,43 @@ win_job.close_job(job)
         owner.communicate(timeout=10)
         for handle in handles:
             kernel.CloseHandle(handle)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Jobs")
+def test_native_completed_exec_jobs_do_not_leak_handles():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = win_job.get_kernel32()
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetProcessHandleCount.restype = wintypes.BOOL
+    process = kernel.GetCurrentProcess()
+
+    def handle_count():
+        count = wintypes.DWORD()
+        assert kernel.GetProcessHandleCount(process, ctypes.byref(count))
+        return count.value
+
+    win_job.release_exec_job(win_job.create_exec_job())
+    before = handle_count()
+    for _ in range(100):
+        win_job.release_exec_job(win_job.create_exec_job())
+    assert handle_count() == before
+
+
+def test_exec_job_release_failure_still_closes_kill_on_close_job(monkeypatch):
+    kernel = MagicMock()
+    kernel.SetInformationJobObject.return_value = False
+    monkeypatch.setattr(win_job, "_require_windows", lambda: None)
+    monkeypatch.setattr(win_job, "get_kernel32", lambda: kernel)
+    # ctypes.WinError is unavailable on Linux, where this fault check also runs.
+    monkeypatch.setattr(win_job.ctypes, "WinError", lambda *_: OSError("set limits failed"), raising=False)
+    monkeypatch.setattr(win_job.ctypes, "get_last_error", lambda: 5, raising=False)
+    with pytest.raises(OSError, match="set limits failed"):
+        win_job.release_exec_job(20)
+    kernel.CloseHandle.assert_called_once()
+    assert kernel.CloseHandle.call_args.args[0].value == 20
 
 
 @pytest.mark.parametrize("failure", [None, "assign", "token", "resume"])

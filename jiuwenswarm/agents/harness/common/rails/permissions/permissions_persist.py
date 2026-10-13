@@ -74,7 +74,7 @@ def _ensure_file_guard_dict(permissions: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(fg, dict):
         fg = {}
         permissions["file_guard"] = fg
-    fg["enabled"] = True
+    fg.setdefault("enabled", True)
     paths = fg.get("paths")
     if not isinstance(paths, list):
         paths = []
@@ -394,7 +394,8 @@ def apply_session_permissions_overlay(
     """Merge session overlay onto a disk permissions snapshot.
 
     Overlay wins on ``file_guard.paths`` (escalate toward allow) and
-    ``approval_overrides`` (by ``id``). Disk ``file_guard.defaults`` stay.
+    ``approval_overrides`` (by ``id``). Disk ``file_guard.defaults`` and an
+    explicit ``file_guard.enabled`` stay.
     """
     merged: dict[str, Any] = deepcopy(base) if isinstance(base, dict) else {}
     if not isinstance(overlay, dict) or not overlay:
@@ -421,7 +422,7 @@ def apply_session_permissions_overlay(
         if ov_fg.get("enabled") is True:
             fg = merged.get("file_guard")
             if isinstance(fg, dict):
-                fg["enabled"] = True
+                fg.setdefault("enabled", True)
 
     ov_overrides = overlay.get("approval_overrides")
     if isinstance(ov_overrides, list):

@@ -16,6 +16,7 @@ def _clear_dedup_registry(monkeypatch, tmp_path):
     class LocalSendFileToolkit(sfu.SendFileToolkit):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, operation_provider=lambda: operation, **kwargs)
+            (tmp_path / "sessions" / self.session_id).mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(sfu, "SendFileToolkit", LocalSendFileToolkit)
     sfu._SENT_FILE_PATHS_BY_SESSION.clear()
