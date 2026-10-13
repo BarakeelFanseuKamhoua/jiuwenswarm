@@ -2100,6 +2100,32 @@ def _grant_write_dac_to_current_user(paths: set[str]) -> None:
         _record_acl_policy_paths(granted)
 
 
+def _grant_owned_preinstall_paths(paths: set[str], recorded: set[str]) -> set[str]:
+    """Grant the sandbox user read/execute on tool dirs the current user owns.
+
+    uv-managed and per-user Python installs live under the user's profile, so the
+    runtime can authorize them without elevation; returns the paths granted.
+    """
+    sid = get_sandbox_user_sid()
+    if not sid:
+        return set()
+    from jiuwenbox.supervisor import win_acl as _wa
+    granted: set[str] = set()
+    for p in sorted(paths):
+        if not os.path.isdir(p) or not _path_owned_by_current_user(p):
+            continue
+        try:
+            _wa.grant_ace(p, sid, rights=const.ALLOW_READ_EXECUTE_RIGHTS, mode="ALLOW", recursive=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("grant 沙箱用户读执行失败 (非致命): %s=%s", p, exc)
+            continue
+        granted.add(p)
+        logger.info("当前用户所有的工具目录已授权沙箱用户读执行 (无需 UAC): %s", p)
+    if granted:
+        _reg_set_str(const.REG_VALUE_PREINSTALLED_PATHS, json.dumps(sorted(recorded | granted)))
+    return granted
+
+
 def ensure_windows_setup(
     force: bool = False,
     preinstall_paths: list[str] | None = None,
@@ -2139,6 +2165,8 @@ def ensure_windows_setup(
                 except (ValueError, TypeError):
                     recorded = set()
             new_paths = self_check_paths - recorded
+            if new_paths:
+                new_paths -= _grant_owned_preinstall_paths(new_paths, recorded)
             # 增量检测: 用户 policy 的 deny/allow 路径变更 (allow_read/deny_read/allow_write/deny_write).
             # install 阶段给这些路径预授 WRITE_DAC, 运行时 box-server 才能改 DACL 施加 Deny/Allow ACE.
             # 若 runtime policy 新增了路径但未预授 WRITE_DAC → grant_ace WinError 5 → Deny Read 不生效.

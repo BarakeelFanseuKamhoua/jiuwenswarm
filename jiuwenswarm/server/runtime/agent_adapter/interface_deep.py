@@ -4132,6 +4132,31 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         return bool(wanted and current and wanted != current)
 
     @staticmethod
+    async def retarget_sandbox_sys_operations(old_url: str, new_url: str) -> list[str]:
+        """Repoint registered sandbox sys_operations after box-server moved ports.
+
+        Built agents hold the SysOperation object, so its config is patched in
+        place; gateway endpoint/provider caches are keyed without base_url.
+        """
+        from openjiuwen.core.sys_operation.sandbox.gateway.gateway import SandboxGateway
+
+        old_url, new_url = old_url.rstrip("/"), new_url.rstrip("/")
+        resource_registry = getattr(Runner.resource_mgr, "_resource_registry", None)
+        if resource_registry is None or old_url == new_url:
+            return []
+        sys_operations = getattr(resource_registry.sys_operation(), "_sys_operations", {})
+        retargeted: list[str] = []
+        for sys_operation in list(sys_operations.values()):
+            run_config = getattr(sys_operation, "_run_config", None)
+            gateway_config = getattr(run_config, "config", None)
+            if JiuWenSwarmDeepAdapter._sandbox_base_url_of(gateway_config) != old_url:
+                continue
+            gateway_config.launcher_config.base_url = new_url
+            await SandboxGateway.get_instance().release_sandbox(run_config.isolation_key_template, on_stop="keep")
+            retargeted.append(str(sys_operation.id))
+        return retargeted
+
+    @staticmethod
     def _get_registered_sys_operation_by_isolation_key(
         isolation_key_template: str | None,
     ) -> SysOperation | None:
@@ -4534,6 +4559,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                         old_id = extra.get("sandbox_id")
                         deleted = await delete_jiuwenbox_sandbox(
                             sandbox_id=old_id, shared_key=shared_key, reason="policy_changed",
+                            raise_on_error=True,
                         )
                         if old_id and old_id not in deleted:
                             raise RuntimeError(f"could not delete old sandbox {old_id}")

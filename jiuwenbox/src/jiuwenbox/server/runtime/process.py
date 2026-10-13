@@ -668,6 +668,8 @@ class ProcessRuntime(RuntimeAdapter):
         # 完全不动这些字典 (文档 6.9: 在 ProcessRuntime 层新增 Windows 分支).
         # runner pipe 句柄 + Job handle + ACL workspace + runner pid/handle.
         self._win_runners: dict[str, dict] = {}
+        self._win_stop_locks: dict[str, asyncio.Lock] = {}
+        self._win_stop_users: dict[str, int] = {}
         self._win_job_handles: dict[str, int] = {}
         self._win_acl_paths: dict[str, list[str]] = {}
         self._win_acl_lock = asyncio.Lock()
@@ -2999,9 +3001,12 @@ class ProcessRuntime(RuntimeAdapter):
         """
         return str(WIN_SANDBOX_WORKSPACE_ROOT / sandbox_id)
 
-    async def _run_windows_acl(self, operation):
+    async def _run_windows_acl(self, operation, *, sandbox_id: str | None = None):
         """Serialize ACL mutations off the loop, including cancelled requests."""
+        queued = time.perf_counter()
         async with self._win_acl_lock:
+            started = time.perf_counter()
+            logger.info("[SandboxWin] %s ACL queue_wait=%.3fs", sandbox_id, started - queued)
             task = asyncio.create_task(asyncio.to_thread(operation))
             try:
                 return await asyncio.shield(task)
@@ -3012,6 +3017,9 @@ class ProcessRuntime(RuntimeAdapter):
                     await task
                 finally:
                     raise
+            finally:
+                logger.info("[SandboxWin] %s ACL execution=%.3fs", sandbox_id,
+                            time.perf_counter() - started)
 
     async def _create_windows(
         self,
@@ -3020,7 +3028,7 @@ class ProcessRuntime(RuntimeAdapter):
         env: dict[str, str] | None = None,
     ) -> int:
         from jiuwenbox.supervisor import (
-            win_acl, win_exec, win_setup, win_constants as const,
+            win_acl, win_exec, win_job, win_setup, win_constants as const,
         )
 
         # 传入 policy 的代理端口范围 (WFP Permit 须与 win_proxy 监听端口一致).
@@ -3316,7 +3324,7 @@ class ProcessRuntime(RuntimeAdapter):
             return acl_paths or [workspace], sandbox_user_sid
 
         try:
-            acl_paths, sandbox_user_sid = await self._run_windows_acl(_apply_acl)
+            acl_paths, sandbox_user_sid = await self._run_windows_acl(_apply_acl, sandbox_id=sandbox_id)
         except asyncio.CancelledError:
             await self._stop_windows(sandbox_id)
             raise
@@ -3361,7 +3369,22 @@ class ProcessRuntime(RuntimeAdapter):
         recycle_token = prepare_runner_recycle(
             env, [workspace, *(allow_write_paths or [])],
         )
+        try:
+            # No resource limits: the Job is solely an owner-death safety net.
+            job_handle = win_job.create_job()
+            self._win_job_handles[sandbox_id] = job_handle
+        except Exception:
+            detach_runner_recycle(recycle_token)
+            await self._stop_windows(sandbox_id)
+            raise
         _t_spawn0 = time.perf_counter()
+
+        def remember_runner(pid, handle):
+            self._win_runners[sandbox_id] = {
+                "pid": pid, "process_handle": handle, "control_port": control_port,
+                "control_token": control_token, "workspace": workspace, "recycle_token": recycle_token,
+            }
+
         spawn_task = asyncio.create_task(asyncio.to_thread(
             win_exec.two_hop_spawn_and_authorize,
             sandbox_id,
@@ -3373,6 +3396,7 @@ class ProcessRuntime(RuntimeAdapter):
             control_port=control_port,
             env=env,
             control_token=control_token,
+            job_handle=job_handle,
         ))
         try:
             runner_pid, proc_handle = await asyncio.shield(spawn_task)
@@ -3380,14 +3404,15 @@ class ProcessRuntime(RuntimeAdapter):
             # The spawn thread cannot be interrupted; reap its runner and ACL.
             try:
                 pid, handle = await spawn_task
-                await asyncio.to_thread(win_exec.stop_runner, pid, handle)
+                remember_runner(pid, handle)
             except Exception:  # noqa: BLE001
-                logger.debug("取消后回收 runner 失败 sandbox=%s", sandbox_id, exc_info=True)
-            detach_runner_recycle(recycle_token)
+                logger.warning("取消后 runner 启动失败 sandbox=%s", sandbox_id, exc_info=True)
+                detach_runner_recycle(recycle_token)
             await self._stop_windows(sandbox_id)
             raise
         except Exception:  # noqa: BLE001
             detach_runner_recycle(recycle_token)
+            await self._stop_windows(sandbox_id)
             raise
         logger.info(
             "[SandboxWin] %s runner spawned (two-hop): pid=%s, workspace=%s, "
@@ -3396,18 +3421,10 @@ class ProcessRuntime(RuntimeAdapter):
             sandbox_id, runner_pid, workspace, proxy_start, proxy_end, control_port,
             time.perf_counter() - _t_spawn0,
         )
-        self._win_runners[sandbox_id] = {
-            "pid": runner_pid,
-            "control_port": control_port,  # TCP loopback, 每次 exec connect
-            "control_token": control_token,  # P0-6 鉴权 token
-            "process_handle": proc_handle,
-            "workspace": workspace,
-            "recycle_token": recycle_token,
-        }
+        remember_runner(runner_pid, proc_handle)
 
-        # 3. Job Object 资源限制 (memory/cpu/进程数) 当前禁用: 跨用户 OpenProcess 拿不到
-        # PROCESS_SET_QUOTA → WinError 5; 隔离核心 (ACL + WFP) 不依赖 Job. 隔离核心不依赖 Job.
-        # resource 配置保留在 policy 但运行时忽略. 恢复路径: 用 two_hop_spawn 返回的 proc_handle 直接 assign 绕过跨用户 ACL.
+        # The suspended runner was assigned using its creation handle before
+        # resume. Only box-server owns the non-inheritable Job handle.
         # review #2: thread_handle 已在 two_hop_spawn_and_authorize 内 resume + CloseHandle,
         # 不再在此单独 resume.
 
@@ -3426,7 +3443,7 @@ class ProcessRuntime(RuntimeAdapter):
 
         try:
             await self._wait_win_runner_ready(sandbox_id)
-        except Exception as exc:  # noqa: BLE001
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
             # 对齐 Linux _verify_daemon_alive: runner 启动期就失败, 必须把已起
             # 的 runner / 日志线程 / ACL 清理干净
             logger.error(
@@ -3493,14 +3510,33 @@ class ProcessRuntime(RuntimeAdapter):
             await asyncio.sleep(WIN_RUNNER_READY_PROBE_INTERVAL)
 
     async def _stop_windows(self, sandbox_id: str, timeout: float = 10.0) -> None:
+        lock = self._win_stop_locks.setdefault(sandbox_id, asyncio.Lock())
+        # Count holders and waiters so cleanup cannot replace a lock still in use.
+        self._win_stop_users[sandbox_id] = self._win_stop_users.get(sandbox_id, 0) + 1
+        try:
+            async with lock:
+                await self._stop_windows_unlocked(sandbox_id, timeout)
+        finally:
+            remaining = self._win_stop_users[sandbox_id] - 1
+            if remaining:
+                self._win_stop_users[sandbox_id] = remaining
+            else:
+                self._win_stop_users.pop(sandbox_id)
+                self._win_stop_locks.pop(sandbox_id)
+
+    async def _stop_windows_unlocked(self, sandbox_id: str, timeout: float = 10.0) -> None:
         from jiuwenbox.supervisor import win_acl, win_exec, win_job
 
-        runner = self._win_runners.pop(sandbox_id, None)
+        cancelled = False
+        runner = self._win_runners.get(sandbox_id)
         if runner is not None:
+            logger.info("[SandboxWin] delete sandbox=%s runner_pid=%s control_port=%s",
+                        sandbox_id, runner["pid"], runner["control_port"])
             from jiuwenbox.supervisor.win_recycle_broker import detach_runner_recycle
-            detach_runner_recycle(runner.get("recycle_token"))
             # 1. 发 shutdown 让 runner 优雅退出 (它内部会停掉所有受限 token child).
+            started = time.perf_counter()
             await self._send_runner_shutdown(sandbox_id, runner)
+            logger.info("[SandboxWin] %s shutdown=%.3fs", sandbox_id, time.perf_counter() - started)
             # 1.5 join 日志读取线程: runner 收 shutdown 退出前会 push 最后一帧
             # "runner 退出", 此处短 timeout 等它读出打印. set stop 让线程主动退.
             stop_evt = self._win_log_stops.pop(sandbox_id, None)
@@ -3508,14 +3544,31 @@ class ProcessRuntime(RuntimeAdapter):
             if stop_evt is not None:
                 stop_evt.set()
             if log_thread is not None:
+                started = time.perf_counter()
                 await asyncio.to_thread(log_thread.join, 2.0)
+                logger.info("[SandboxWin] %s log_join=%.3fs", sandbox_id, time.perf_counter() - started)
             # 2. TerminateProcess 兜底 (runner 没响应 shutdown).
             try:
-                await asyncio.to_thread(win_exec.stop_runner, runner["pid"], runner["process_handle"])
+                started = time.perf_counter()
+                stop_task = asyncio.create_task(asyncio.to_thread(
+                    win_exec.stop_runner, runner["pid"], runner["process_handle"],
+                ))
+                try:
+                    await asyncio.shield(stop_task)
+                except asyncio.CancelledError:
+                    # The handle is closed once the thread succeeds; finish the
+                    # remaining cleanup before propagating, or it cannot be retried.
+                    await stop_task
+                    cancelled = True
             except Exception:  # noqa: BLE001
-                logger.debug(
+                logger.warning(
                     "停止 runner 失败 sandbox=%s", sandbox_id, exc_info=True,
                 )
+                raise
+            finally:
+                logger.info("[SandboxWin] %s stop_runner=%.3fs", sandbox_id, time.perf_counter() - started)
+            self._win_runners.pop(sandbox_id, None)
+            detach_runner_recycle(runner.get("recycle_token"))
             # 3. 关 Job: KILL_ON_JOB_CLOSE 内核强杀所有残留成员 (含
             #    runner 未及回收的受限 child). 放在 terminate 之后确保 child
             #    也被清理; 若放前面, Job kill 后 runner handle 失效.
@@ -3531,17 +3584,23 @@ class ProcessRuntime(RuntimeAdapter):
                 win_job.teardown(job)
 
         # 5. 撤销文件 ACL (按 apply 时返回的施加路径清单撤销, review MAJOR #6).
-        acl_paths = self._win_acl_paths.pop(sandbox_id, None)
-        sandbox_user_sid = self._win_sandbox_sids.pop(sandbox_id, None)
+        acl_paths = self._win_acl_paths.get(sandbox_id)
+        sandbox_user_sid = self._win_sandbox_sids.get(sandbox_id)
         if acl_paths:
             try:
                 await self._run_windows_acl(
                     lambda: win_acl.revoke_sandbox_acl(acl_paths, sandbox_user_sid=sandbox_user_sid),
+                    sandbox_id=sandbox_id,
                 )
             except Exception:  # noqa: BLE001
-                logger.debug("撤销 ACL 失败 sandbox=%s", sandbox_id, exc_info=True)
+                logger.warning("撤销 ACL 失败 sandbox=%s", sandbox_id, exc_info=True)
+                raise
+        self._win_acl_paths.pop(sandbox_id, None)
+        self._win_sandbox_sids.pop(sandbox_id, None)
         # 清理 per-sandbox pipe lock.
         self._win_pipe_locks.pop(sandbox_id, None)
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _close_win_pipe_handles(runner: dict) -> None:

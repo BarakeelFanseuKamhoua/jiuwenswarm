@@ -193,6 +193,7 @@ async def test_adapter_restart_uses_scoped_key_and_propagates_error(monkeypatch)
     assert launcher.extra_params["sandbox_id"] == "new-id"
     import sys
     if sys.platform == "win32":
+        assert delete.await_args.kwargs["raise_on_error"] is True
         assert [call[0] for call in calls.mock_calls] == ["delete", "create"]
     create.side_effect = RuntimeError("create failed")
     with pytest.raises(RuntimeError, match="create failed"):

@@ -36,7 +36,9 @@ def is_tcp_port_bindable(host: str, port: int) -> bool:
     try:
         try:
             sock.bind((host, port))
-        except OSError:
+        except OSError as exc:
+            logger.warning("[sandbox.port] cannot bind %s:%d: %s (winerror=%s)",
+                           host, port, exc, getattr(exc, "winerror", None))
             return False
         return True
     finally:
@@ -70,7 +72,7 @@ def allocate_internal_jiuwenbox_port(
         return preferred_port
     new_port = pick_free_tcp_port(host)
     logger.warning(
-        "[sandbox.port] preferred port %s:%d is busy; "
+        "[sandbox.port] cannot bind preferred port %s:%d; "
         "allocating fresh port %d for new jiuwenbox instance",
         host,
         preferred_port,

@@ -306,7 +306,8 @@ class TestProcessRuntimeWindowsBranch:
     win_* 模块, 因此可跨平台验证调度逻辑.
     """
 
-    def test_create_dispatches_to_windows(self, monkeypatch):
+    @pytest.mark.parametrize("failure", [None, "job", "spawn", "cancel", "ready_cancel"])
+    def test_create_dispatches_to_windows(self, monkeypatch, tmp_path, failure):
         from jiuwenbox.server.runtime import process as proc_mod
         runtime = proc_mod.ProcessRuntime()
 
@@ -323,6 +324,10 @@ class TestProcessRuntimeWindowsBranch:
         fake_win_exec._get_kernel32 = MagicMock(return_value=MagicMock())  # noqa: SLF001 - 测试访问内部成员
         fake_win_job = MagicMock()
         fake_win_job.create_job = MagicMock(return_value=999)
+        if failure == "job":
+            fake_win_job.create_job.side_effect = RuntimeError("job failed")
+        if failure == "spawn":
+            fake_win_exec.two_hop_spawn_and_authorize.side_effect = RuntimeError("spawn failed")
         fake_win_job.assign_process_by_pid = MagicMock()
         fake_win_job.resume_process = MagicMock()
         fake_win_setup = MagicMock()
@@ -351,6 +356,9 @@ class TestProcessRuntimeWindowsBranch:
             proc_mod.ProcessRuntime, "_load_policy",
             staticmethod(lambda path: policy),
         )
+        monkeypatch.setattr(runtime, "_win_workspace_for", lambda *args: str(tmp_path))
+        monkeypatch.setattr(runtime, "_wait_win_runner_ready", AsyncMock())
+        monkeypatch.setattr(runtime, "_win_log_reader_blocking", MagicMock())
 
         # 跑 create.
         import asyncio as _asyncio
@@ -373,13 +381,60 @@ class TestProcessRuntimeWindowsBranch:
             _os, "fdopen",
             lambda fd, mode, **kw: MagicMock(),
         )
-        pid = _asyncio.run(runtime._create_windows("sb-1", Path("/tmp/p.yaml"), {}))  # noqa: SLF001
+        async def exercise():
+            if failure == "cancel":
+                import threading
+                entered, release = threading.Event(), threading.Event()
 
-        assert pid == 12345
+                def spawn(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(2)
+                    return 12345, 100
+
+                fake_win_exec.two_hop_spawn_and_authorize.side_effect = spawn
+                task = _asyncio.create_task(runtime._create_windows("sb-1", Path("/tmp/p.yaml"), {}))
+                assert await _asyncio.to_thread(entered.wait, 2)
+                task.cancel()
+                release.set()
+                with pytest.raises(_asyncio.CancelledError):
+                    await task
+            elif failure == "ready_cancel":
+                entered = _asyncio.Event()
+
+                async def hang(sandbox_id):
+                    entered.set()
+                    await _asyncio.Event().wait()
+
+                monkeypatch.setattr(runtime, "_wait_win_runner_ready", hang)
+                task = _asyncio.create_task(runtime._create_windows("sb-1", Path("/tmp/p.yaml"), {}))
+                await entered.wait()
+                task.cancel()
+                with pytest.raises(_asyncio.CancelledError):
+                    await task
+            elif failure:
+                with pytest.raises(RuntimeError, match=failure):
+                    await runtime._create_windows("sb-1", Path("/tmp/p.yaml"), {})
+            else:
+                pid = await runtime._create_windows("sb-1", Path("/tmp/p.yaml"), {})
+                assert pid == 12345
+                assert runtime._win_job_handles["sb-1"] == 999
+                await runtime._stop_windows("sb-1")
+
+        _asyncio.run(exercise())
+
+        assert not runtime._win_job_handles
+        assert not runtime._win_runners
+        assert not runtime._win_acl_paths
+        assert not runtime._win_sandbox_sids
         # ACL 施加被调用 (含读控制参数, review M4).
         fake_win_acl.apply_sandbox_acl.assert_called_once()
         # 两跳启动被调用 (review #2: token 走 pipe, two_hop_spawn_and_authorize 封装).
-        fake_win_exec.two_hop_spawn_and_authorize.assert_called_once()
+        if failure == "job":
+            fake_win_exec.two_hop_spawn_and_authorize.assert_not_called()
+        else:
+            fake_win_exec.two_hop_spawn_and_authorize.assert_called_once()
+            assert fake_win_exec.two_hop_spawn_and_authorize.call_args.kwargs["job_handle"] == 999
+            fake_win_job.teardown.assert_called_once_with(999)
 
 
 class TestAppLifespanWindowsBranch:

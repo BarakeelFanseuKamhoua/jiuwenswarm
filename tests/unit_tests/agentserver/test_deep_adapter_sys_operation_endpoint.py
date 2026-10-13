@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from openjiuwen.core.sys_operation import OperationMode, SandboxGatewayConfig, SysOperation, SysOperationCard
 from openjiuwen.core.sys_operation.config import (
@@ -11,6 +13,8 @@ from openjiuwen.core.sys_operation.config import (
     PreDeployLauncherConfig,
     SandboxIsolationConfig,
 )
+from openjiuwen.core.sys_operation.sandbox.gateway.gateway import SandboxGateway
+from openjiuwen.core.sys_operation.sandbox.gateway.sandbox_store import SandboxRecord, SandboxStatus
 
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
@@ -31,6 +35,7 @@ class _FakeResourceMgr:
         self.ops: dict[str, SysOperation] = {}
         self.owner: dict[str, str] = {}
         self.removed: list[str] = []
+        self._resource_registry = SimpleNamespace(sys_operation=lambda: SimpleNamespace(_sys_operations=self.ops))
 
     def add_sys_operation(self, card: SysOperationCard):
         op = SysOperation(card)
@@ -95,3 +100,29 @@ def test_changed_endpoint_replaces_stale_sys_operation(
     assert fresh.id != stale.id
     assert resource_mgr.removed == [stale.id]
     assert JiuWenSwarmDeepAdapter._sandbox_base_url_of(fresh._run_config.config) == "http://127.0.0.1:44006"
+
+
+@pytest.mark.asyncio
+async def test_port_change_retargets_sys_operation_held_by_built_agents(
+    monkeypatch: pytest.MonkeyPatch, resource_mgr: _FakeResourceMgr
+) -> None:
+    gateway = SandboxGateway()
+    monkeypatch.setattr(SandboxGateway, "_instance", gateway)
+    held = _resolve(monkeypatch, "http://127.0.0.1:44005")
+    key = held.isolation_key_template
+    gateway._provider_cache[f"{key}:fs"] = object()
+    await gateway._store.set(key, SandboxRecord(
+        sandbox_id="", base_url="http://127.0.0.1:44005", status=SandboxStatus.RUNNING,
+        launcher_type="pre_deploy", sandbox_type="jiuwenbox", container_config_hash="",
+    ))
+
+    retargeted = await JiuWenSwarmDeepAdapter.retarget_sandbox_sys_operations(
+        "http://127.0.0.1:44005/", "http://127.0.0.1:44006",
+    )
+
+    assert retargeted == [held.id]
+    assert JiuWenSwarmDeepAdapter._sandbox_base_url_of(held._run_config.config) == "http://127.0.0.1:44006"
+    assert not gateway._provider_cache
+    assert await gateway._store.get(key) is None
+    assert _resolve(monkeypatch, "http://127.0.0.1:44006") is held
+    assert resource_mgr.removed == []
