@@ -29,6 +29,7 @@ from jiuwenswarm.server.handlers._shared import (
     _sessions_dir_for_request,
     _is_team_metadata_mode,
     _log_background_session_kvc_failure,
+    _plan_active_sessions,
     _plan_exited_sessions,
     send_error_wire,
 )
@@ -540,6 +541,7 @@ async def handle_session_delete(ctx: RequestContext) -> None:
                 else:
                     shutil.rmtree(session_dir)
                     _plan_exited_sessions.discard(target)
+                    _plan_active_sessions.discard(target)
                     remove_session_metadata_cache(
                         target,
                         sessions_root=sessions_root,
@@ -626,6 +628,14 @@ async def handle_session_rewind_full(ctx: RequestContext, restore_files: bool = 
             )
         else:
             rewind_result = rewind_session(session_id=target_sid, turn_index=turn_index)
+
+        # rewind 视同退出 plan（评审 CR-9）：rewind_session_context 会清零
+        # checkpointer 的 plan_mode（plan_slug 归 None），内存标记若保留，
+        # stale plan token 会被 CR-8 的延续放行命中并拉回 plan。两道标记
+        # 同步翻转，与 _ensure_code_mode_state 的同步退出路径同款；显式
+        # 进入（/plan、开关）会先 discard 退出标记，不受影响。
+        _plan_active_sessions.discard(target_sid)
+        _plan_exited_sessions.add(target_sid)
 
         # Step 3: Truncate context_engine in-place + persist to checkpointer.
         # rewind_session_context reads the already-truncated history.json and
@@ -820,6 +830,11 @@ async def handle_session_rewind_context(ctx: RequestContext) -> None:
         # correct truncated state (the new implementation rebuilds context
         # from history.json on disk).
         rewind_result = rewind_session(session_id=target_sid, turn_index=turn_index)
+        # rewind 视同退出 plan（评审 CR-9），理由同 session.rewind 主路径：
+        # rewind_session_context 清零 plan_mode 后，内存标记若保留会让
+        # stale plan token 经延续放行拉回 plan。
+        _plan_active_sessions.discard(target_sid)
+        _plan_exited_sessions.add(target_sid)
         context_ok = await rewind_session_context(
             deep_agent=deep_agent,
             session_id=target_sid,
