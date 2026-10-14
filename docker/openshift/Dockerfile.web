@@ -1,5 +1,5 @@
-ARG NODE_IMAGE=node:20-alpine
-ARG NGINX_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine
+ARG NODE_IMAGE=node:22-alpine
+ARG NGINX_IMAGE=nginx:1.27-alpine
 
 # ---------- 阶段1:前端构建 ----------
 FROM ${NODE_IMAGE} AS web-builder
@@ -20,7 +20,8 @@ RUN npm run build
 # ---------- 阶段2:nginx 运行 ----------
 FROM ${NGINX_IMAGE}
 
-USER root
+# [安全加固] 强制升级 Nginx 运行镜像中的底层依赖，规避高危漏洞
+RUN apk update && apk upgrade --no-cache
 
 COPY docker/web.nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY docker/web-optional-upstreams.sh /docker-entrypoint.d/40-optional-upstreams.sh
@@ -31,5 +32,4 @@ RUN chmod +x /docker-entrypoint.d/40-optional-upstreams.sh \
 COPY --from=web-builder /build/jiuwenswarm/channels/web/frontend/dist \
      /app/jiuwenswarm/jiuwenswarm/channels/web/frontend/dist
 
-USER 101
 EXPOSE 5173
