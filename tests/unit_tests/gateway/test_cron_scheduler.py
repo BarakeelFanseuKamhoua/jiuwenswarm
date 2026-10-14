@@ -179,6 +179,11 @@ class FakeAgentClient:
     def __init__(self) -> None:
         self.unary_requests = []
         self.stream_requests = []
+        self.released_sessions: list[str] = []
+
+    async def release_session(self, session_id: str) -> str:
+        self.released_sessions.append(session_id)
+        return "evicted"
 
     async def send_request(self, envelope, *a, **kw):
         self.unary_requests.append(envelope)
@@ -317,6 +322,37 @@ class TestCronLastSessionId:
         assert stored.last_session_id
         assert stored.last_session_id.startswith("cron_")
         assert stored.last_session_id == "cron_agentserver_allocated"
+
+    @pytest.mark.asyncio
+    async def test_finished_run_releases_runtime_session(self, tmp_path):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        agent = FakeAgentClient()
+        svc = _make_scheduler(store, agent_client=agent)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert agent.released_sessions == ["cron_agentserver_allocated"]
+
+    @pytest.mark.asyncio
+    async def test_finished_run_keeps_slot_when_followup_is_inflight(self, tmp_path):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        agent = FakeAgentClient()
+
+        class _FollowUpHandler(FakeMessageHandler):
+            def has_inflight_chat_stream(self, session_id: str, **_kwargs) -> bool:
+                return session_id == "cron_agentserver_allocated"
+
+        svc = _make_scheduler(store, _FollowUpHandler(), agent_client=agent)
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert svc.runs[run_id].status == "succeeded"
+        assert agent.released_sessions == []
 
     @pytest.mark.asyncio
     async def test_run_now_info_returns_current_execution_session_id(self, tmp_path):
@@ -1287,6 +1323,7 @@ class TestTeamModeWake:
         state = svc.runs[run_id]
         assert state.status == "awaiting_approval"
         assert not state.result_text
+        assert agent.released_sessions == []
         assert len(agent.stream_requests) == 1
         ask_msgs = [
             msg for msg in handler.published
