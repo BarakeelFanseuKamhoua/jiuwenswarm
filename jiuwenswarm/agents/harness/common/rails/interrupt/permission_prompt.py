@@ -33,7 +33,9 @@ _ACTION_LABELS = {
     "edit": "修改",
     "exec": "执行",
     "list": "列出",
+    "access": "访问",
 }
+_ACTION_ALIASES = {"edit": "write", "list": "read"}
 
 
 def _is_shell(tool_name: str, permission_config: dict | None = None) -> bool:
@@ -179,8 +181,14 @@ def build_permission_prompt(
             if isinstance(op, dict)
             and isinstance(op.get("path"), str)
             and isinstance(op.get("action"), str)
-            and op.get("action") in {"read", "write", "exec", "access"}
         )
+    # Use the same action contract for captured metadata and fresh extraction.
+    # Older action names map to the canonical types rendered by core.
+    operations = tuple(
+        (path, _ACTION_ALIASES.get(action, action), source)
+        for path, action, source in operations
+        if action in _ACTION_LABELS
+    )
     presentation = replace(
         presentation,
         intent=title,
@@ -227,7 +235,7 @@ def build_permission_prompt(
 
     if message.strip():
         message = re.sub(
-            r"^(read|write|edit|exec|list) (?=\S)",
+            rf"^({'|'.join(_ACTION_LABELS)}) (?=\S)",
             lambda match: _ACTION_LABELS[match.group(1)] + " ",
             message.strip(),
         )

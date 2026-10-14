@@ -2,7 +2,17 @@
 
 """Approval copy preserves command meaning and one approval for the full chain."""
 
+from dataclasses import replace
+
 import pytest
+
+from openjiuwen.harness.security.permission_engine.approve.ask_presentation import (
+    build_permission_ask_presentation,
+)
+from openjiuwen.harness.security.permission_engine.models import (
+    PermissionLevel,
+    PermissionResult,
+)
 
 from jiuwenswarm.agents.harness.common.rails.interrupt.permission_prompt import (
     _command_lines,
@@ -167,3 +177,48 @@ def test_core_captured_file_list_and_risk_are_used_once():
     assert "**风险等级：高风险**" in body
     assert "默认仅授权当前对象" in body
     assert args["command"] == "copy ./报告.txt ./备份.txt && echo done"
+
+
+@pytest.mark.parametrize(
+    ("action", "label"),
+    [
+        ("read", "读取"),
+        ("write", "写入"),
+        ("exec", "执行"),
+        ("access", "访问"),
+        ("edit", "写入"),
+        ("list", "读取"),
+    ],
+)
+def test_file_actions_have_identical_display_with_and_without_metadata(
+    monkeypatch, action, label
+):
+    presentation = replace(
+        build_permission_ask_presentation(
+            "custom_tool", {}, PermissionResult(PermissionLevel.ASK)
+        ),
+        file_operations=(("C:/资料/报告.txt", action, "tool_arg"),),
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.interrupt.permission_prompt."
+        "build_permission_ask_presentation",
+        lambda *args, **kwargs: presentation,
+    )
+    uncaptured = build_permission_prompt("custom_tool", {}, "")
+    captured = build_permission_prompt(
+        "custom_tool",
+        {},
+        "",
+        {
+            "file_operations": [
+                {"path": "C:/资料/报告.txt", "action": action, "source": "tool_arg"}
+            ]
+        },
+    )
+    assert captured == uncaptured
+    assert f"- {label} C:/资料/报告.txt" in captured[1]
+
+
+def test_legacy_access_summary_uses_chinese_label():
+    _, body = build_permission_prompt("custom_tool", {}, "access C:/资料/报告.txt")
+    assert "访问 C:/资料/报告.txt" in body
