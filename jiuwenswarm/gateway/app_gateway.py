@@ -1928,6 +1928,7 @@ async def _run(
     # cron must not start this service. Only agent_sandbox.idle_timeout is
     # managed, so no user reload/fanout is needed.
     config_updater = None
+    config_poll_scheduler = None
     from jiuwenswarm.gateway.routing.e2a_proxy import is_agentos_routing_client
     if is_agentos_routing_client(client):
         from jiuwenswarm.extensions.agentos.config_updater.service import ConfigUpdaterService
@@ -2293,6 +2294,15 @@ async def _run(
 
     await channel_manager.start_dispatch()
     log_startup_stage("message_dispatch_started")
+
+    try:
+        from jiuwenswarm.gateway.config_poll import get_config_poll_scheduler
+
+        config_poll_scheduler = get_config_poll_scheduler()
+        await config_poll_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[App] gateway config poll scheduler failed to start: %s", exc)
+
     await cron_scheduler.start()
     if config_updater is not None:
         await config_updater.start()
@@ -3320,6 +3330,11 @@ async def _run(
     except asyncio.CancelledError:
         pass
     finally:
+        if config_poll_scheduler is not None:
+            try:
+                await config_poll_scheduler.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[App] gateway config poll scheduler stop failed: %s", exc)
         if config_updater is not None:
             await config_updater.stop()
         if not channel_config_task.done():
