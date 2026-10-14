@@ -7,6 +7,44 @@ from openjiuwen_runtime.foundation.db.table_def import (
     TableDefinition,
 )
 
+CHANNEL_CONFIG_TABLE_DEF = TableDefinition(
+    table_name="channel_config",
+    columns=[
+        ColumnDefinition(
+            "id",
+            "integer",
+            primary_key=True,
+            autoincrement=True,
+            nullable=False,
+        ),
+        # 业务主键；与 DbRowChannelCodec / config_poll.row_key 对齐
+        ColumnDefinition("channel_id", "string", length=128, nullable=False),
+        ColumnDefinition("channel_name", "string", length=128, nullable=False),
+        ColumnDefinition("channel_type", "string", length=64, nullable=False),
+        ColumnDefinition(
+            "bot_id",
+            "string",
+            length=128,
+            nullable=False,
+            default="",
+        ),
+        # ChannelManager 使用的 body（enabled / apps / send_file_allowed 等）
+        ColumnDefinition("config", "json", nullable=False),
+        ColumnDefinition(
+            "status",
+            "string",
+            length=32,
+            nullable=False,
+            default="active",
+        ),
+        ColumnDefinition("created_at", "datetime", nullable=False),
+        ColumnDefinition("updated_at", "datetime", nullable=False),
+    ],
+    indexes=[
+        IndexDefinition(["channel_id"], unique=True),
+    ],
+)
+
 LOG_MASKING_RULE_TABLE_DEF = TableDefinition(
     table_name="log_masking_rule",
     columns=[
