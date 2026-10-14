@@ -270,7 +270,6 @@ _DEEPRESEARCH_CHECKPOINT_UNCERTAIN = "DEEPRESEARCH_CHECKPOINT_UNCERTAIN"
 _DEEPRESEARCH_CHECKPOINT_UNCERTAIN_MESSAGE = (
     "会话检查点状态不确定，请重试以重新加载会话。"
 )
-
 from jiuwenswarm.agents.harness.team.a2x.a2x_registry_runtime import (
     init_a2x_client,
     register_blank_agent_if_teammate,
@@ -631,6 +630,7 @@ from jiuwenswarm.agents.harness.common.auto_harness.service import _HARNESS_PACK
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
 from jiuwenswarm.server.runtime.runtime_scope import RuntimeScopeKey
 from jiuwenswarm.server.runtime.skill_turbo.permission_bridge import (
+    SKILL_TURBO_MODEL_IDENTITY_KEY as _SKILL_TURBO_MODEL_IDENTITY_KEY,
     build_interaction_output_from_abort as _skill_turbo_build_interaction_output,
     clear_resume_in_flight as _skill_turbo_clear_resume_in_flight,
     extract_tool_interrupt as _skill_turbo_extract_tool_interrupt,
@@ -3583,10 +3583,11 @@ class JiuWenSwarmDeepAdapter:
             reset_workspace_key(wk_token)
 
     async def _maybe_apply_pending_reload(self) -> ReloadResult | None:
-        if self._pending_reload is None or self._adapter_is_working():
+        pending_reload = getattr(self, "_pending_reload", None)
+        if pending_reload is None or self._adapter_is_working():
             return None
         async with self._reload_lock:
-            pending = self._pending_reload
+            pending = getattr(self, "_pending_reload", None)
             if pending is None or self._adapter_is_working():
                 return None
             config_base, env_overrides = pending
@@ -7075,6 +7076,45 @@ class JiuWenSwarmDeepAdapter:
                     "[JiuWenSwarmDeepAdapter] failed to sync deep_config.model",
                     exc_info=True,
                 )
+
+    def restore_skill_turbo_model_from_resume_ctx(
+        self, resume_ctx: dict[str, Any]
+    ) -> None:
+        resume_inputs = resume_ctx.get("inputs")
+        resume_metadata = (
+            resume_inputs.get("metadata") if isinstance(resume_inputs, dict) else None
+        )
+        model_identity = (
+            resume_metadata.get(_SKILL_TURBO_MODEL_IDENTITY_KEY)
+            if isinstance(resume_metadata, dict)
+            else None
+        )
+        if not isinstance(model_identity, dict):
+            raise RuntimeError(
+                "SkillTurbo resume context missing model identity; please restart the task"
+            )
+        model_ref = str(model_identity.get("model_ref") or "").strip()
+        saved_model_name = str(model_identity.get("model_name") or "").strip()
+        if not model_ref:
+            raise RuntimeError(
+                "SkillTurbo resume context missing model_ref; please restart the task"
+            )
+        resolved_model = self._resolve_model_by_identity(model_ref)
+        actual_model_name = str(
+            getattr(resolved_model.model_config, "model_name", "") or ""
+        ).strip()
+        if saved_model_name and saved_model_name != actual_model_name:
+            raise ValueError(
+                "SkillTurbo resume model identity mismatch: "
+                f"expected {saved_model_name!r}, found {actual_model_name!r}"
+            )
+        self._apply_model_to_react_agent(resolved_model)
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] SkillTurbo resume model restored: "
+            "model_name=%s model_ref=%s",
+            actual_model_name,
+            model_ref,
+        )
 
     @staticmethod
     def _resolve_skill_mode(config: dict[str, Any]) -> str:
@@ -14252,6 +14292,17 @@ class JiuWenSwarmDeepAdapter:
                     exc_info=True,
                 )
             return self._make_skill_turbo_resume_duplicate_placeholder(request)
+        try:
+            self.restore_skill_turbo_model_from_resume_ctx(resume_ctx)
+        except Exception:
+            try:
+                await session.post_run()
+            except Exception:
+                logger.debug(
+                    "[JiuWenSwarmDeepAdapter] skill_turbo resume model restore post_run failed",
+                    exc_info=True,
+                )
+            raise
         pending = str(resume_ctx.get("pending_tool_call_id") or "")
         answer_rid = str(params.get("request_id") or "").strip()
         if pending and answer_rid and answer_rid != pending:
@@ -19769,6 +19820,18 @@ class JiuWenSwarmDeepAdapter:
         self._inject_extension_config_into_inputs(inputs)
         self._inject_model_selection_into_inputs(request, inputs)
 
+        is_skill_turbo_resume_request = bool(_params.get("answers")) and (
+            str(_params.get("source") or "").strip() == "ask_user_interrupt"
+        )
+        if is_skill_turbo_resume_request:
+            await self._maybe_apply_pending_reload()
+        # SkillTurbo resume: 检测 answers + resume_ctx，走 SkillTurbo resume 路径
+        skill_turbo_resume_stream = await self._try_skill_turbo_resume(request, inputs)
+        if skill_turbo_resume_stream is not None:
+            async for chunk in skill_turbo_resume_stream:
+                yield chunk
+            return
+
         _req_model = (request.params.get("model_name") or "") if isinstance(request.params, dict) else ""
         if not self._has_valid_model_config(_req_model):
             yield AgentResponseChunk(
@@ -19777,13 +19840,6 @@ class JiuWenSwarmDeepAdapter:
                 payload={"event_type": "chat.error", "error": "模型未正确配置，请先配置模型信息"},
                 is_complete=True,
             )
-            return
-
-        # SkillTurbo resume: 检测 answers + resume_ctx，走 SkillTurbo resume 路径
-        skill_turbo_resume_stream = await self._try_skill_turbo_resume(request, inputs)
-        if skill_turbo_resume_stream is not None:
-            async for chunk in skill_turbo_resume_stream:
-                yield chunk
             return
 
         session_id = request.session_id or "default"
@@ -20316,10 +20372,46 @@ class JiuWenSwarmDeepAdapter:
                     "[JiuWenSwarmDeepAdapter] permission rail agent-level bind failed: %s",
                     exc,
                 )
+            await self._maybe_apply_pending_reload()
             # 按请求选择模型（企业配置已在 create_instance 合并）
             resolved_model = self._resolve_model_for_request(request)
             self._apply_model_to_react_agent(resolved_model)
-            await self._maybe_apply_pending_reload()
+            model_name = str(
+                getattr(resolved_model.model_config, "model_name", "") or ""
+            ).strip()
+            model_refs = [
+                ref
+                for ref, keys in self._model_identity_to_keys.items()
+                if any(self._model_cache.get(key) is resolved_model for key in keys)
+            ]
+            request_metadata = (
+                dict(request.metadata) if isinstance(request.metadata, dict) else {}
+            )
+            model_ref = model_refs[0] if len(model_refs) == 1 else ""
+            model_keys = (
+                self._model_identity_to_keys.get(model_ref, [])
+                if model_ref
+                else []
+            )
+            model_identity_available = (
+                len(model_refs) == 1
+                and len(model_keys) == 1
+                and self._model_cache.get(model_keys[0]) is resolved_model
+            )
+            if not model_identity_available:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] selected model identity unavailable "
+                    "for SkillTurbo resume: "
+                    "model_name=%s refs=%s owners=%s",
+                    model_name,
+                    len(model_refs),
+                    len(model_keys),
+                )
+            else:
+                request_metadata[_SKILL_TURBO_MODEL_IDENTITY_KEY] = {
+                    "model_name": model_name,
+                    "model_ref": model_ref,
+                }
             request_env_tokens = self._bind_request_env_overlay()
             self._mark_session_active(session_id)
             session_active = True
@@ -20341,7 +20433,7 @@ class JiuWenSwarmDeepAdapter:
                     mode=mode,
                     request_id=request.request_id,
                     channel_id=request.channel_id,
-                    request_metadata=request.metadata,
+                    request_metadata=request_metadata,
                     trusted_dirs=inputs.get("trusted_dirs"),
                     cwd=inputs.get("cwd"),
                     workspace=inputs.get("workspace_dir"),

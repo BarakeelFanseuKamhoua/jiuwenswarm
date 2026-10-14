@@ -51,6 +51,7 @@ from jiuwenswarm.server.runtime.skill_turbo.node_artifact_store import (
     save_node_artifacts,
 )
 from jiuwenswarm.server.runtime.skill_turbo.permission_bridge import (
+    SKILL_TURBO_MODEL_IDENTITY_KEY,
     SKILL_TURBO_RESUME_CTX_KEY,
     build_tool_ctx,
     clear_resume_ctx,
@@ -1871,6 +1872,28 @@ class SkillTurboExecutor:
             # （plan_code/inputs/pending_tool_call_id），供 resume 时重放执行并命中
             # 同一 tool_call_id 恢复。透传给上层发 HITL 三件套。
             trace_status = "interrupted"
+            metadata = (
+                self._execution_inputs.get("metadata")
+                if isinstance(self._execution_inputs, dict)
+                else None
+            )
+            model_identity = (
+                metadata.get(SKILL_TURBO_MODEL_IDENTITY_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(model_identity, dict) or not str(
+                model_identity.get("model_ref") or ""
+            ).strip():
+                logger.error(
+                    "[SkillTurboExecutor] selected model identity is unavailable; "
+                    "rejecting HITL pause without saving resume_ctx tcid=%s",
+                    tool_call_id,
+                )
+                raise RuntimeError(
+                    "SkillTurbo cannot pause for user input because the selected "
+                    "model identity is unavailable"
+                ) from None
             try:
                 outer_task_id = get_current_task_id()
                 await save_resume_ctx(

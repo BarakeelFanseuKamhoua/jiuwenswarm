@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import re
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,10 @@ from jiuwenswarm.agents.harness.common.rails.stream_event_rail import (
 )
 from jiuwenswarm.common.schema.agent import AgentRequest
 from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+    JiuWenSwarmDeepAdapter,
+    _SKILL_TURBO_MODEL_IDENTITY_KEY,
+)
 from jiuwenswarm.server.runtime.skill_turbo.permission_bridge import (
     SKILL_TURBO_RESUME_CTX_KEY,
     clear_resume_ctx,
@@ -158,7 +162,18 @@ async def _async_none():
 
 
 async def _async_resume_ctx():
-    return {"pending_tool_call_id": "skill_turbo-tc-ask_user-1", "plan_code": "x"}
+    return {
+        "pending_tool_call_id": "skill_turbo-tc-ask_user-1",
+        "plan_code": "x",
+        "inputs": {
+            "metadata": {
+                _SKILL_TURBO_MODEL_IDENTITY_KEY: {
+                    "model_name": "glm-5.2",
+                    "model_ref": "model-ref-1",
+                }
+            }
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -182,6 +197,12 @@ async def test_try_skill_turbo_resume_continues_with_outer_interrupt_when_ctx(
     sentinel = object()
     adapter._make_skill_turbo_resume_stream = (
         lambda **_kwargs: sentinel  # type: ignore[method-assign]
+    )
+    restored_models = []
+    model = SimpleNamespace(model_config=SimpleNamespace(model_name="glm-5.2"))
+    adapter._resolve_model_by_identity = lambda ref: model  # type: ignore[method-assign]
+    adapter._apply_model_to_react_agent = (  # type: ignore[method-assign]
+        lambda resolved: restored_models.append(resolved)
     )
     request = AgentRequest(
         request_id="req-1",
@@ -219,6 +240,141 @@ async def test_try_skill_turbo_resume_continues_with_outer_interrupt_when_ctx(
         lambda _session, _ctx: _async_none(),
     )
     assert await adapter._try_skill_turbo_resume(request, {}) is sentinel
+    assert restored_models == [model]
+
+
+@pytest.mark.asyncio
+async def test_process_stream_applies_pending_reload_before_skill_turbo_resume():
+    """Pending reload must complete before SkillTurbo resume restores the model."""
+    adapter = object.__new__(JiuWenSwarmDeepAdapter)
+    adapter._is_session_scoped_adapter = True
+    adapter._instance = SimpleNamespace()
+    adapter._deepresearch_rewrite_tx_uncertain = False
+    events = []
+
+    async def apply_pending_reload():
+        events.append("reload")
+
+    async def try_resume(_request, _inputs):
+        events.append("resume")
+
+        async def stream():
+            yield SimpleNamespace(is_complete=True)
+
+        return stream()
+
+    adapter._maybe_apply_pending_reload = apply_pending_reload  # type: ignore[method-assign]
+    adapter._try_skill_turbo_resume = try_resume  # type: ignore[method-assign]
+    adapter._refresh_stale_mcp_tool_lists = (  # type: ignore[method-assign]
+        lambda: _async_none()
+    )
+    adapter._inject_extension_config_into_inputs = lambda *_args: None  # type: ignore[method-assign]
+    adapter._inject_model_selection_into_inputs = lambda *_args: None  # type: ignore[method-assign]
+    adapter._is_subagent_approval_answer = lambda *_args: False  # type: ignore[method-assign]
+
+    request = AgentRequest(
+        request_id="req-order",
+        channel_id="test-channel",
+        session_id="sess-order",
+        req_method=ReqMethod.CHAT_SEND,
+        params={
+            "query": "resume",
+            "answers": [{"question": "页数", "selected_options": ["10"]}],
+            "source": "ask_user_interrupt",
+        },
+    )
+    chunks = [
+        chunk
+        async for chunk in adapter._process_message_stream_impl(request, {})
+    ]
+
+    assert events == ["reload", "resume"]
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_stream_does_not_persist_ambiguous_model_identity(monkeypatch):
+    """A model_ref with multiple owners must not enter a resumable request."""
+    adapter = object.__new__(JiuWenSwarmDeepAdapter)
+    adapter._is_session_scoped_adapter = True
+    adapter._instance = SimpleNamespace()
+    adapter._deepresearch_rewrite_tx_uncertain = False
+    adapter._active_session_ids = defaultdict(int)
+    adapter._session_agent_tasks = {}
+    model = SimpleNamespace(model_config=SimpleNamespace(model_name="glm-5.2"))
+    other_model = SimpleNamespace(model_config=SimpleNamespace(model_name="glm-5.2"))
+    adapter._model_cache = {
+        "glm-5.2#0": model,
+        "glm-5.2#1": other_model,
+    }
+    adapter._model_identity_to_keys = {
+        "model-ref-1": ["glm-5.2#0", "glm-5.2#1"]
+    }
+    adapter._resolve_model_for_request = lambda _request: model  # type: ignore[method-assign]
+    adapter._apply_model_to_react_agent = lambda _model: None  # type: ignore[method-assign]
+    adapter._has_valid_model_config = lambda _model_name: True  # type: ignore[method-assign]
+    adapter._maybe_apply_pending_reload = lambda: _async_none()  # type: ignore[method-assign]
+    adapter._bind_runtime_cron_context = lambda **_kwargs: None  # type: ignore[method-assign]
+    adapter._reset_stream_runtime_context = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    adapter._run_cleanup_steps = lambda _steps: None  # type: ignore[method-assign]
+    adapter._register_session_agent_task = lambda _session_id: None  # type: ignore[method-assign]
+    adapter._unregister_session_agent_task = lambda _session_id: None  # type: ignore[method-assign]
+    adapter._runtime_cron_tool_context = SimpleNamespace(
+        remember_current_binding=lambda: None
+    )
+    adapter._config_base_cache = {}
+    adapter._refresh_standard_agent_permissions_body = lambda _request: None  # type: ignore[method-assign]
+    adapter._bind_agent_permissions_base = lambda: None  # type: ignore[method-assign]
+    adapter._update_permission_rail = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    adapter._is_subagent_approval_answer = lambda *_args: False  # type: ignore[method-assign]
+    adapter._refresh_stale_mcp_tool_lists = lambda: _async_none()  # type: ignore[method-assign]
+    adapter._inject_extension_config_into_inputs = lambda *_args: None  # type: ignore[method-assign]
+    adapter._inject_model_selection_into_inputs = lambda *_args: None  # type: ignore[method-assign]
+    adapter._deepresearch_artifact_output_dir = lambda _path: ""  # type: ignore[method-assign]
+    adapter._wants_attach_goal = lambda _params: False  # type: ignore[method-assign]
+    adapter._structured_goal_op_from_request = lambda _request: None  # type: ignore[method-assign]
+    adapter._should_parse_tui_goal_slash = lambda **_kwargs: False  # type: ignore[method-assign]
+    adapter._handle_slash_command = lambda *_args, **_kwargs: _async_none()  # type: ignore[method-assign]
+    captured_metadata = None
+
+    class _StopAfterRuntimeConfig(BaseException):
+        pass
+
+    async def capture_runtime_config(runtime_config):
+        nonlocal captured_metadata
+        captured_metadata = runtime_config.request_metadata
+        raise _StopAfterRuntimeConfig
+
+    adapter._update_runtime_config = capture_runtime_config  # type: ignore[method-assign]
+    adapter._persist_session_checkpoint = lambda *_args: _async_none()  # type: ignore[method-assign]
+    adapter._revoke_main_skill_authorization = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    request = AgentRequest(
+        request_id="req-model-identity",
+        channel_id="test-channel",
+        session_id="sess-model-identity",
+        req_method=ReqMethod.CHAT_SEND,
+        params={"query": "生成PPT", "mode": "agent"},
+    )
+
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.setup_permission_context",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.setup_permissions_session_scope",
+        lambda _session_id: None,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.is_enterprise",
+        lambda: True,
+    )
+    with pytest.raises(_StopAfterRuntimeConfig):
+        async for _chunk in adapter._process_message_stream_impl(request, {}):
+            pass
+
+    assert captured_metadata is not None
+    assert _SKILL_TURBO_MODEL_IDENTITY_KEY not in captured_metadata
 
 
 async def _async_in_flight_resume_ctx():
