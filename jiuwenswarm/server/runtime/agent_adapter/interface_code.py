@@ -54,6 +54,7 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     _AGENT_CARD_ID,
     _CRON_TOOL_CHANNEL_ID,
     _RailBuildInfo,
+    _agent_ras_kwargs_from_config,
     _deep_agent_kv_cache_affinity_config,
     _optional_enable_subagent_runtime,
     _resolve_instance_config_base,
@@ -617,6 +618,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             **_optional_enable_subagent_runtime(
                 self._resolve_enable_subagent_runtime(config_base),
             ),
+            **_agent_ras_kwargs_from_config(config_base),
         )
 
         # Keep ensure_initialized on the main event loop (same as interface_deep).
@@ -635,7 +637,6 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         initial_workspace = self._project_dir or str(
             get_default_project_session_workspace_dir()
         )
-        self._ensure_project_gitignore_agent_history(initial_workspace)
         self._seed_runtime_cwd(initial_workspace, workspace=initial_workspace)
 
         setattr(self._instance, "_jiuwenswarm_adapter_mode", "code")

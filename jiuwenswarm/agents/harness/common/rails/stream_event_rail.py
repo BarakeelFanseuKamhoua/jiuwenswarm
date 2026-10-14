@@ -40,12 +40,13 @@ from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import 
 from jiuwenswarm.agents.harness.common.prompt.user_prompt_builder import (
     strip_image_content_from_model_context,
 )
-from jiuwenswarm.agents.harness.common.tools.todo_resume import (
-    filter_todos_by_generation,
-    get_todo_generation_token,
-)
 from jiuwenswarm.agents.harness.common.rails.symphony import (
     SymphonyToolStreamHandler,
+)
+from jiuwenswarm.agents.harness.common.rails.path_whitespace_fix import (
+    WHITESPACE_FIX_TOOL_NAMES,
+    build_whitespace_fix_notice,
+    fix_whitespace_path_arguments,
 )
 from jiuwenswarm.agents.harness.common.rails.read_file_validation import (
     extract_path_from_arguments,
@@ -55,6 +56,12 @@ from jiuwenswarm.agents.harness.common.rails.read_file_validation import (
 )
 from jiuwenswarm.agents.harness.common.rails.task_execution_rail import (
     SKILL_TURBO_OUTER_TODO_ACTIVE_EXTRA_KEY,
+)
+from jiuwenswarm.agents.harness.common.tools.todo_resume import (
+    filter_todos_for_display,
+    filter_todos_for_execution,
+    get_todo_generation_token,
+    snapshot_includes_persistent_todos,
 )
 from jiuwenswarm.common.tool_display import (
     build_tool_display_name,
@@ -70,6 +77,7 @@ from jiuwenswarm.common.utils import fix_json_arguments, logger
 # "todo"：flash 统一工具（单卡 action 分发，覆盖同一组引擎操作）
 _TODO_TOOL_NAMES = frozenset(["todo_create", "todo_get", "todo_list", "todo_modify", "todo"])
 _EARLY_CHECKPOINT_EXTRA_KEY = "_jiuwenswarm_early_checkpoint_done"
+_WHITESPACE_PATH_FIXES_EXTRA_KEY = "_jiuwenswarm_whitespace_path_fixes"
 _EARLY_CHECKPOINT_ENV = "JIUWENCLAW_EARLY_CHECKPOINT"
 
 
@@ -532,6 +540,55 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         if os.path.normcase(rebased) == os.path.normcase(abs_path):
             return None
         return rebased
+
+    @staticmethod
+    def _fix_whitespace_path_args(tool_call: Any, tool_name: str) -> list[tuple[str, str]]:
+        try:
+            from openjiuwen.core.sys_operation.cwd import get_cwd
+
+            base_dir = get_cwd()
+        except Exception:  # noqa: BLE001 - cwd is optional, absolute paths still work
+            base_dir = None
+        try:
+            raw_args = getattr(tool_call, "arguments", None)
+            fixed = fix_whitespace_path_arguments(raw_args, str(base_dir) if base_dir else None)
+            if fixed is None:
+                return []
+            new_args, fixes = fixed
+            # ToolCall.arguments is a JSON string; keep the type it arrived with.
+            tool_call.arguments = (
+                json.dumps(new_args, ensure_ascii=False) if isinstance(raw_args, str) else new_args
+            )
+            for original, corrected in fixes:
+                logger.info(
+                    "[StreamEventRail] fixed whitespace in %s path: %s -> %s",
+                    tool_name,
+                    original,
+                    corrected,
+                )
+            return fixes
+        except (AttributeError, TypeError, OSError) as exc:
+            logger.warning(
+                "[StreamEventRail] failed to fix whitespace in %s path: %s",
+                tool_name,
+                exc,
+            )
+            return []
+
+    def _annotate_whitespace_path_fix(self, ctx: AgentCallbackContext) -> None:
+        extra = getattr(ctx, "extra", None)
+        fixes_by_call = extra.get(_WHITESPACE_PATH_FIXES_EXTRA_KEY) if isinstance(extra, dict) else None
+        if not isinstance(fixes_by_call, dict):
+            return
+        tool_call_id = str(getattr(getattr(ctx.inputs, "tool_call", None), "id", "") or "")
+        fixes = fixes_by_call.pop(tool_call_id, None)
+        if not fixes:
+            return
+        tool_msg = getattr(ctx.inputs, "tool_msg", None)
+        content = getattr(tool_msg, "content", None)
+        if not isinstance(content, str):
+            return
+        tool_msg.content = build_whitespace_fix_notice(fixes, self._get_prompt_language()) + "\n" + content
 
     def _rebase_user_artifact_path_args(self, tool_call: Any, tool_name: str) -> None:
         """Rewrite write/edit file_path when model hardcodes agent workspace."""
@@ -1139,6 +1196,13 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             )
             if tool_name in ("write_file", "edit_file"):
                 self._rebase_user_artifact_path_args(tc, tool_name)
+            if tool_name in WHITESPACE_FIX_TOOL_NAMES:
+                fixes = self._fix_whitespace_path_args(tc, tool_name)
+                tool_call_id = str(getattr(tc, "id", "") or "")
+                if fixes and tool_call_id and isinstance(getattr(ctx, "extra", None), dict):
+                    # ctx.extra is shared across all tool calls of the whole invoke;
+                    # entries are popped in after_tool_call keyed by tool_call_id.
+                    ctx.extra.setdefault(_WHITESPACE_PATH_FIXES_EXTRA_KEY, {})[tool_call_id] = fixes
             if is_read_file_tool(tool_name):
                 path = extract_path_from_arguments(getattr(tc, "arguments", {}))
                 if path:
@@ -1348,6 +1412,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             return
 
         normalize_read_file_tool_outcome(ctx)
+        self._annotate_whitespace_path_fix(ctx)
         # A call suspended for user input (approval card, ask_user) has no
         # result yet: ToolCallResilienceRail only left a failure placeholder
         # on ctx.inputs.tool_result.  Emitting it would show the tool as
@@ -1380,7 +1445,12 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                 # The todo tool itself is loaded from the main workspace below, so
                 # this stays authoritative even when a resumed/supplement turn uses
                 # a different stream session object.
-                await self._emit_todo_updated(session, todo_sid)
+                await self._emit_todo_updated(
+                    session,
+                    todo_sid,
+                    tool_name=tool_name,
+                    arguments=getattr(tc, "arguments", None),
+                )
 
     # ------------------------------------------------------------------
     # on_model_exception: attempt context repair
@@ -1524,7 +1594,14 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         except Exception:
             logger.debug("tool_update emit failed", exc_info=True)
 
-    async def _emit_todo_updated(self, session: Session, session_id: str) -> None:
+    async def _emit_todo_updated(
+        self,
+        session: Session,
+        session_id: str,
+        *,
+        tool_name: str = "",
+        arguments: Any = None,
+    ) -> None:
         """Load the main agent's todo list and push a todo.updated event to the frontend."""
         todo_tool = self._get_todo_tool()
         if todo_tool is None:
@@ -1547,9 +1624,12 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             generation_token = get_todo_generation_token(session)
         except Exception:
             generation_token = None
-        if generation_token:
+        if generation_token or tool_name:
             before = len(todos_data)
-            todos_data = filter_todos_by_generation(todos_data, generation_token)
+            if snapshot_includes_persistent_todos(tool_name, arguments, todos_data):
+                todos_data = filter_todos_for_display(todos_data, generation_token)
+            else:
+                todos_data = filter_todos_for_execution(todos_data, generation_token)
             if len(todos_data) != before:
                 logger.info(
                     "[StreamEventRail] todo.updated filtered stale-generation "

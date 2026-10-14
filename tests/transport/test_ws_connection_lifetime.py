@@ -43,6 +43,7 @@ def make_server(monkeypatch):
     server._stop_scheduler = AsyncMock()
     server._agent_manager = SimpleNamespace(cancel_all_inflight_work=AsyncMock())
     server._session_stream_tasks = {}
+    server._server = None
     server._clear_ws_acp_client_capabilities = Mock()
     return server, cancel_teams
 
