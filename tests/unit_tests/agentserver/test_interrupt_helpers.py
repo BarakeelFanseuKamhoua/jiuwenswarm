@@ -31,6 +31,163 @@ def test_permission_scope_reply_reaches_confirmation_payload():
     }
 
 
+def test_shell_chain_is_listed_in_one_unchanged_approval_request():
+    options = [
+        {"label": "本次允许", "value": "allow_once"},
+        {"label": "会话内记住", "value": "session_allow"},
+        {"label": "永久记住", "value": "always_allow"},
+        {"label": "拒绝", "value": "reject"},
+    ]
+    scopes = [{"value": "exact", "label": "仅当前对象"}]
+    args = {"command": 'echo "a && b" && dir', "shell_type": "cmd"}
+    interaction = {"id": "chain-request", "value": {
+        "tool_name": "mcp_exec_command", "tool_call_id": "original-call", "tool_args": args,
+        "message": "read C:/workspace\n\n> 永久记住写入配置。",
+        "metadata": {"ask_title": "检测到受保护的文件路径访问，需要确认后才能执行", "authorization_scopes": scopes},
+        "ui_options": options,
+    }}
+
+    payloads = convert_interactions_to_ask_user_questions([interaction])
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["request_id"] == "chain-request"
+    assert payload["source"] == "permission_interrupt"
+    assert len(payload["questions"]) == 1
+    question = payload["questions"][0]
+    assert question["header"] == "助手想要在你的设备上运行程序指令"
+    assert 'echo "a && b" &&\ndir' in question["question"]
+    assert "永久记住写入配置" in question["question"]
+    assert "检测到受保护的文件路径访问" in question["question"]
+    assert question["tool_call_id"] == "original-call"
+    assert question["tool_args"] == args
+    assert question["authorization_scopes"] == scopes
+    assert [option["value"] for option in question["options"]] == [option["value"] for option in options]
+
+
+def test_acp_shell_prompt_keeps_one_request_and_existing_option_ids(monkeypatch, tmp_path):
+    from openjiuwen.harness.security.host import PermissionConfirmationRequest
+    from openjiuwen.harness.security.models import PermissionLevel, PermissionResult
+
+    from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import (
+        TOOL_PERMISSION_CHANNEL_ID,
+    )
+    from jiuwenswarm.agents.harness.common.tools import acp_output_tools
+    from jiuwenswarm.common import utils
+
+    monkeypatch.setattr(utils, "get_config_file", lambda: tmp_path / "config.yaml")
+    monkeypatch.setattr(utils, "get_workspace_dir", lambda: tmp_path)
+
+    sent = []
+
+    async def send_request(method, params, *, session_id):
+        sent.append((method, params, session_id))
+        return {"result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}
+
+    monkeypatch.setattr(acp_output_tools, "get_acp_output_manager", lambda: SimpleNamespace(
+        send_jsonrpc_request=send_request,
+    ))
+    rail = build_permission_rail({"permissions": {"enabled": True}})
+    args = {"command": "cd .. && dir", "shell_type": "cmd"}
+    request = PermissionConfirmationRequest(
+        ctx=SimpleNamespace(session=SimpleNamespace(session_id="acp-session")),
+        tool_call=SimpleNamespace(id="original-call", name="mcp_exec_command", arguments=args),
+        result=PermissionResult(PermissionLevel.ASK, matched_rule="tools.mcp_exec_command", reason="需要确认目录访问"),
+        auto_confirm_key="original-key",
+    )
+    token = TOOL_PERMISSION_CHANNEL_ID.set("acp")
+    try:
+        response = asyncio.run(rail._host.request_permission_confirmation(request))
+    finally:
+        TOOL_PERMISSION_CHANNEL_ID.reset(token)
+
+    assert response.approved and not response.auto_confirm
+    assert len(sent) == 1
+    method, params, session_id = sent[0]
+    assert method == "session/request_permission" and session_id == "acp-session"
+    assert params["toolCall"]["title"] == "助手想要在你的设备上运行程序指令"
+    assert params["toolCall"]["rawInput"] == args
+    assert params["toolCall"]["toolCallId"] == "original-call"
+    assert "cd .. &&\ndir" in params["toolCall"]["content"][0]["content"]["text"]
+    assert "需要确认目录访问" in params["toolCall"]["content"][0]["content"]["text"]
+    assert [option["optionId"] for option in params["options"]] == [
+        "allow-once", "allow-session", "allow-always", "reject-once",
+    ]
+
+
+def test_xiaoyi_receives_split_command_prompt_and_one_pending_approval():
+    from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_connect import XiaoyiChannel
+
+    payload = convert_interactions_to_ask_user_question([{
+        "id": "chain-request",
+        "value": {
+            "tool_name": "mcp_exec_command",
+            "tool_args": {"command": "cd .. && dir", "shell_type": "cmd"},
+            "message": "read C:/workspace",
+            "metadata": {"ask_title": "检测到受保护的文件路径访问，需要确认后才能执行"},
+        },
+    }])
+    sent = []
+
+    async def send_text(session_id, task_id, text, url_key, **flags):
+        sent.append((text, flags))
+
+    channel = SimpleNamespace(
+        _pending_approvals={}, _ws_connections={"mock": object()}, _send_text_response=send_text,
+    )
+    message = SimpleNamespace(
+        payload=payload, metadata={"xiaoyi_conversation_id": "conversation"}, session_id="conversation",
+    )
+    asyncio.run(XiaoyiChannel._send_ask_user_question_prompt(channel, message, "session", "task"))
+
+    assert len(channel._pending_approvals) == 1
+    assert channel._pending_approvals["conversation"]["request_id"] == "chain-request"
+    assert channel._pending_approvals["conversation"]["source"] == "permission_interrupt"
+    assert len(sent) == 1
+    prompt, flags = sent[0]
+    assert "助手想要在你的设备上运行程序指令" in prompt
+    assert "cd .. &&\ndir" in prompt
+    assert "本次授权适用于整组指令" in prompt
+    assert "检测到受保护的文件路径访问" in prompt
+    assert "本次允许 / 会话内记住 / 永久记住 / 拒绝" in prompt
+    assert flags["is_final"] is False
+
+
+def test_core_permission_message_reaches_ws_with_complete_file_list(tmp_path):
+    from openjiuwen.harness.rails.security.tool_security_rail import PermissionInterruptRail
+    from openjiuwen.harness.security.models import PermissionLevel, PermissionResult
+
+    source, destination, notes = tmp_path / "报告.txt", tmp_path / "备份.txt", tmp_path / "说明.txt"
+    args = {
+        "command": f'copy "{source.as_posix()}" "{destination.as_posix()}" && type "{notes.as_posix()}"',
+        "workdir": str(tmp_path), "shell_type": "cmd", "description": "备份报告并读取说明",
+    }
+    call = SimpleNamespace(id="original-copy", name="mcp_exec_command", arguments=args)
+    result = PermissionResult(PermissionLevel.ASK, matched_rule="file_guard:defaults", external_paths=[str(destination)])
+    rail = PermissionInterruptRail(config={"enabled": True})
+    message = rail._build_message(call, result)
+    metadata = rail._build_interrupt_metadata(call, result)
+    assert len(metadata["file_operations"]) == 3
+    assert metadata["ask_risk_level"] == "高"
+    payloads = convert_interactions_to_ask_user_questions([{
+        "id": "copy-approval", "value": {
+            "tool_name": call.name, "tool_call_id": call.id,
+            "tool_args": args, "message": message, "metadata": metadata,
+        },
+    }])
+    assert len(payloads) == 1 and len(payloads[0]["questions"]) == 1
+    question = payloads[0]["questions"][0]
+    body = question["question"]
+    for path, action in [(source, "读取"), (destination, "写入"), (notes, "读取")]:
+        assert f"- {action} " in body and path.name in body
+        assert any(op["path"] == str(path.resolve()) for op in metadata["file_operations"])
+    assert body.count("涉及的文件操作") == 1 and body.count("风险等级") == 1
+    assert body.index("助手想要") < body.index("工具 `") < body.index("涉及的文件操作") < body.index("风险等级")
+    assert "**风险等级：高风险**" in body
+    assert "命令始终按原始命令授权" in body
+    assert question["tool_args"] == args and question["tool_call_id"] == call.id
+    assert payloads[0]["request_id"] == "copy-approval"
+
+
 def _evolution_interrupt(
     tool_name: str,
     operation: str,
