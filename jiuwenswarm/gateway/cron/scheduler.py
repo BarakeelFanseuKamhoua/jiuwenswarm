@@ -431,6 +431,8 @@ class CronSchedulerService:
         # job_id -> (deadline_ts, exec_session_id)。审批卡未回复时跳过下一次触发。
         # 多副本时另写 Redis（见 _hold_job_for_permission）；读失败偏安全（当仍 hold）。
         self._permission_hold: dict[str, tuple[float, str]] = {}
+        # 任务被取消时 finally 不能再 await 释放，改后台任务，避免拖垮收尾。
+        self._runtime_release_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _redis_hold_required() -> bool:
@@ -2192,6 +2194,14 @@ class CronSchedulerService:
                 )
             finally:
                 state.finished_at = self._now_fn()
+                # 流已返回（含结束时的 touch）。非审批才释放槽位，且放在历史落库之前，
+                # 缩短和用户续聊 route 叠在一起的窗口。等审批必须留着原槽位。
+                if not awaiting_permission:
+                    release_sid = exec_session_id or state.exec_session_id or ""
+                    if state.error == "cancelled":
+                        self._schedule_runtime_session_release(release_sid)
+                    else:
+                        await self._release_finished_exec_session(release_sid)
                 is_cancelled_ghost = state.error == "cancelled"
                 if not is_cancelled_ghost:
                     await asyncio.to_thread(
@@ -2273,6 +2283,61 @@ class CronSchedulerService:
             job_id=job.id,
             task_name=task.get_name(),
         )
+
+    def _session_has_inflight_followup(self, session_id: str) -> bool:
+        """用户已在同一条 ``cron_*`` 上发出普通 chat.send 时，不要拆掉刚续上的槽。"""
+        probe = getattr(self._message_handler, "has_inflight_chat_stream", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(session_id))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Cron] inflight follow-up probe failed session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _release_finished_exec_session(self, session_id: str) -> None:
+        """定时任务自己的流结束后，立刻释放 Runtime 槽位。
+
+        没有 ``release_session`` 的客户端（本地直连）跳过。释放失败不改变
+        run 状态，槽位按 ``session_ttl`` 过期。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        if self._session_has_inflight_followup(sid):
+            logger.info(
+                "[Cron] skip runtime session release; follow-up in flight session=%s",
+                sid,
+            )
+            return
+        release = getattr(self._agent_client, "release_session", None)
+        if not callable(release):
+            return
+        try:
+            await release(sid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Cron] runtime session release failed session=%s",
+                sid,
+                exc_info=True,
+            )
+
+    def _schedule_runtime_session_release(self, session_id: str) -> None:
+        """取消路径里调度释放，避免在已取消的任务上再 await。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+
+        async def _run() -> None:
+            await self._release_finished_exec_session(sid)
+
+        task = asyncio.create_task(_run(), name=f"cron-release-{sid}")
+        self._runtime_release_tasks.add(task)
+        task.add_done_callback(self._runtime_release_tasks.discard)
 
     async def _mark_last_session_ready(self, job: CronJob, exec_session_id: str) -> None:
         """Record the execution session after the agent request has accepted it."""

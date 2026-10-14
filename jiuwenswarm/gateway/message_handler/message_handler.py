@@ -3430,7 +3430,49 @@ class MessageHandler(FileTransferMixin, ABC):
         # end the outer round with invocation_paused.
         return source not in {"subagent_skill_load", "subagent_tool_permission"}
 
-    def _settle_cron_permission_hold_after_interrupt_stream(
+    def has_inflight_chat_stream(
+        self,
+        session_id: str,
+        *,
+        exclude_request_id: str = "",
+    ) -> bool:
+        """同一会话上是否还有未结束的对话流。
+
+        定时任务自己的流由调度器消费，不在 ``_stream_tasks`` 里。这里看到的是
+        用户续聊或另一条 web ``chat.send``。当前这条续跑流在 settle 前已弹出。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        exclude = str(exclude_request_id or "").strip()
+        for rid, task in self._stream_tasks.items():
+            if exclude and rid == exclude:
+                continue
+            if str(self._stream_sessions.get(rid) or "").strip() != sid:
+                continue
+            if task.done():
+                continue
+            return True
+        return False
+
+    async def _release_runtime_session(self, session_id: str) -> None:
+        """审批续跑真正结束后释放 Runtime 槽位。失败不外抛。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        release = getattr(self.agent_client, "release_session", None)
+        if not callable(release):
+            return
+        try:
+            await release(sid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[MessageHandler] runtime session release failed session_id=%s",
+                sid,
+                exc_info=True,
+            )
+
+    async def _settle_cron_permission_hold_after_interrupt_stream(
         self,
         *,
         env: Any,
@@ -3445,6 +3487,9 @@ class MessageHandler(FileTransferMixin, ABC):
         (multi-tool approval), was cancelled, or errored (interrupt may still
         be live). Do not release at ``chat.send`` entry. Do not treat
         intermediate ``chat.final`` as success (see mirror).
+
+        The same settled branch drops the runtime slot. A follow-up ``chat.send``
+        already in flight keeps the slot so that turn can age by ``session_ttl``.
         """
         if still_awaiting_hitl or cancelled or request_error is not None:
             return
@@ -3465,6 +3510,16 @@ class MessageHandler(FileTransferMixin, ABC):
                 sid,
                 exc_info=True,
             )
+            return
+        current_rid = str(getattr(env, "request_id", "") or "").strip()
+        if self.has_inflight_chat_stream(sid, exclude_request_id=current_rid):
+            logger.info(
+                "[MessageHandler] skip runtime session release; follow-up in "
+                "flight session_id=%s",
+                sid,
+            )
+            return
+        await self._release_runtime_session(sid)
 
     def _mirror_cron_live_stream_chunk(
         self,
@@ -5426,7 +5481,7 @@ class MessageHandler(FileTransferMixin, ABC):
             # cron 审批续跑：仅在本流未再出现外层 HITL ask/pause、且未取消时释放 hold。
             # clear_session 随 mark/release 一并发生；中间 contentful final 不再清 hold。
             if track_cron_interrupt_resume:
-                self._settle_cron_permission_hold_after_interrupt_stream(
+                await self._settle_cron_permission_hold_after_interrupt_stream(
                     env=env,
                     session_id=session_id,
                     still_awaiting_hitl=still_awaiting_hitl,

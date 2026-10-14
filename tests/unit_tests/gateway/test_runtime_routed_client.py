@@ -1074,6 +1074,37 @@ async def test_create_rebind_failure_degrades_to_legacy_behavior() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_session_evicts_real_id() -> None:
+    """跑完后的释放走 rebind(to=None)，目标是真实会话 id。"""
+    route = _FakeRoute()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=_FakeHttp())
+    action = await client.release_session("cron_real_1")
+    assert action == "rebound"
+    assert len(route.rebinds) == 1
+    assert route.rebinds[0]["from_session_id"] == "cron_real_1"
+    assert route.rebinds[0]["to_session_id"] is None
+    assert route.rebinds[0]["request_id"]
+
+
+@pytest.mark.asyncio
+async def test_release_session_empty_id_is_noop() -> None:
+    route = _FakeRoute()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=_FakeHttp())
+    assert await client.release_session("  ") is None
+    assert route.rebinds == []
+
+
+@pytest.mark.asyncio
+async def test_release_session_failure_does_not_raise() -> None:
+    """旧 runtime 无端点或超时时降级，不把调用方的任务打成失败。"""
+    route = _FakeRoute()
+    route.rebind_fail = FatalRouteError("not found", code="VALIDATION", status_code=404)
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=_FakeHttp())
+    assert await client.release_session("cron_real_1") is None
+    assert len(route.rebinds) == 1
+
+
+@pytest.mark.asyncio
 async def test_chat_send_does_not_rebind() -> None:
     """非 create 方法不触发 rebind（chat.send 的路由 key 即真实 id）。"""
     route = _FakeRoute()
