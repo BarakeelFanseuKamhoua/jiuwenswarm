@@ -75,10 +75,17 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from contextlib import contextmanager
 from typing import Any
 
 from openjiuwen.core.foundation.store.base_embedding import EmbeddingConfig
 from openjiuwen.harness.rails import SkillUseRail
+
+try:
+    from jiuwenswarm.agents.harness.flash.skill_selection import startup_lifecycle
+except ImportError:
+    # Skill selection remains an optional, removable Flash extension.
+    startup_lifecycle = None
 
 from jiuwenswarm.agents.harness.common.memory.config import (
     get_embed_config,
@@ -285,6 +292,51 @@ class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
         service_id: str | None = None,
     ) -> None:
         super().__init__(workspace_dir=workspace_dir, agent_id=agent_id, service_id=service_id)
+        self._flash_startup_preparations = {}
+
+    @contextmanager
+    def _prepare_flash_startup(self, request=None):
+        if startup_lifecycle is None:
+            yield
+            return
+        request_id = getattr(request, "request_id", "")
+        preparations = getattr(self, "_flash_startup_preparations", None)
+        if preparations is None:
+            preparations = self._flash_startup_preparations = {}
+        with startup_lifecycle.preparing(request_id) as preparation:
+            previous = preparations.get(request_id)
+            if request_id:
+                preparations[request_id] = preparation
+            try:
+                yield
+            finally:
+                if request_id:
+                    if previous is None:
+                        preparations.pop(request_id, None)
+                    else:
+                        preparations[request_id] = previous
+
+    async def process_message_stream_impl(self, request, inputs):
+        with self._prepare_flash_startup(request):
+            stream = super().process_message_stream_impl(request, inputs)
+            try:
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                await stream.aclose()
+
+    async def process_message_impl(self, request, inputs):
+        with self._prepare_flash_startup(request):
+            return await super().process_message_impl(request, inputs)
+
+    def _bind_subagent_model_resolver(self):
+        instance = self._instance
+        if instance is not None and startup_lifecycle is not None:
+            preparations = getattr(self, "_flash_startup_preparations", None)
+            if preparations is None:
+                preparations = self._flash_startup_preparations = {}
+            startup_lifecycle.bind_instance(instance, preparations)
+        return super()._bind_subagent_model_resolver()
 
     def _build_web_tools(self, agent_id: str, cache: Any | None = None) -> list[Any]:
         """Expose the single ``web_flash`` card only for the Flash profile."""
@@ -680,11 +732,13 @@ class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
         自己的字段，故 flash 的 ``enable_task_loop=false`` 等配置一路传到
         ``_resolve_enable_task_loop`` 与 ``_build_agent_rails``。
         """
-        resolved = _resolve_instance_config_base(config_base)
-        resolved = self._apply_flash_react_override(resolved)
-        await super().create_instance(
-            config=config, mode=mode, sub_mode=sub_mode, config_base=resolved
-        )
+        request = config.get("request") if isinstance(config, dict) else None
+        with self._prepare_flash_startup(request):
+            resolved = _resolve_instance_config_base(config_base)
+            resolved = self._apply_flash_react_override(resolved)
+            await super().create_instance(
+                config=config, mode=mode, sub_mode=sub_mode, config_base=resolved
+            )
 
     async def _apply_reload_config_snapshot(
         self,

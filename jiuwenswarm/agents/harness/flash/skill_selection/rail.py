@@ -15,7 +15,7 @@ from uuid import uuid4
 from openjiuwen.harness.prompts import PromptSection
 from openjiuwen.harness.rails.base import DeepAgentRail
 
-from .catalog import directory_id
+from .catalog import CatalogChanged, directory_id
 from .config import SelectionSettings
 from .execution import SelectionBusy, SelectionTimedOut
 from .diagnostics import emit, selection_trace
@@ -323,7 +323,17 @@ class SkillSelectionRail(DeepAgentRail):
             settings = SelectionSettings.from_config(self._config_provider())
             async with asyncio.timeout(settings.query_timeout_s):
                 async with state.lock:
-                    return await self._search_once(query, keywords, ctx, state)
+                    for attempt in range(3):
+                        try:
+                            return await self._search_once(query, keywords, ctx, state)
+                        except CatalogChanged:
+                            # Never pair old ranking text with newly edited
+                            # candidate details. Refresh and recompute permissions.
+                            state.results.clear()
+                            state.tickets.clear()
+                            if attempt == 2:
+                                raise
+                            self._service.refresh(force=True)
         except (TimeoutError, SelectionTimedOut):
             self.use_default(ctx, 'timeout')
             return self.response('timeout', '检索超时，尚未加载技能；下一轮恢复原生目录与工具。')
@@ -386,9 +396,9 @@ class SkillSelectionRail(DeepAgentRail):
 
         result = state.results.get(cache_key(generation))
         cache_hit = result is not None
-        if result is None:
-            result = await service.search(query, keywords, allowed_ids=allowed, snapshot=snapshot)
-            RequestState.remember(state.results, cache_key(result.generation), result)
+        result = await service.search(query, keywords, allowed_ids=allowed, snapshot=snapshot,
+                                      cached_result=result)
+        RequestState.remember(state.results, cache_key(result.generation), result)
         # A disable or catalog/permission switch during background work invalidates this response.
         current = SelectionSettings.from_config(self._config_provider())
         context_changed = (current.identity() != settings.identity() or service is not self._service

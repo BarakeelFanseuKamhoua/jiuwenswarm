@@ -1148,12 +1148,14 @@ async def test_direct_answers_do_not_trigger_automatic_search(harness, text, mon
 async def test_stale_candidate_file_change_is_rejected(harness):
     h = harness
     await warm_catalog(h)
-    write_skill(h.root, 'slides', 'changed body after snapshot')
     ctx = context()
     await h.rail.before_model_call(ctx)
     await h.rail.after_model_call(ctx)
     result = await h.rail.handle_action(
         SkillSearchInput(action='search', query='制作幻灯片', keywords=['slides']), ctx)
+    # Search now refreshes stale ranking before issuing a ticket. A change
+    # after that ticket must still be rejected before native execution.
+    write_skill(h.root, 'slides', 'changed body after candidate was issued')
     assert (await load(h, result['search_id'], 'slides', ctx))['status'] == 'changed'
     h.abilities.execute.assert_not_awaited()
 
@@ -1544,6 +1546,55 @@ async def test_two_round_warm_query_does_not_rescan_and_revocation_is_live(harne
     h.native.disabled_skills = {'slides'}
     assert (await load(h, result['search_id'], 'slides', ctx))['status'] == 'changed'
     h.abilities.execute.assert_not_awaited()
+
+
+async def test_repeated_query_revalidates_details_without_reranking(harness, monkeypatch):
+    h = harness
+    path = h.root / 'slides' / 'SKILL.md'
+    path.write_text(path.read_text(encoding='utf-8') + '\n[Limits](limits.md)\n', encoding='utf-8')
+    reference = path.parent / 'limits.md'
+    reference.write_text('Supports creating PPTX presentations.', encoding='utf-8')
+    await warm_catalog(h)
+    pipeline = h.rail.service._pipeline
+    original_search = pipeline.search
+    calls = 0
+
+    def count_search(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, 'search', count_search)
+    ctx = context()
+    await h.rail.before_model_call(ctx)
+    first = await h.rail._search_from_model('制作幻灯片', ['slides'], ctx)
+    state = ctx.extra[h.rail.REUSE]
+    first_document = state.tickets[first['search_id']]['result'].candidates[0][0]
+    reference.write_text('Cannot create PPTX. Only supports creating PDF.', encoding='utf-8')
+    second = await h.rail._search_from_model('制作幻灯片', ['slides'], ctx)
+    second_document = state.tickets[second['search_id']]['result'].candidates[0][0]
+    assert calls == 1
+    assert first_document.fingerprint != second_document.fingerprint
+    assert first_document.capability_record != second_document.capability_record
+    assert (await load(h, first['search_id'], 'slides', ctx))['status'] == 'changed'
+    h.abilities.execute.assert_not_awaited()
+
+
+async def test_search_refreshes_root_changed_after_ranking_snapshot(harness):
+    h = harness
+    await warm_catalog(h)
+    old_generation = h.rail.service.generation
+    write_skill(h.root, 'slides', 'Only supports creating PDF presentation slides.')
+    ctx = context()
+    await h.rail.before_model_call(ctx)
+    result = await h.rail._search_from_model('presentation', ['slides'], ctx)
+    assert result['status'] == 'candidates'
+    ticket = ctx.extra[h.rail.REUSE].tickets[result['search_id']]
+    document = ticket['result'].candidates[0][0]
+    assert document.description == 'Only supports creating PDF presentation slides.'
+    assert ticket['result'].generation > old_generation
+    assert document.fingerprint and document.capability_record
+    assert not ctx.extra.get(h.rail.FALLBACK)
 
 
 async def test_two_round_timeout_restores_all_tools_and_catalog(harness, monkeypatch):
