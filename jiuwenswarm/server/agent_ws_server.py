@@ -1136,7 +1136,7 @@ class AgentWebSocketServer:
             await self._stop_personal_context_best_effort()
 
     async def _stop_main_services(self) -> None:
-        """Run the unchanged AgentServer shutdown before optional PersonalContext cleanup."""
+        """Stop shared execution and services before optional PersonalContext cleanup."""
         global _startup_warmup_task
 
         async def _cancel_warmup_task(task: asyncio.Task[None] | None, label: str) -> None:
@@ -1160,8 +1160,23 @@ class AgentWebSocketServer:
         had_server = self._server is not None
         if had_server:
             self._server.close()
+        # Global cancellation belongs to server shutdown, not to an individual
+        # subscriber disconnecting while other WS/HTTP consumers are still live.
+        try:
+            await self._agent_manager.cancel_all_inflight_work(reason="[agent server stopping] ")
+        except Exception:
+            logger.exception("[AgentWebSocketServer] shutdown cancel_all_inflight_work failed")
+        await self._stop_scheduler()
+        try:
+            from jiuwenswarm.agents.harness.team import cancel_all_team_stream_tasks_across_managers
+
+            await cancel_all_team_stream_tasks_across_managers(reason="[agent server stopping] ")
+        except Exception:
+            logger.exception("[AgentWebSocketServer] shutdown team stream cancel failed")
+        if had_server:
             await self._server.wait_closed()
             self._server = None
+        self._session_stream_tasks.clear()
 
         from jiuwenswarm.server.runtime.session.kv_cache_product_hooks import (
             cancel_pending_tasks,
@@ -1293,6 +1308,12 @@ class AgentWebSocketServer:
                         logger.info("[AgentWebSocketServer] 连接已关闭: %s", e)
                     except Exception:
                         logger.exception("[AgentWebSocketServer] 处理消息失败")
+                    finally:
+                        current_task = asyncio.current_task()
+                        for session_id, entries in list(self._session_stream_tasks.items()):
+                            entries.pop(current_task, None)
+                            if not entries:
+                                self._session_stream_tasks.pop(session_id, None)
 
                 task = asyncio.create_task(_run())
                 tasks.add(task)
@@ -1336,29 +1357,13 @@ class AgentWebSocketServer:
             for task in connection_tasks:
                 if not task.done():
                     task.cancel()
-            # Gateway 进程退出/端口关闭时，必须先取消各 session 内流式生产者（SessionManager）
-            # 并中止 DeepAgent 内层循环；否则仅等待 _handle_message 任务结束会一直阻塞到任务自然完成。
-            # import 放在 try 外：缺模块要当场暴露，不能被「步骤失败」吞掉。
-            from jiuwenswarm.agents.harness.team import cancel_all_team_stream_tasks_across_managers
-
-            close_reason = f"[gateway ws closed {remote}] "
-            await self._run_cleanup_step(
-                "cancel_inflight",
-                remote,
-                lambda: self._agent_manager.cancel_all_inflight_work(reason=close_reason),
-            )
-            await self._run_cleanup_step("stop_scheduler", remote, self._stop_scheduler)
-            await self._run_cleanup_step(
-                "team_stream",
-                remote,
-                lambda: cancel_all_team_stream_tasks_across_managers(reason=close_reason),
-            )
+            # Cancelling this connection's consumers closes their adapter streams;
+            # the adapter finally blocks cancel and await their own producers.
             await self._run_cleanup_step(
                 "join_tasks",
                 remote,
                 lambda: _join_connection_tasks(connection_tasks),
             )
-            self._session_stream_tasks.clear()
             logger.info(
                 "[AgentWebSocketServer] 连接清理完成: %s",
                 format_ws_diagnostics(self._listener_diag(remote)),

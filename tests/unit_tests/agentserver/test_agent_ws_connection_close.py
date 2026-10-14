@@ -523,7 +523,7 @@ async def _async_noop(*_args, **_kwargs) -> None:
 
 
 @pytest.mark.asyncio
-async def test_abrupt_disconnect_cancels_round_and_stops_scheduler(
+async def test_abrupt_disconnect_preserves_shared_work_and_logs_cleanup(
     monkeypatch, caplog,
 ) -> None:
     target_logger = logging.getLogger("jiuwenswarm.server.agent_ws_server")
@@ -557,20 +557,18 @@ async def test_abrupt_disconnect_cancels_round_and_stops_scheduler(
     finally:
         target_logger.removeHandler(caplog.handler)
 
-    assert len(cancelled) == 1
-    assert "127.0.0.1" in cancelled[0]
-    assert scheduler_stops == ["stop"]
-    assert "step='stop_scheduler' phase='done'" in caplog.text
+    assert cancelled == []
+    assert scheduler_stops == []
+    assert "step='stop_scheduler'" not in caplog.text
     assert "连接关闭" in caplog.text
     assert "进程快照" in caplog.text
     assert "rss_mb=" in caplog.text
     assert "threads=" in caplog.text
     assert "handles=" in caplog.text
     assert "sockets=" in caplog.text
-    assert "step='cancel_inflight' phase='start'" in caplog.text
-    assert "step='cancel_inflight' phase='done'" in caplog.text
-    assert "step='team_stream' phase='start'" in caplog.text
-    assert "step='team_stream' phase='done'" in caplog.text
+    assert "step='cancel_inflight'" not in caplog.text
+    assert "step='team_stream'" not in caplog.text
+    assert "step='join_tasks' phase='start'" in caplog.text
     assert "step='join_tasks' phase='done'" in caplog.text
     assert "连接清理完成" in caplog.text
     assert "listener_present" in caplog.text
@@ -578,7 +576,7 @@ async def test_abrupt_disconnect_cancels_round_and_stops_scheduler(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_step_error_still_reaches_later_steps(
+async def test_connection_cleanup_error_still_logs_completion(
     monkeypatch, caplog,
 ) -> None:
     target_logger = logging.getLogger("jiuwenswarm.server.agent_ws_server")
@@ -592,23 +590,17 @@ async def test_cleanup_step_error_still_reaches_later_steps(
     server._session_stream_tasks = {}
     server._acp_client_capabilities_by_ws = {}
 
-    async def cancel_all(reason: str = "") -> None:
-        raise RuntimeError(reason)
+    async def fail_join(_tasks) -> None:
+        raise RuntimeError("join failed")
 
-    server._agent_manager = SimpleNamespace(cancel_all_inflight_work=cancel_all)
-    server._stop_scheduler = _async_noop
-    monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.team.cancel_all_team_stream_tasks_across_managers",
-        _async_noop,
-    )
+    monkeypatch.setattr(agent_ws_server_module, "_join_connection_tasks", fail_join)
 
     try:
         await server._connection_handler(_AbortingWebSocket())
     finally:
         target_logger.removeHandler(caplog.handler)
 
-    assert "step='cancel_inflight' phase='error'" in caplog.text
-    assert "step='team_stream' phase='done'" in caplog.text
+    assert "step='join_tasks' phase='error'" in caplog.text
     assert "连接清理完成" in caplog.text
 
 
