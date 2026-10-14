@@ -28,7 +28,7 @@ _ENTERPRISE_BLOCKED_EXACT = frozenset({
     "models.remove", "models.set_active", "path.set", "updater.download",
     "updater.upgrade", "updater.reset_source", "updater.set_conf",
 })
-_ENTERPRISE_BLOCKED_PREFIXES = ("agents.", "teams.", "extensions.", "plugins.")
+_ENTERPRISE_BLOCKED_PREFIXES = ("agents.", "teams.", "extensions.", "plugins.", "mcp.server.")
 _ENTERPRISE_SKILL_ALLOWED = frozenset({
     "skills.list",
     "skills.get",
