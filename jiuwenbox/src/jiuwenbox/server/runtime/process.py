@@ -59,6 +59,7 @@ from jiuwenbox.server.runtime.base import (
     RuntimeFileOpResult,
 )
 from jiuwenbox.server.workspace import SANDBOX_WORKSPACE, WIN_SANDBOX_WORKSPACE_ROOT
+from jiuwenbox.server.environment import inherited_environment
 from jiuwenbox.supervisor import cgroup as cgroup_module
 from jiuwenbox.supervisor import network as network_module
 from jiuwenbox.supervisor.bwrap import BwrapConfig
@@ -951,6 +952,8 @@ class ProcessRuntime(RuntimeAdapter):
         scripts, seccomp BPF, landlock payload) keep the per-call cost low.
         """
         config = BwrapConfig.from_policy(policy, list(command))
+        config.extra_args.append("--clearenv")
+        config.env = {**inherited_environment(), **config.env}
         process_uid = config.uid
         process_gid = config.gid
         if sandbox_env:
@@ -3158,26 +3161,17 @@ class ProcessRuntime(RuntimeAdapter):
         )
         env.setdefault("TEMP", win_tmp_dir)
         env.setdefault("TMP", win_tmp_dir)
+        env.setdefault("TMPDIR", win_tmp_dir)
         # 补 profile 变量 (第一跳 runner env 缺这些, profile 加载只在不传 env
         # block 时自动填; 我们传了 env block → 需显式补, 否则 child 继承不到).
         env.setdefault("USERPROFILE", _profile_root)
+        env.setdefault("HOME", _profile_root)
         env.setdefault("LOCALAPPDATA", os.path.join(_profile_root, "AppData", "Local"))
         env.setdefault("APPDATA", os.path.join(_profile_root, "AppData", "Roaming"))
-        # CreateProcessWithLogonW 传自定义 env 块会替换整个环境, 必须把 box-server
-        # 自己的 PYTHONPATH 带给 runner, 否则 ``python -m jiuwenbox.supervisor.win_exec``
-        # 立刻 ModuleNotFoundError 退出 → 沙箱 phase=error.
-        for _inherit_key in (
-            "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING", "PYTHONUTF8",
-            "PATHEXT", "SystemRoot", "windir", "COMSPEC",
-            "JIUWENBOX_RUNNER_PYTHON",
-        ):
-            if not env.get(_inherit_key):
-                _inherit_val = os.environ.get(_inherit_key)
-                if _inherit_val:
-                    env[_inherit_key] = _inherit_val
-        for _k, _v in os.environ.items():
-            if _k.startswith("JIUWENBOX_") and _k not in env and _v:
-                env[_k] = _v
+        # Keep service loader/control settings in the runner, but inherit only
+        # configured tool keys alongside system requirements.
+        for _k, _v in inherited_environment(for_runner=True).items():
+            env.setdefault(_k, _v)
         logger.debug(
             "[SandboxWin] %s sandbox-writable temp injected: TEMP=%s",
             sandbox_id, win_tmp_dir,

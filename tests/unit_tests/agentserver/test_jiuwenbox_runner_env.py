@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -80,7 +81,15 @@ async def test_stop_timeout_kills_before_draining_shutdown_logs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp_path, monkeypatch):
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
+    tmp_path, monkeypatch, platform,
+):
+    from jiuwenswarm.common import config
+
+    allowlist = ["CLAW_SKILL_TOKEN", "CLAW_PYTHON_EXE", "CUSTOM_TOOL_SETTING", "EMPTY_TOOL_SETTING"]
+    monkeypatch.setattr(config, "get_sandbox_env_allowlist", lambda: allowlist)
+    monkeypatch.setattr(runner_module, "sys", SimpleNamespace(platform=platform, executable=sys.executable))
     runner = runner_module.JiuwenBoxRunner()
     policy = tmp_path / "policy.yaml"
     policy.write_text("version: 1", encoding="utf-8")
@@ -93,7 +102,12 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     monkeypatch.setattr(runner, "_pump_stream", AsyncMock())
     monkeypatch.delenv("JIUWENBOX_RUNNER_PYTHON", raising=False)
     monkeypatch.delenv("JIUWENBOX_SKILLS_DIR", raising=False)
-    monkeypatch.setenv("UNRELATED_TEST_SECRET", "must-not-be-forwarded")
+    monkeypatch.setenv("CUSTOM_TOOL_SETTING", "inherited-setting")
+    monkeypatch.setenv("EMPTY_TOOL_SETTING", "")
+    monkeypatch.setenv("CLAW_SKILL_TOKEN", "test-skill-token")
+    monkeypatch.setenv("CLAW_PYTHON_EXE", "C:/managed/python.exe")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
+    monkeypatch.setenv("DATABASE_URL", "must-not-be-forwarded")
 
     async def stop():
         runner.process = None
@@ -109,6 +123,7 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     bootstrap_env = {
         "JIUWENBOX_RUNNER_PYTHON": "C:/Python312/python.exe",
         "JIUWENBOX_SKILLS_DIR": "C:/workspace/skills",
+        "CUSTOM_TOOL_SETTING": "startup-override",
     }
     assert await runner.ensure_running(policy_path=policy, extra_env=bootstrap_env)
     # The caller must not be able to mutate retained startup parameters.
@@ -118,17 +133,34 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     assert spawn.await_count == 2
     for call in spawn.await_args_list:
         env = call.kwargs["env"]
-        if sys.platform == "win32":
+        if platform == "win32":
             assert call.kwargs["stdin"] == subprocess.DEVNULL
         assert env["JIUWENBOX_RUNNER_PYTHON"] == "C:/Python312/python.exe"
         assert env["JIUWENBOX_SKILLS_DIR"] == "C:/workspace/skills"
         assert env["JIUWENBOX_POLICY_PATH"] == str(policy)
-        assert "UNRELATED_TEST_SECRET" not in env
+        assert env["CLAW_SKILL_TOKEN"] == "test-skill-token"
+        assert env["CLAW_PYTHON_EXE"] == "C:/managed/python.exe"
+        assert env["CUSTOM_TOOL_SETTING"] == "startup-override"
+        assert env["EMPTY_TOOL_SETTING"] == ""
+        assert os.environ["CUSTOM_TOOL_SETTING"] == "inherited-setting"
+        assert "OPENAI_API_KEY" not in env
+        assert "DATABASE_URL" not in env
+        assert json.loads(env["JIUWENBOX_ENV_ALLOWLIST"]) == allowlist
 
     policy.write_text("version: 3", encoding="utf-8")
     assert await runner.ensure_running(policy_path=policy, extra_env={})
     assert "JIUWENBOX_RUNNER_PYTHON" not in spawn.await_args.kwargs["env"]
     assert "JIUWENBOX_SKILLS_DIR" not in spawn.await_args.kwargs["env"]
+    assert spawn.await_args.kwargs["env"]["CUSTOM_TOOL_SETTING"] == "inherited-setting"
+    # A config-only allowlist change must restart the owned service too.
+    allowlist.clear()
+    assert await runner.ensure_running(policy_path=policy)
+    assert spawn.await_count == 4
+    env = spawn.await_args.kwargs["env"]
+    assert "CLAW_SKILL_TOKEN" not in env
+    assert "CUSTOM_TOOL_SETTING" not in env
+    assert "EMPTY_TOOL_SETTING" not in env
+    assert json.loads(env["JIUWENBOX_ENV_ALLOWLIST"]) == []
     await asyncio.sleep(0)  # Complete mocked stdout/stderr drain tasks.
 
 

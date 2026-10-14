@@ -24,6 +24,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+import json
 import os
 import signal
 import sys
@@ -318,6 +319,7 @@ class JiuwenBoxRunner:
         # 须比指纹才检测到 → 触发 stop+spawn 重启 box-server 重建 EgressFilter.
         self._spawned_policy_fingerprint: Optional[str] = None
         self._spawned_limits: tuple[int, int] | None = None
+        self._spawned_env_allowlist: tuple[str, ...] | None = None
         # Policy-only reloads omit extra_env. Keep bootstrap-injected runner
         # Python/venv/skills paths across stop+spawn and failed-start retries.
         self._startup_extra_env: dict[str, str] = {}
@@ -447,10 +449,8 @@ class JiuwenBoxRunner:
             policy_path: jiuwenbox 启动时使用的 policy 文件路径; 仅在
                 ``startup_mode='internal'`` 下生效, 通过 ``JIUWENBOX_POLICY_PATH``
                 环境变量传给子进程。
-            extra_env: 传给 box-server 子进程的额外 env (P0-5: 收口 env 透传,
-                避免全量 dict(os.environ) 把 agent-server 敏感凭据灌进子进程 +
-                避免 os.environ 全局污染). 仅 JIUWENBOX_* / PYTHONPATH 等白名单
-                键会从父进程继承, 其余敏感 env (token/API key/DB 口令) 不透传.
+            extra_env: 覆盖系统运行项和 sandbox.env_allowlist 继承环境的额外 env。
+                不修改 os.environ, 不自动继承其它父进程凭据。
                 None 沿用上次 internal 启动参数; 显式 dict 整体替换, {} 清空。
 
         Returns:
@@ -489,9 +489,10 @@ class JiuwenBoxRunner:
 
             # internal 模式: agent-server 自管 jbx 生命周期. 上游保证 port 是 (a) 之前拉起的同 host:port 或 (b) 空闲端口.
             # 决策: 进程 alive 且 host/port/policy_path+内容指纹全匹配 → 复用; 指纹变 → 重 spawn; 否则停旧 spawn 新.
-            from jiuwenswarm.common.config import get_sandbox_runtime
+            from jiuwenswarm.common.config import get_sandbox_env_allowlist, get_sandbox_runtime
 
             sandbox_limits = get_sandbox_runtime()["limits"]
+            desired_env_allowlist = tuple(get_sandbox_env_allowlist())
             desired_limits = (
                 sandbox_limits["max_file_mb"],
                 sandbox_limits["exec_timeout_seconds"],
@@ -506,6 +507,7 @@ class JiuwenBoxRunner:
                 and self.spawned_policy_path == policy_path
                 and self._spawned_policy_fingerprint == new_fp
                 and self._spawned_limits == desired_limits
+                and self._spawned_env_allowlist == desired_env_allowlist
             )
             if owned_match:
                 if await self.health_check(host, port):
@@ -563,32 +565,29 @@ class JiuwenBoxRunner:
                     "--port",
                     str(port),
                 ]
-            # 构造 box-server 子进程 env (P0-5 收口: 不全量 dict(os.environ), 避免凭据/token/API key 灌进子进程).
-            # 只继承白名单键 (PATH/SystemRoot 等运行必需) + JIUWENBOX_* (调用方 extra_env 传入的动态路径), 其余不透传.
-            _env_allowlist = {  # noqa: N806 - Win32 常量风格
-                "PATH", "PATHEXT", "SystemRoot", "windir", "COMSPEC",
-                "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
-                "HOME", "LANG", "LC_ALL", "LC_CTYPE",
-                "PYTHONIOENCODING",
+            # P0-5: parent credentials stay outside the sandbox unless an exact
+            # tool key is configured or explicitly supplied by the caller.
+            system_keys = {
+                "PATH", "PATHEXT", "SystemRoot", "windir", "COMSPEC", "SystemDrive",
+                "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "HOME",
+                "LANG", "LC_ALL", "LC_CTYPE", "PYTHONIOENCODING",
                 "JIUWENCLAW_DATA_DIR", "OFFICE_CLAW_DATA_DIR",
                 "JIUWENSWARM_DATA_DIR", "JIUWENSWARM_HOME", "JIUWENSWARM_LOG_DIR",
                 "JIUWENSWARM_CORE_LOG_DIR", "JIUWENSWARM_LOG_DATE_ROOT",
-                "CLAW_PYTHON_HOME", "JIUWENCLAW_BASE_PYTHON",
+                "JIUWENCLAW_BASE_PYTHON",
             }
             if not getattr(sys, "frozen", False):
-                _env_allowlist.update({"PYTHONPATH", "PYTHONHOME"})
-            env: dict[str, str] = {}
-            for _k in _env_allowlist:
-                _v = os.environ.get(_k)
-                if _v:
-                    env[_k] = _v
-            # JIUWENBOX_* 前缀键全部继承 (box-server 运行时依赖: policy 路径/
-            # venv 目录/runner python/skills 目录 等, 由调用方经 extra_env 注入).
-            for _k, _v in os.environ.items():
-                if _k.startswith("JIUWENBOX_") and _k not in env:
-                    env[_k] = _v
+                system_keys.update({"PYTHONPATH", "PYTHONHOME"})
+            env = {
+                key: os.environ[key] for key in system_keys | set(desired_env_allowlist)
+                if key in os.environ
+            }
+            env.update({
+                key: value for key, value in os.environ.items() if key.startswith("JIUWENBOX_")
+            })
             # Retain explicit bootstrap overrides on policy-only reloads.
             env.update(self._startup_extra_env)
+            env["JIUWENBOX_ENV_ALLOWLIST"] = json.dumps(desired_env_allowlist)
             # The public sandbox config intentionally exposes only these two
             # business limits. Box-server validates and enforces them again.
             env["JIUWENBOX_MAX_FILE_MB"] = str(sandbox_limits["max_file_mb"])
@@ -645,6 +644,7 @@ class JiuwenBoxRunner:
                 self.spawned_policy_path = policy_path
                 self._spawned_policy_fingerprint = new_fp
                 self._spawned_limits = desired_limits
+                self._spawned_env_allowlist = desired_env_allowlist
                 # 同步退出兜底: 即便没走 stop() 也尽可能 terminate 子进程
                 self._register_atexit_once()
                 # 后台持续 drain stdout/stderr, 防止管道堆积阻塞子进程; 同时

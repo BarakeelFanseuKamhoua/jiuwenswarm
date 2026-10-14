@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jiuwenbox.server.environment import inherited_environment
+
 # Cap stdout/stderr at this many chars per audit event. Large model
 # completions can dump megabytes, which is fine to keep in the runtime
 # log file but explodes the audit JSONL (one line per event, designed to
@@ -61,7 +63,11 @@ def _build_windows_exec_env(
     env: dict[str, str] | None,
     tool_paths=None,
 ) -> dict[str, str]:
-    """为 Windows 沙箱子进程补 PATH, 使裸名 ``bash``/``python``/``cmd`` 可解析.
+    """Copy only system/configured tool keys, then apply explicit request overrides.
+
+    Service loader paths and unrelated credentials are not inherited. Empty
+    values survive, and the caller's mapping is never modified. Add tool PATH
+    prefixes so bare ``bash``/``python``/``cmd`` remain resolvable.
 
     docs §4.0: jbx-sandbox 子进程的 PATH 默认空 (LOGON_WITH_PROFILE 加载的
     profile 无 PATH), agent-core 送的 ``command[0]`` 是裸名 (``bash``/``python``
@@ -81,7 +87,8 @@ def _build_windows_exec_env(
     (``JIUWENBOX_VENV_DIR`` / ``JIUWENBOX_BUNDLED_PYTHON``, 见 docs §4.3),
     缺失则跳过对应段。PATH 放最前, 覆盖 profile 任何残留。
     """
-    base = dict(env) if env else {}
+    base = inherited_environment()
+    base.update(env or {})
     parts: list[str] = []
     # tool_paths 展开 (和 _create_windows 给 runner 的 PATH 一致, 确保 exec
     # 子进程能解析到与预装 ACL 匹配的工具可执行). git_dir 含 usr/bin + bin.
@@ -114,16 +121,6 @@ def _build_windows_exec_env(
         parts.append(existing_path)
     if parts:
         base["PATH"] = os.pathsep.join(parts)
-    # 补齐进程加载 DLL / 运行所需的基本环境变量. agent-core 传来的 env
-    # (request.env) 通常只有 PATH 片段, 缺 SystemRoot/TEMP 等 — 受限 token
-    # 子进程加载系统 DLL (kernel32 依赖 KnownDlls) 或 msys/cygwin runtime
-    # (msys-2.0.dll 初始化需 SystemRoot) 时会 STATUS_DLL_INIT_FAILED
-    # (0xC0000142, 实测: bash/python 启动即退). 用 setdefault 不覆盖已有值,
-    # 缺失则从本进程环境补 (和 _create_windows 给 runner 的 env 一致).
-    for _var in ("SystemRoot", "windir", "TEMP", "TMP", "PATHEXT", "COMSPEC"):
-        _val = os.environ.get(_var)
-        if _val and _var not in base:
-            base[_var] = _val
     return base
 
 from jiuwenbox.logging_config import configure_logging
@@ -1014,7 +1011,11 @@ class SandboxManager:
                     command=request.command,
                     job_id=job_id,
                     workdir=request.workdir,
-                    env=request.env,
+                    env=(
+                        _build_windows_exec_env(
+                            request.env, tool_paths=self.policy.windows.filesystem.tool_paths,
+                        ) if sys.platform == "win32" else request.env
+                    ),
                     stdin_data=request.stdin_data,
                 ),
             )

@@ -310,6 +310,13 @@ class TestProcessRuntimeWindowsBranch:
     def test_create_dispatches_to_windows(self, monkeypatch, tmp_path, failure):
         from jiuwenbox.server.runtime import process as proc_mod
         runtime = proc_mod.ProcessRuntime()
+        monkeypatch.setenv("CUSTOM_TOOL_SETTING", "inherited-setting")
+        monkeypatch.setenv("EMPTY_TOOL_SETTING", "")
+        monkeypatch.setenv("TEMP", "C:/host-temp")
+        monkeypatch.setenv("USERPROFILE", "C:/host-profile")
+        monkeypatch.setenv("JIUWENBOX_ENV_ALLOWLIST", '["CUSTOM_TOOL_SETTING", "EMPTY_TOOL_SETTING"]')
+        monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
+        monkeypatch.setenv("DATABASE_URL", "must-not-be-forwarded")
 
         # 构造 mock 的 win_* 模块.
         fake_win_acl = MagicMock()
@@ -434,6 +441,13 @@ class TestProcessRuntimeWindowsBranch:
         else:
             fake_win_exec.two_hop_spawn_and_authorize.assert_called_once()
             assert fake_win_exec.two_hop_spawn_and_authorize.call_args.kwargs["job_handle"] == 999
+            env = fake_win_exec.two_hop_spawn_and_authorize.call_args.kwargs["env"]
+            assert env["CUSTOM_TOOL_SETTING"] == "inherited-setting"
+            assert env["EMPTY_TOOL_SETTING"] == ""
+            assert env["USERPROFILE"] != "C:/host-profile"
+            assert env["TEMP"] != "C:/host-temp"
+            assert "OPENAI_API_KEY" not in env
+            assert "DATABASE_URL" not in env
             fake_win_job.teardown.assert_called_once_with(999)
 
 

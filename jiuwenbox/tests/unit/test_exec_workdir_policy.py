@@ -1,11 +1,13 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 import asyncio
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
 from jiuwenbox.models.policy import SecurityPolicy
-from jiuwenbox.models.sandbox import ExecResult, SandboxPhase, SandboxRef
+from jiuwenbox.models.sandbox import BackgroundExecResult, ExecResult, SandboxPhase, SandboxRef
 from jiuwenbox.server.limits import SandboxLimits
 from jiuwenbox.server.sandbox_manager import (
     CodePolicyDenialError,
@@ -77,3 +79,54 @@ def test_exec_without_workdir_skips_path_policy():
 
     asyncio.run(run())
     assert runtime.exec_calls == 1
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("explicit_env", [False, True])
+def test_windows_exec_inherits_allowlisted_environment(monkeypatch, background, explicit_env):
+    from jiuwenbox.server import sandbox_manager
+
+    monkeypatch.setattr(sandbox_manager.sys, "platform", "win32")
+    monkeypatch.setenv("CLAW_SKILL_TOKEN", "test-skill-token")
+    monkeypatch.setenv("CLAW_PYTHON_EXE", "C:/managed/python.exe")
+    monkeypatch.setenv("CUSTOM_TOOL_SETTING", "inherited-setting")
+    monkeypatch.setenv("EMPTY_TOOL_SETTING", "")
+    monkeypatch.setenv("JIUWENBOX_ENV_ALLOWLIST", json.dumps([
+        "CLAW_SKILL_TOKEN", "CLAW_PYTHON_EXE", "CUSTOM_TOOL_SETTING", "EMPTY_TOOL_SETTING",
+        "PYTHONPATH", "NODE_OPTIONS",
+    ]))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
+    monkeypatch.setenv("DATABASE_URL", "must-not-be-forwarded")
+    monkeypatch.setenv("PYTHONPATH", "runner-loader-path")
+    monkeypatch.setenv("NODE_OPTIONS", "runner-loader-options")
+    manager, runtime = _manager()
+    request_env = {
+        "CLAW_SKILL_TOKEN": "explicit-token", "CUSTOM_TOOL_SETTING": "request-override",
+        "PYTHONPATH": "explicit-loader-path",
+    } if explicit_env else None
+    if background:
+        operation = runtime.exec_background = AsyncMock(
+            return_value=BackgroundExecResult(started=False, job_id="test-job"),
+        )
+        request = SandboxBackgroundExecRequest(command=["python"], env=request_env)
+        asyncio.run(manager.exec_background_in_sandbox("sb", request))
+    else:
+        operation = runtime.exec = AsyncMock(return_value=ExecResult(exit_code=0))
+        request = SandboxExecRequest(command=["python"], env=request_env)
+        asyncio.run(manager.exec_in_sandbox("sb", request))
+    env = operation.await_args.args[1].env
+    assert env["CLAW_SKILL_TOKEN"] == ("explicit-token" if explicit_env else "test-skill-token")
+    assert env["CLAW_PYTHON_EXE"] == "C:/managed/python.exe"
+    assert env["CUSTOM_TOOL_SETTING"] == (
+        "request-override" if explicit_env else "inherited-setting"
+    )
+    assert env["EMPTY_TOOL_SETTING"] == ""
+    assert sandbox_manager.os.environ["CUSTOM_TOOL_SETTING"] == "inherited-setting"
+    assert request.env == request_env
+    assert "OPENAI_API_KEY" not in env
+    assert "DATABASE_URL" not in env
+    assert "NODE_OPTIONS" not in env
+    if explicit_env:
+        assert env["PYTHONPATH"] == "explicit-loader-path"
+    else:
+        assert "PYTHONPATH" not in env

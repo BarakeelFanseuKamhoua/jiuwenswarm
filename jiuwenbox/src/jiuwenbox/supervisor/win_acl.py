@@ -751,6 +751,10 @@ def grant_parent_traverse(
     desktop_keys = _desktop_data_dir_keys()
     sid_obj = _resolve_sid(sid) if isinstance(sid, str) else sid
     our_key = _sid_dedup_key(sid_obj)
+    policy_allow_roots = _compile_acl_rules(
+        list((filesystem_policy or {}).get("allow_read") or [])
+        + list((filesystem_policy or {}).get("allow_write") or []),
+    )
     seen: set[str] = set()
     while True:
         if _is_host_dacl_frozen(current):
@@ -766,7 +770,9 @@ def grant_parent_traverse(
             name: (filesystem_policy or {}).get(name, [])
             for name in ("deny_read", "deny_write")
         }
-        if _policy_deny_rights(current, deny_only):
+        if _policy_deny_rights(current, deny_only) or any(
+            _acl_rule_covers(root, key) for root in policy_allow_roots
+        ):
             if current.parent == current or key in stop_keys:
                 break
             current = current.parent
