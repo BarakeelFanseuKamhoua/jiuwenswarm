@@ -12,6 +12,7 @@ from jiuwenswarm.agents.harness.common.model_gears import (
     MODE_MODEL_MAP,
     MODE_PREFERRED_PROVIDER,
     MODE_THINKING_MAP,
+    sync_agent_compressor_models,
 )
 from .capability import ModelCapability
 from .types import (
@@ -22,20 +23,18 @@ from .types import (
 
 
 # 四档模式（先写死）：模式名 → 固定 (模型名, 思考深度)。
-#   fast      → deepseek-v4.1-flash 关闭思考
-#   balanced  → deepseek-v4.1-flash 中等思考
-#   extreme   → glm-5.2             深度思考
-#   auto      → deepseek-v4.1-flash 中等思考
+#   fast/balanced/auto → deepseek-v4.1-flash（思考 off/medium/medium）
+#   extreme            → glm-5.2（思考 deep）
 # 具体模型名不在此表内（走 skip 分支，保留 adapter 已应用的具体/默认模型）。
-# 与 relay 前端 GEAR_MODEL_MAP 对齐市场 id。
+# 与宿主产品侧档位映射同表同源（见 model_gears.MODE_MODEL_MAP）。
 # 表本体在 jiuwenswarm.agents.harness.common.model_gears（deepresearch 隔离子进程
 # 也要用同一张表把档位翻成具体模型），此处只做别名，避免两处各写一份漂移。
 _MODE_MODEL_MAP: dict[str, str] = MODE_MODEL_MAP
 
 _MODE_THINKING_MAP: dict[str, str] = MODE_THINKING_MAP
 
-# 四档写死映射里的「官方模型」标记：relay 写 models.json 时给 maas binding 打
-# model_provider='huawei_maas'（config.yaml 手工配时也可在条目顶层写同名字段）。
+# 四档写死映射里的「官方模型」标记：宿主写 models.json 时给官方供应商标记
+# model_provider（见 model_gears.MODE_PREFERRED_PROVIDER；config.yaml 亦可手写）。
 # 四档查找优先命中此标，避免撞到用户自定义的同名模型；无标则退回第一个同名。
 _MODE_PREFERRED_PROVIDER = MODE_PREFERRED_PROVIDER
 
@@ -106,7 +105,7 @@ class ModelRoutingRail(DeepAgentRail):
         """按 model_name（忽略大小写/空白）在能力表中查找。
 
         ``prefer_provider`` 非空时，在所有同名 cap 里优先返回 ``model_provider``
-        匹配的条目（四档写死映射用，优先 maas 官方模型）；找不到标才退回第一个
+        匹配的条目（四档写死映射用，优先带官方供应商标记的同名模型）；找不到标才退回第一个
         同名（向后兼容：无标能力表行为不变）。
         """
         key = (name or "").strip().lower()
@@ -295,6 +294,7 @@ class ModelRoutingRail(DeepAgentRail):
         ):
             try:
                 react_agent = _resolve_react_agent(ctx.agent)
+                previous_model = getattr(react_agent, "_llm", None)
                 react_agent.set_llm(recommended_cap.model)
                 # 记下实际切到的 cap（同模型多 API 场景靠 model_id 区分）
                 if isinstance(ctx.extra, dict):
@@ -349,7 +349,19 @@ class ModelRoutingRail(DeepAgentRail):
                             setattr(ctx.agent, "model_name", mname)
                     except Exception as exc:
                         logger.debug("[ModelRouting] setattr model_name failed: %s", exc)
-                logger.info("[ModelRouting] applied set_llm -> %s", mname or "unknown")
+                # 主对话换模后，同步已缓存的上下文压缩器 Model，避免压缩仍用档位关键字
+                # / 过期 id → 模型调用失败，压缩 noop。
+                synced = sync_agent_compressor_models(
+                    react_agent,
+                    recommended_cap.model,
+                    host=ctx.agent,
+                    previous_model=previous_model,
+                )
+                logger.info(
+                    "[ModelRouting] applied set_llm -> %s compressor_synced=%s",
+                    mname or "unknown",
+                    synced,
+                )
             except Exception as exc:
                 logger.warning("[ModelRouting] set_llm failed: %s", exc)
         decision = RoutingDecision(
