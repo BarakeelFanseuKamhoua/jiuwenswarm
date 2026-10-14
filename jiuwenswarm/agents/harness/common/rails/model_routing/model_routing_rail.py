@@ -1,6 +1,5 @@
 """model_routing.rail — ModelRoutingRail."""
 from __future__ import annotations
-from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -39,15 +38,13 @@ _MODE_THINKING_MAP: dict[str, str] = MODE_THINKING_MAP
 # 四档查找优先命中此标，避免撞到用户自定义的同名模型；无标则退回第一个同名。
 _MODE_PREFERRED_PROVIDER = MODE_PREFERRED_PROVIDER
 
-# 思考深度 → 直接注入的 llm_call_kwargs（不经 vendor 白名单 / 语义适配层，短路）。
-#   off    → extra_body.thinking.type=disabled（DeepSeek/GLM 通用“关闭思考”）
-#   medium → extra_body.thinking.type=enabled（开启思考，默认深度）
-#   deep   → extra_body.thinking.type=enabled + reasoning_effort=high（思考开到最高）
-# 核心 allowlist 直接透传 extra_body / reasoning_effort。
-_THINKING_KWARGS: dict[str, dict[str, Any]] = {
-    "off": {"extra_body": {"thinking": {"type": "disabled"}}},
-    "medium": {"extra_body": {"thinking": {"type": "enabled"}}},
-    "deep": {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": "high"},
+# 四档附带的思考语义 → 产品 depth（再经 vendor_map 按模型族翻译）。
+# 具体模型 / default：仅 GLM-5.3 族自动注入产品默认 depth（当前 low）；其余 no-op。
+_GEAR_THINKING_TO_DEPTH: dict[str, str] = {
+    "off": "off",
+    "medium": "medium",
+    "deep": "high",
+    "default": "default",
 }
 
 
@@ -219,26 +216,42 @@ class ModelRoutingRail(DeepAgentRail):
             logger.warning("[ModelRouting] before_invoke failed: %s", exc, exc_info=True)
 
     async def before_model_call(self, ctx: AgentCallbackContext) -> None:
-        """按请求档位直接注入思考深度（fast=off / balanced=medium / extreme=deep / auto=medium）。
+        """按请求档位 / 模型族注入思考参数（经 vendor_map）。
 
-        具体模型（skip 分支）时 ``_request_thinking`` 保持 default，本方法 no-op。
-        直接写 ``ctx.extra["llm_call_kwargs"]``，由 ReActAgent 每次 model call 消费
-        （pop 后合入调用 kwargs）。不经 vendor 白名单：off 用 DeepSeek/GLM 通用的
-        ``extra_body.thinking.type=disabled``，medium 用 ``thinking.type=enabled``，
-        deep 用 ``thinking.type=enabled`` + ``reasoning_effort=high``（核心 allowlist 直接透传）。
+        - 四档：fast=off / balanced|auto=medium / extreme=deep→high
+        - 具体模型：``_request_thinking=default`` → 仅 GLM-5.3 族注入产品默认 depth（low）
+        写 ``ctx.extra["llm_call_kwargs"]``，由 ReActAgent 每次 model call 消费。
+        不支持思考控制的模型：adapt 降级为空 kwargs，本方法不写入。
         """
-        kwargs = _THINKING_KWARGS.get(self._request_thinking)
-        if kwargs is None:
-            return
+        from jiuwenswarm.common.thinking.adapter import adapt_thinking
+        from jiuwenswarm.common.thinking.types import thaw_llm_call_kwargs
+
+        depth = _GEAR_THINKING_TO_DEPTH.get(
+            self._request_thinking, self._request_thinking or "default"
+        )
+        model_name = _agent_model_name(ctx)
+        used_cap = None
+        extra_probe = getattr(ctx, "extra", None)
+        if isinstance(extra_probe, dict):
+            used_cap = extra_probe.get("_model_routing_used_cap")
+        if used_cap is not None:
+            cap_name = getattr(used_cap, "model_name", None)
+            if isinstance(cap_name, str) and cap_name.strip():
+                model_name = cap_name.strip()
         try:
+            profile = adapt_thinking(depth, model_name=model_name)
+            if not profile.injected or not profile.llm_call_kwargs:
+                return
             extra = getattr(ctx, "extra", None)
             if not isinstance(extra, dict):
                 return
-            extra["llm_call_kwargs"] = deepcopy(kwargs)
+            kwargs = thaw_llm_call_kwargs(profile.llm_call_kwargs)
+            extra["llm_call_kwargs"] = kwargs
             logger.info(
-                "[ModelRouting] thinking inject mode=%s thinking=%s kwargs=%r",
+                "[ModelRouting] thinking inject mode=%s thinking=%s model=%r kwargs=%r",
                 self._request_mode or "(none)",
-                self._request_thinking,
+                profile.thinking,
+                model_name,
                 kwargs,
             )
         except Exception as exc:

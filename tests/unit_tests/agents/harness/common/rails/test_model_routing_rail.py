@@ -10,7 +10,8 @@ Covers the written-down four-tier contract:
     auto     -> deepseek-v4.1-flash  思考 medium
 
 and the skip branch: a concrete model name / empty selection keeps the
-adapter-applied model and never injects thinking kwargs.
+adapter-applied model; ``default`` thinking is no-op except GLM-5.3 family
+(auto-inject product default depth low).
 """
 
 from __future__ import annotations
@@ -108,7 +109,8 @@ async def test_before_invoke_sets_thinking_per_tier(selection, thinking):
 @pytest.mark.asyncio
 async def test_before_model_call_injects_off_kwargs():
     rail = _rail()
-    ctx = _ctx("fast")
+    agent = _FakeAgent("deepseek-v4.1-flash")
+    ctx = _ctx("fast", agent=agent)
     await rail.before_invoke(ctx)
     await rail.before_model_call(ctx)
     assert ctx.extra["llm_call_kwargs"] == {"extra_body": {"thinking": {"type": "disabled"}}}
@@ -117,7 +119,8 @@ async def test_before_model_call_injects_off_kwargs():
 @pytest.mark.asyncio
 async def test_before_model_call_injects_deep_kwargs():
     rail = _rail()
-    ctx = _ctx("extreme")
+    agent = _FakeAgent("glm-5.2")
+    ctx = _ctx("extreme", agent=agent)
     await rail.before_invoke(ctx)
     await rail.before_model_call(ctx)
     assert ctx.extra["llm_call_kwargs"] == {
@@ -127,14 +130,15 @@ async def test_before_model_call_injects_deep_kwargs():
 
 
 @pytest.mark.asyncio
-async def test_injected_kwargs_are_isolated_from_class_constant():
+async def test_injected_kwargs_are_isolated_per_call():
     rail = _rail()
-    ctx = _ctx("balanced")
+    agent = _FakeAgent("deepseek-v4.1-flash")
+    ctx = _ctx("balanced", agent=agent)
     await rail.before_invoke(ctx)
     await rail.before_model_call(ctx)
-    # Mutating the injected dict must not corrupt the shared _THINKING_KWARGS.
+    # Mutating the injected dict must not affect the next call's kwargs.
     ctx.extra["llm_call_kwargs"]["extra_body"]["thinking"]["type"] = "disabled"
-    ctx2 = _ctx("balanced")
+    ctx2 = _ctx("balanced", agent=_FakeAgent("deepseek-v4.1-flash"))
     await rail.before_invoke(ctx2)
     await rail.before_model_call(ctx2)
     assert ctx2.extra["llm_call_kwargs"]["extra_body"]["thinking"]["type"] == "enabled"
@@ -144,8 +148,8 @@ async def test_injected_kwargs_are_isolated_from_class_constant():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selection", ["", "gpt-5.4", "deepseek-v4.1-flash"])
-async def test_concrete_or_empty_selection_skips(selection):
+@pytest.mark.parametrize("selection", ["", "gpt-5.4"])
+async def test_concrete_unsupported_model_skips_thinking_inject(selection):
     rail = _rail()
     agent = _FakeAgent("gpt-5.4")
     ctx = _ctx(selection, agent=agent)
@@ -156,6 +160,28 @@ async def test_concrete_or_empty_selection_skips(selection):
     assert "_model_routing_used_cap" not in ctx.extra
     assert "llm_call_kwargs" not in ctx.extra
     assert ctx.extra["model_routing_decision"]["analysis"]["category"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_concrete_non_glm53_allowlisted_skips_default_inject():
+    rail = _rail()
+    agent = _FakeAgent("deepseek-v4.1-flash")
+    ctx = _ctx("deepseek-v4.1-flash", agent=agent)
+    await rail.before_invoke(ctx)
+    await rail.before_model_call(ctx)
+    assert rail._request_thinking == "default"
+    assert "llm_call_kwargs" not in ctx.extra
+
+
+@pytest.mark.asyncio
+async def test_concrete_glm53_injects_effort_low():
+    rail = _rail()
+    agent = _FakeAgent("glm-5.3-test")
+    ctx = _ctx("glm-5.3-test", agent=agent)
+    await rail.before_invoke(ctx)
+    await rail.before_model_call(ctx)
+    assert ctx.extra["llm_call_kwargs"]["extra_body"]["thinking"]["type"] == "enabled"
+    assert ctx.extra["llm_call_kwargs"]["reasoning_effort"] == "low"
 
 
 # ---- switch branch ---- #

@@ -140,11 +140,11 @@ def resolve_skill_turbo_thinking_kwargs(
 ) -> dict[str, Any]:
     """Optional thinking inject for SkillTurbo LLM calls.
 
-    ``thinking is None`` → empty dict (no adapt, identical to legacy invoke/stream).
-    Unsupported / degraded → empty dict (never abort).
+    ``thinking is None`` → ``default`` (GLM-5.3 family → product depth low;
+    other models → no inject). Unsupported / degraded → empty dict (never abort).
     """
     if thinking is None:
-        return {}
+        thinking = "default"
     from jiuwenswarm.common.thinking.adapter import adapt_thinking
     from jiuwenswarm.common.thinking.types import kwargs_digest, thaw_llm_call_kwargs
 
