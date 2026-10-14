@@ -45,13 +45,13 @@ class StartupLease:
     def __init__(self, gate):
         self._gate = gate
         self._closed = False
+        self._close_lock = threading.Lock()
 
     def close(self):
-        with self._gate._condition:
+        with self._close_lock:
             if not self._closed:
+                self._gate.release_startup()
                 self._closed = True
-                self._gate._startups -= 1
-                self._gate._condition.notify_all()
 
 
 class StartupGate:
@@ -75,6 +75,12 @@ class StartupGate:
         with self._condition:
             self._startups += 1
         return StartupLease(self)
+
+    def release_startup(self):
+        """Release one lease and wake builders under the gate's own lock."""
+        with self._condition:
+            self._startups -= 1
+            self._condition.notify_all()
 
     @contextmanager
     def demand(self):

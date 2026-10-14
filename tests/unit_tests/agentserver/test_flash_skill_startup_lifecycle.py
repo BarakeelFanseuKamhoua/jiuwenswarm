@@ -56,6 +56,36 @@ def test_gate_has_bounded_wait_even_under_continuous_startup():
     lease.close()
 
 
+def test_concurrent_lease_close_preserves_other_active_preparation():
+    gate = execution.StartupGate()
+    lease = gate.startup()
+    other = gate.startup()
+    barrier = threading.Barrier(8)
+
+    def close_lease():
+        barrier.wait(timeout=2)
+        lease.close()
+
+    workers = [threading.Thread(target=close_lease) for _ in range(8)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(2)
+        assert not any(worker.is_alive() for worker in workers)
+        assert gate.stats()["startups"] == 1
+        other.close()
+        assert gate.stats()["startups"] == 0
+    finally:
+        barrier.abort()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(2)
+        lease.close()
+        other.close()
+        gate.close()
+
+
 def test_demand_wakes_a_build_and_releases_on_exception():
     gate = execution.StartupGate(max_pause_s=5)
     lease = gate.startup()
@@ -187,7 +217,7 @@ async def test_first_and_continuation_bind_actual_request_without_timing(monkeyp
                 requests.pop(request_id)
         assert instance.observed == [("first", 1), ("model", 0),
                                      ("continuation", 1), ("model", 0)]
-        assert not instance._flash_preparation_tasks
+        assert not instance.flash_preparation_tasks
         assert _React._apply_llm_call_kwargs is original_class_method
         # An unrelated task must not inherit the first request from the worker.
         await instance._execute_round(SimpleNamespace(request_id="background"))
@@ -210,7 +240,7 @@ async def test_failure_before_model_releases_lease_and_task_mapping(monkeypatch)
             with pytest.raises(RuntimeError, match="before model failed"):
                 await instance._execute_round(SimpleNamespace(request_id="failed"))
             assert gate.stats()["startups"] == 0
-            assert not instance._flash_preparation_tasks
+            assert not instance.flash_preparation_tasks
     finally:
         await instance.stop()
 
@@ -287,7 +317,7 @@ async def test_real_sdk_reused_scheduler_releases_each_request_before_model(monk
                 assert outcome.error_code is None
                 assert gate.stats()["startups"] == 0
             assert controller.task_scheduler is scheduler
-            assert not agent._flash_preparation_tasks
+            assert not agent.flash_preparation_tasks
         assert observed == ["first", "continuation"]
     finally:
         await agent._force_cleanup_controller()

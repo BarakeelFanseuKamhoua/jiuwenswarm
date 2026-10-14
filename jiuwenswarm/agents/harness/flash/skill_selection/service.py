@@ -42,6 +42,15 @@ class _PreparedCatalog:
     changed: bool
 
 
+@dataclass(frozen=True)
+class _QueryWork:
+    query: str
+    keywords: tuple[str, ...]
+    allowed_ids: frozenset[str]
+    submitted_at: float
+    cached_result: SelectionResult | None = None
+
+
 class SelectionService:
     def __init__(
         self,
@@ -335,14 +344,17 @@ class SelectionService:
                     )
                     token = budget.set(request_budget)
                     try:
+                        query_work = _QueryWork(
+                            query=query,
+                            keywords=tuple(keywords),
+                            allowed_ids=allowed_ids,
+                            submitted_at=time.perf_counter(),
+                            cached_result=cached_result,
+                        )
                         work = self.runtime.queries.submit(
                             self._query,
                             pipeline,
-                            query,
-                            keywords,
-                            allowed_ids,
-                            time.perf_counter(),
-                            cached_result,
+                            query_work,
                         )
                     finally:
                         budget.reset(token)
@@ -367,16 +379,18 @@ class SelectionService:
                 with self._lock:
                     self._active_requests -= 1
 
-    def _query(self, pipeline, query, keywords, allowed_ids, submitted_at, cached_result=None):
-        queue_ms = (time.perf_counter() - submitted_at) * 1000
+    def _query(self, pipeline, work: _QueryWork):
+        queue_ms = (time.perf_counter() - work.submitted_at) * 1000
         checkpoint()
-        result = cached_result or pipeline.search(query, keywords, allowed_ids=allowed_ids)
+        result = work.cached_result or pipeline.search(
+            work.query, work.keywords, allowed_ids=work.allowed_ids,
+        )
         # Ranking can be reused, but file-backed details must be revalidated
         # before every response/ticket, including repeated queries in one turn.
         candidates = []
         for document, score in result.candidates:
             checkpoint()
-            if document.id in allowed_ids:
+            if document.id in work.allowed_ids:
                 document = hydrate_document(document, cache=self._catalog_cache)
                 candidates.append((document, score))
         checkpoint()

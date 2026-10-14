@@ -58,11 +58,11 @@ def preparing(request_id=""):
 
 def bind_instance(instance, request_preparations):
     """Carry the actual request lease through both long-lived SDK workers."""
-    if getattr(instance, "_flash_preparation_bound", False):
+    if getattr(instance, "flash_preparation_bound", False):
         return
-    instance._flash_preparation_bound = True
+    instance.flash_preparation_bound = True
     task_preparations = {}
-    instance._flash_preparation_tasks = task_preparations
+    instance.flash_preparation_tasks = task_preparations
 
     def wrap(name, factory):
         original = getattr(instance, name, None)
@@ -102,7 +102,7 @@ def bind_instance(instance, request_preparations):
         async def setup(*args, **kwargs):
             result = await original(*args, **kwargs)
             scheduler = getattr(result[1], "task_scheduler", None)
-            if scheduler is not None and not getattr(scheduler, "_flash_preparation_bound", False):
+            if scheduler is not None and not getattr(scheduler, "flash_preparation_bound", False):
                 execute = getattr(scheduler, "execute_task", None)
                 if callable(execute):
                     @wraps(execute)
@@ -111,7 +111,7 @@ def bind_instance(instance, request_preparations):
                         with bind(preparation):
                             return await execute(task_id, session, *a, **kw)
                     scheduler.execute_task = execute_task
-                    scheduler._flash_preparation_bound = True
+                    scheduler.flash_preparation_bound = True
                 else:
                     logger.warning("[SkillSelection] preparation scheduler hook unavailable")
             return result
@@ -132,6 +132,7 @@ def bind_instance(instance, request_preparations):
             if preparation is not None:
                 preparation.close()
             return result
-        react._apply_llm_call_kwargs = before_model
+        # Keep SDK-version-specific binding dynamic, like the instance hooks above.
+        setattr(react, "_apply_llm_call_kwargs", before_model)
     else:
         logger.warning("[SkillSelection] preparation model boundary unavailable")
