@@ -528,7 +528,40 @@ def _build_deepresearch_config(source: dict[str, str]) -> dict[str, str]:
             os.environ.get("SEARCH_SERVICE_ALLOW_UNSAFE_URL", "true"),
         )
     )
+    _attach_deepresearch_thinking_config(config)
     return config
+
+
+def _attach_deepresearch_thinking_config(config: dict[str, str]) -> None:
+    """Pass auto-default thinking depth into the isolated DeepResearch child.
+
+    SDK defaults to ``llm_thinking_enabled=False`` (injects ``thinking.type=disabled``),
+    which breaks GLM-5.3. Parent resolves vendor-mapped kwargs (currently only
+    GLM-5.3 family on ``default``) and ships them as ``LLM_EXTENSION`` +
+    ``LLM_THINKING_ENABLED`` for the runner to apply.
+    """
+    model_name = str(config.get("LLM_MODEL_NAME", "") or "").strip()
+    if not model_name:
+        return
+    try:
+        from jiuwenswarm.common.thinking.adapter import adapt_thinking
+        from jiuwenswarm.common.thinking.types import thaw_llm_call_kwargs
+        from jiuwenswarm.common.thinking.vendor_map import (
+            llm_call_kwargs_to_extension,
+        )
+    except ImportError:
+        return
+    profile = adapt_thinking("default", model_name=model_name)
+    if not profile.injected or not profile.llm_call_kwargs:
+        return
+    extension = llm_call_kwargs_to_extension(
+        thaw_llm_call_kwargs(profile.llm_call_kwargs)
+    )
+    if not extension:
+        return
+    config["LLM_EXTENSION"] = json.dumps(extension, ensure_ascii=False)
+    # Never ask the SDK to disable thinking when we ship an explicit depth profile.
+    config["LLM_THINKING_ENABLED"] = "true"
 
 
 def _build_deepresearch_request_config(
@@ -574,15 +607,34 @@ def _build_styled_export_llm_config(
         raise ValueError("styled HTML LLM configuration is invalid")
     if model_type not in {"openai", "siliconflow"}:
         model_type = "openai"
+    # Prefer GLM-5.3 auto-default depth (vendor-mapped). Fall back to disable
+    # when adapt does not inject — never disable GLM-5.3 when it does inject.
+    extension: dict[str, object] = {
+        "extra_body": {"thinking": {"type": "disabled"}},
+    }
+    try:
+        from jiuwenswarm.common.thinking.adapter import adapt_thinking
+        from jiuwenswarm.common.thinking.types import thaw_llm_call_kwargs
+        from jiuwenswarm.common.thinking.vendor_map import (
+            llm_call_kwargs_to_extension,
+        )
+
+        profile = adapt_thinking("default", model_name=model_name)
+        if profile.injected and profile.llm_call_kwargs:
+            mapped = llm_call_kwargs_to_extension(
+                thaw_llm_call_kwargs(profile.llm_call_kwargs)
+            )
+            if mapped:
+                extension = mapped
+    except ImportError:
+        pass
     return {
         "general": {
             "model_name": model_name,
             "model_type": model_type,
             "base_url": base_url,
             "api_key": api_key,
-            "extension": {
-                "extra_body": {"thinking": {"type": "disabled"}},
-            },
+            "extension": extension,
         }
     }
 
