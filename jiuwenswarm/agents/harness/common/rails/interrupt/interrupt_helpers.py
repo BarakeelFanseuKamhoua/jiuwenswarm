@@ -14,6 +14,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from jiuwenswarm.agents.harness.common.rails.interrupt.permission_prompt import (
+    build_permission_prompt,
+)
 from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     build_plan_approval_actions,
 )
@@ -415,14 +418,33 @@ def build_permission_rail(
                 status="pending",
                 kind="other",
             )
-            title = str(descriptor.get("title") or f"Approve `{tool_name}`")
-            if getattr(req.result, "reason", None):
-                title = f"{title}: {req.result.reason}"
+            from openjiuwen.harness.security.permission_engine.approve.ask_presentation import (
+                build_permission_ask_presentation,
+                render_ask_presentation_message,
+            )
+
+            tool_args = _normalize_tool_args(tool_args_raw) or {}
+            presentation = build_permission_ask_presentation(
+                tool_name, tool_args, req.result, permission_config=permission_config,
+                workspace=get_workspace_dir(),
+            )
+            title, prompt = build_permission_prompt(
+                tool_name, tool_args, render_ask_presentation_message(presentation),
+                {
+                    "ask_title": presentation.title, "ask_reason": req.result.reason,
+                    "ask_risk_level": presentation.risk_level,
+                    "file_operations": [
+                        {"path": path, "action": action, "source": source}
+                        for path, action, source in presentation.file_operations
+                    ],
+                }, permission_config,
+            )
 
             request_params: dict[str, Any] = {
                 "toolCall": {
                     **descriptor,
                     "title": title,
+                    "content": [{"type": "content", "content": {"type": "text", "text": prompt}}],
                 },
                 "options": [
                     {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
@@ -1157,6 +1179,10 @@ def extract_question_from_interaction(payload: Any) -> dict | None:
     else:
         header = f"权限审批: {tool_name}" if tool_name else "权限审批"
         question = message
+        if not _classify_structured_approval(value_obj, {}):
+            header, question = build_permission_prompt(
+                tool_name, tool_args, message, _extract_interrupt_metadata(value_obj),
+            )
 
     skill_name = ""
     if isinstance(tool_args, dict):
