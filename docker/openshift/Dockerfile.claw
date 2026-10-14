@@ -46,6 +46,5 @@ RUN if [ -f jiuwenswarm/extensions/symphony/extension.yaml ]; then \
 
 ENV HOME=/home/app \
     PATH=/usr/local/bin:$PATH:/home/app/.local/bin
-USER 1000
 
 CMD ["/app/jiuwenswarm/docker/start.sh"]
