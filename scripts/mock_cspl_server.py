@@ -25,7 +25,6 @@ class MockCsplHandler(BaseHTTPRequestHandler):
             payload = body.decode("utf-8", errors="replace")
 
         print("\n=== CSPL REQUEST ===")
-        print(f"Headers: {dict(self.headers)}")
         print(
             f"Body: {json.dumps(payload, indent=2, ensure_ascii=False) if isinstance(payload, dict) else payload}"
         )
