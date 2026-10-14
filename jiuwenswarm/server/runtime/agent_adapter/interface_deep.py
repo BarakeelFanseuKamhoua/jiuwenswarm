@@ -4205,33 +4205,40 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def _install_file_soft_delete(self) -> None:
         """Load the Windows soft-delete DLL once when the switch is on.
 
-        Failure raises. The agent must not keep running with physical deletes
-        after the operator turned the feature on.
+        A load failure is logged and ignored. The agent keeps working, and
+        deletes stay physical while the DLL is not loaded. A later
+        create_instance retries the load.
         """
         import sys
 
         if sys.platform != "win32":
             return
-        from jiuwenswarm.common.config import get_config, get_file_soft_delete_settings
+        try:
+            from jiuwenswarm.common.config import get_config, get_file_soft_delete_settings
 
-        enabled, archive = get_file_soft_delete_settings(
-            get_config(),
-            workspace_dir=getattr(self, "_workspace_dir", None),
-        )
-        if not enabled:
-            return
-        # 冻结包把 DLL 放在 jiuwenbox_native, 不放在 jiuwenbox 目录里。
-        # agent-core 只按包路径找, 找不到这一份, 所以先把实际路径写进环境变量。
-        # 已经配过的路径不覆盖。
-        from jiuwenbox.supervisor.win_softdelete import dll_path as jiuwenbox_soft_delete_dll_path
+            enabled, archive = get_file_soft_delete_settings(
+                get_config(),
+                workspace_dir=getattr(self, "_workspace_dir", None),
+            )
+            if not enabled:
+                return
+            # 冻结包把 DLL 放在 jiuwenbox_native, 不放在 jiuwenbox 目录里。
+            # agent-core 只按包路径找, 找不到这一份, 所以先把实际路径写进环境变量。
+            # 已经配过的路径不覆盖。
+            from jiuwenbox.supervisor.win_softdelete import dll_path as jiuwenbox_soft_delete_dll_path
 
-        os.environ.setdefault(
-            "JIUWENBOX_SOFT_DELETE_DLL",
-            str(jiuwenbox_soft_delete_dll_path()),
-        )
-        from openjiuwen.core.sys_operation.local.win_softdelete import install_win_soft_delete
+            os.environ.setdefault(
+                "JIUWENBOX_SOFT_DELETE_DLL",
+                str(jiuwenbox_soft_delete_dll_path()),
+            )
+            from openjiuwen.core.sys_operation.local.win_softdelete import install_win_soft_delete
 
-        install_win_soft_delete(archive)
+            install_win_soft_delete(archive)
+        except Exception:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] soft-delete DLL was not installed; deletes stay physical",
+                exc_info=True,
+            )
 
     def _retain_sys_operation(self, sys_operation_id: str) -> None:
         """Record one adapter-held reference on a registered sys operation.
