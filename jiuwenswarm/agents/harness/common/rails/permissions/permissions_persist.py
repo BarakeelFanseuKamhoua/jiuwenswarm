@@ -32,6 +32,7 @@ from openjiuwen.harness.security.patterns import (
     merge_file_guard_path_rule,
     merge_permission_allow_rule_into_permissions,
 )
+from openjiuwen.harness.security.permission_engine.policy_sources import SOURCE_USER
 
 logger = logging.getLogger(__name__)
 
@@ -402,7 +403,7 @@ def apply_session_permissions_overlay(
         return merged
     composition = merged.get("composition")
     composed = isinstance(composition, dict)
-    if composed and "user" not in composition.get("source_order", []):
+    if composed and SOURCE_USER not in composition.get("source_order", []):
         return merged
 
     ov_fg = overlay.get("file_guard")
@@ -417,7 +418,7 @@ def apply_session_permissions_overlay(
                     continue
                 if composed:
                     merged.setdefault("file_guard", {}).setdefault("paths", []).append(
-                        {**deepcopy(entry), "layer": "user"}
+                        {**deepcopy(entry), "layer": SOURCE_USER}
                     )
                 else:
                     merged, _wrote = merge_file_guard_path_rule(

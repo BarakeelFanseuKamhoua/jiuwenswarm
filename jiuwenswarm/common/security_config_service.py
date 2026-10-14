@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 import portalocker
+from openjiuwen.harness.security.permission_engine.policy_sources import (
+    SOURCE_BUILTIN,
+    SOURCE_CLOUD,
+    SOURCE_USER,
+)
 
 from jiuwenswarm.common.config import dump_yaml_round_trip, load_yaml_round_trip
 from jiuwenswarm.common.security_config_compose import (
@@ -116,9 +121,9 @@ class SecurityConfigService:
         }
         if self.settings_path.is_file():
             settings = validate_settings(self._read_yaml(self.settings_path))
-            if any(item["id"] == "builtin" and item["enabled"] for item in settings["security"]["policy_sources"]):
+            if any(item["id"] == SOURCE_BUILTIN and item["enabled"] for item in settings["security"]["policy_sources"]):
                 builtin = json.dumps(self._builtin_reader(), sort_keys=True, ensure_ascii=False, default=str)
-                hashes["builtin"] = hashlib.sha256(builtin.encode("utf-8")).hexdigest()
+                hashes[SOURCE_BUILTIN] = hashlib.sha256(builtin.encode("utf-8")).hexdigest()
         return hashes
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -145,8 +150,8 @@ class SecurityConfigService:
 
     def _load_sources(self, settings: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         selected = {item["id"] for item in settings["security"]["policy_sources"] if item["enabled"]}
-        local = validate_source(self._read_yaml(self.local_path)) if "user" in selected else {"permissions": {}}
-        cloud = validate_source(self._read_yaml(self.cloud_path), cloud=True) if self.cloud_path.is_file() and "cloud" in selected else {"permissions": {}}
+        local = validate_source(self._read_yaml(self.local_path)) if SOURCE_USER in selected else {"permissions": {}}
+        cloud = validate_source(self._read_yaml(self.cloud_path), cloud=True) if self.cloud_path.is_file() and SOURCE_CLOUD in selected else {"permissions": {}}
         return local, cloud
 
     def _load(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -171,7 +176,7 @@ class SecurityConfigService:
             cloud = (
                 validate_source(self._read_yaml(self.cloud_path), cloud=True)
                 if self.cloud_path.is_file() and any(
-                    item["id"] == "cloud" and item["enabled"]
+                    item["id"] == SOURCE_CLOUD and item["enabled"]
                     for item in settings["security"]["policy_sources"]
                 ) else {"permissions": {}}
             )
@@ -186,9 +191,9 @@ class SecurityConfigService:
             return result, deepcopy(state)
 
     def _sources(self, settings: dict[str, Any], local: dict[str, Any], cloud: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        sources = {"user": local, "cloud": cloud}
-        if any(item["id"] == "builtin" and item["enabled"] for item in settings["security"]["policy_sources"]):
-            sources["builtin"] = self._builtin_reader()
+        sources = {SOURCE_USER: local, SOURCE_CLOUD: cloud}
+        if any(item["id"] == SOURCE_BUILTIN and item["enabled"] for item in settings["security"]["policy_sources"]):
+            sources[SOURCE_BUILTIN] = self._builtin_reader()
         return sources
 
     def initialize_from_live(self) -> dict[str, Any]:
@@ -245,7 +250,7 @@ class SecurityConfigService:
         with self._thread_lock, self._locked():
             settings = validate_settings(self._read_yaml(self.settings_path))
             enabled = any(
-                item["id"] == "builtin" and item["enabled"]
+                item["id"] == SOURCE_BUILTIN and item["enabled"]
                 for item in settings["security"]["policy_sources"]
             )
             section, field = key_map[module]
@@ -333,7 +338,7 @@ class SecurityConfigService:
         with self._thread_lock, self._locked():
             self._check_revision(expected_revision)
             settings, local, cloud = self._load()
-            if not any(item["id"] == "user" and item["enabled"] for item in settings["security"]["policy_sources"]):
+            if not any(item["id"] == SOURCE_USER and item["enabled"] for item in settings["security"]["policy_sources"]):
                 local = validate_source(self._read_yaml(self.local_path))
             perms = local.setdefault("permissions", {})
             if module == "file":
@@ -414,7 +419,7 @@ class SecurityConfigService:
             self._check_revision(expected_revision)
             settings, local, cloud = self._load()
             if not any(
-                item["id"] == "user" and item["enabled"]
+                item["id"] == SOURCE_USER and item["enabled"]
                 for item in settings["security"]["policy_sources"]
             ):
                 local = validate_source(self._read_yaml(self.local_path))
@@ -448,7 +453,7 @@ class SecurityConfigService:
             raise ValueError("approval grant requires an id")
         with self._thread_lock, self._locked():
             settings, local, cloud = self._load()
-            if not any(item["id"] == "user" and item["enabled"] for item in settings["security"]["policy_sources"]):
+            if not any(item["id"] == SOURCE_USER and item["enabled"] for item in settings["security"]["policy_sources"]):
                 return False
             grants = local.setdefault("permissions", {}).setdefault("approval_overrides", [])
             grants[:] = [item for item in grants if item.get("id") != grant["id"]]

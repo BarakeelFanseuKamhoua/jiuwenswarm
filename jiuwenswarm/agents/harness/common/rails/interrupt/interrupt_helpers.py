@@ -14,6 +14,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from openjiuwen.harness.security.permission_engine.policy_sources import SOURCE_BUILTIN
+
 from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     build_plan_approval_actions,
 )
@@ -298,7 +300,7 @@ def build_permission_rail(
     permission_config = runtime_permission_config(config)
     tools_config = permission_config.setdefault("tools", {})
     composition = permission_config.get("composition")
-    builtin_active = not isinstance(composition, dict) or "builtin" in composition.get("source_order", [])
+    builtin_active = not isinstance(composition, dict) or SOURCE_BUILTIN in composition.get("source_order", [])
     if isinstance(tools_config, dict) and builtin_active:
         tools_config.setdefault("configure_channel", "allow")
         tools_config.setdefault("get_wechat_login_status", "allow")

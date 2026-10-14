@@ -7,11 +7,17 @@ understand ``permissions.composition``.
 from copy import deepcopy
 from typing import Any
 
+from openjiuwen.harness.security.permission_engine.policy_sources import (
+    DEFAULT_SOURCE_ORDER,
+    SOURCE_USER,
+    validate_policy_sources,
+)
+
 from jiuwenswarm.common.config import _validate_tools_map
 from jiuwenswarm.common.file_guard_config import validate_paths
 
 
-DEFAULT_SOURCES = ("user", "cloud", "builtin")
+DEFAULT_SOURCES = DEFAULT_SOURCE_ORDER
 _LEVELS = frozenset({"allow", "ask", "deny"})
 _RULE_FIELDS = frozenset({"id", "tools", "pattern", "severity", "action", "description", "match_type"})
 
@@ -25,17 +31,7 @@ def validate_settings(settings: Any) -> dict[str, Any]:
     if set(security) - {"policy_sources", "fail_closed"}:
         raise ValueError("unknown security setting")
     sources = security.get("policy_sources", [{"id": name, "enabled": True} for name in DEFAULT_SOURCES])
-    if not isinstance(sources, list):
-        raise ValueError("policy_sources must be a list")
-    seen = set()
-    for source in sources:
-        if not isinstance(source, dict) or set(source) != {"id", "enabled"}:
-            raise ValueError("each policy source requires id and enabled")
-        if not isinstance(source["id"], str) or source["id"] not in DEFAULT_SOURCES or source["id"] in seen:
-            raise ValueError("unknown or duplicate policy source")
-        if not isinstance(source["enabled"], bool):
-            raise ValueError("policy source enabled must be boolean")
-        seen.add(source["id"])
+    validate_policy_sources(sources)
     fail_closed = security.get("fail_closed", {"enabled": False})
     if not isinstance(fail_closed, dict) or set(fail_closed) != {"enabled"} or not isinstance(fail_closed["enabled"], bool):
         raise ValueError("fail_closed.enabled must be boolean")
@@ -120,7 +116,7 @@ def compose_candidate(settings: dict[str, Any], sources: dict[str, dict[str, Any
     effective["rules"] = rules
     effective.setdefault("file_guard", {})["paths"] = paths
     effective.setdefault("net_guard", {})["urls"] = urls
-    effective["approval_overrides"] = deepcopy(sources.get("user", {}).get("permissions", {}).get("approval_overrides", [])) if "user" in selected else []
+    effective["approval_overrides"] = deepcopy(sources.get(SOURCE_USER, {}).get("permissions", {}).get("approval_overrides", [])) if SOURCE_USER in selected else []
     effective["composition"] = {
         "schema_version": 1, "revision": revision, "source_order": selected, "net_url_layers": url_layers,
     }
