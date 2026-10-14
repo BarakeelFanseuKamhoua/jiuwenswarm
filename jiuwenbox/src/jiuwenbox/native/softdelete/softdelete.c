@@ -918,8 +918,53 @@ static int path_from_object(OBJECT_ATTRIBUTES_ *oa, wchar_t *out, size_t cch) {
     return ok;
 }
 
+/* Keep DOS names for comparisons and IPC; extend only filesystem API inputs.
+ * A process without longPathAware must work even when LongPathsEnabled is 0. */
+static wchar_t *filesystem_path(const wchar_t *path) {
+    wchar_t *full;
+    wchar_t *extended;
+    DWORD n;
+    size_t prefix;
+    int unc;
+    if (path == NULL) {
+        return NULL;
+    }
+    if (wcslen(path) < MAX_PATH || wcsncmp(path, L"\\\\?\\", 4) == 0) {
+        return heap_wcs_dup(path);
+    }
+    full = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, PATH_CAP * sizeof(wchar_t));
+    if (full == NULL) {
+        return NULL;
+    }
+    n = GetFullPathNameW(path, PATH_CAP, full, NULL);
+    if (n == 0 || n >= PATH_CAP) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+    unc = n > 1 && full[0] == L'\\' && full[1] == L'\\';
+    prefix = unc ? 6 : 4;
+    if (n + prefix >= PATH_CAP) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+    extended = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (n + prefix + 1) * sizeof(wchar_t));
+    if (extended != NULL) {
+        wcscpy_s(extended, n + prefix + 1, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\");
+        wcscat_s(extended, n + prefix + 1, full + (unc ? 2 : 0));
+    }
+    HeapFree(GetProcessHeap(), 0, full);
+    return extended;
+}
+
+static DWORD path_attributes(const wchar_t *path) {
+    wchar_t *api_path = filesystem_path(path);
+    DWORD attr = api_path == NULL ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(api_path);
+    HeapFree(GetProcessHeap(), 0, api_path);
+    return attr;
+}
+
 static int path_exists(const wchar_t *path) {
-    DWORD attr = GetFileAttributesW(path);
+    DWORD attr = path_attributes(path);
     return attr != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -1321,10 +1366,21 @@ static void sanitize_name(const wchar_t *path, wchar_t *out, size_t cch) {
 static int same_volume(const wchar_t *left, const wchar_t *right) {
     wchar_t a[MAX_PATH];
     wchar_t b[MAX_PATH];
-    if (!GetVolumePathNameW(left, a, MAX_PATH) || !GetVolumePathNameW(right, b, MAX_PATH)) {
+    wchar_t dos_a[MAX_PATH];
+    wchar_t dos_b[MAX_PATH];
+    wchar_t *api_left = filesystem_path(left);
+    wchar_t *api_right = filesystem_path(right);
+    int ok = api_left != NULL && api_right != NULL
+        && GetVolumePathNameW(api_left, a, MAX_PATH)
+        && GetVolumePathNameW(api_right, b, MAX_PATH);
+    HeapFree(GetProcessHeap(), 0, api_left);
+    HeapFree(GetProcessHeap(), 0, api_right);
+    if (!ok) {
         return 0;
     }
-    return _wcsicmp(a, b) == 0;
+    to_dos_path(a, dos_a, MAX_PATH);
+    to_dos_path(b, dos_b, MAX_PATH);
+    return _wcsicmp(dos_a, dos_b) == 0;
 }
 
 static int move_to_archive(const wchar_t *dos_path) {
@@ -1371,8 +1427,16 @@ static int move_to_archive(const wchar_t *dos_path) {
         return 0;
     }
     /* No MOVEFILE_COPY_ALLOWED: a cross-volume copy would delete the source. */
-    if (!MoveFileExW(dos_path, dest, MOVEFILE_WRITE_THROUGH)) {
-        return 0;
+    {
+        wchar_t *api_source = filesystem_path(dos_path);
+        wchar_t *api_dest = filesystem_path(dest);
+        int moved = api_source != NULL && api_dest != NULL
+            && MoveFileExW(api_source, api_dest, MOVEFILE_WRITE_THROUGH);
+        HeapFree(GetProcessHeap(), 0, api_source);
+        HeapFree(GetProcessHeap(), 0, api_dest);
+        if (!moved) {
+            return 0;
+        }
     }
     {
         wchar_t msg[1024];
@@ -1613,7 +1677,7 @@ static int soft_delete_path(const wchar_t *dos_path) {
         return 0;
     }
     t_bypass = 1;
-    attr = GetFileAttributesW(dos_path);
+    attr = path_attributes(dos_path);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         t_bypass = 0;
         return 0;
@@ -1839,9 +1903,16 @@ static int path_has_file_id(
     if (!have_id) {
         return 1;
     }
-    opened = CreateFileW(
-        path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    {
+        wchar_t *api_path = filesystem_path(path);
+        if (api_path == NULL) {
+            return 0;
+        }
+        opened = CreateFileW(
+            api_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        HeapFree(GetProcessHeap(), 0, api_path);
+    }
     if (opened == INVALID_HANDLE_VALUE) {
         return 0;
     }
@@ -3055,23 +3126,26 @@ static wchar_t *ansi_env_to_wide(const char *block) {
     return wide;
 }
 
-/* A sandboxed child that builds its own environment must still see the recycle port. */
-static wchar_t *merge_child_soft_env(const wchar_t *block) {
+/* Preserve broker settings and the Windows socket provider's SystemRoot.
+ * Do not copy the rest of the parent's environment into a custom block. */
+static wchar_t *merge_child_soft_env(const wchar_t *block, int *ok) {
     static const wchar_t *keys[] = {
         ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN,
+        L"SystemRoot",
     };
-    wchar_t *values[5];
+    wchar_t *values[sizeof keys / sizeof keys[0]];
     size_t base = 1;
     size_t extra = 0;
     size_t pos = 0;
     const wchar_t *cursor;
     wchar_t *out;
     int i;
+    *ok = 0;
     memset(values, 0, sizeof values);
     for (cursor = block; *cursor != L'\0'; cursor += wcslen(cursor) + 1) {
         base += wcslen(cursor) + 1;
     }
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
         if (env_block_has(block, keys[i])) {
             continue;
         }
@@ -3081,11 +3155,12 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         }
     }
     if (extra == 0) {
+        *ok = 1;
         return NULL;
     }
     out = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (base + extra) * sizeof(wchar_t));
     if (out == NULL) {
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
             HeapFree(GetProcessHeap(), 0, values[i]);
         }
         return NULL;
@@ -3095,7 +3170,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         memcpy(out + pos, cursor, count * sizeof(wchar_t));
         pos += count;
     }
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
         int wrote;
         if (values[i] == NULL) {
             continue;
@@ -3104,7 +3179,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         HeapFree(GetProcessHeap(), 0, values[i]);
         values[i] = NULL;
         if (wrote < 0) {
-            for (; i < 5; i++) {
+            for (; i < (int)(sizeof keys / sizeof keys[0]); i++) {
                 HeapFree(GetProcessHeap(), 0, values[i]);
             }
             HeapFree(GetProcessHeap(), 0, out);
@@ -3113,6 +3188,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         pos += (size_t)wrote + 1;
     }
     out[pos] = L'\0';
+    *ok = 1;
     return out;
 }
 
@@ -3122,6 +3198,7 @@ static BOOL WINAPI hook_CreateProcessInternalW(
     LPCWSTR cwd, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION pi, HANDLE *new_token) {
     DWORD used = flags;
     int added_suspend = 0;
+    int env_ok;
     BOOL ok;
     wchar_t *owned_env = NULL;
     wchar_t *converted_env = NULL;
@@ -3132,7 +3209,8 @@ static BOOL WINAPI hook_CreateProcessInternalW(
             token, app, cmd, process_attr, thread_attr, inherit, flags, env, cwd, startup, pi,
             new_token);
     }
-    if (GetEnvironmentVariableW(ENV_RECYCLE_PORT, NULL, 0) > 1 && env != NULL) {
+    if (env != NULL && (recycle_delegation_configured()
+        || GetEnvironmentVariableW(ENV_ARCHIVE, NULL, 0) > 1)) {
         wide_env = (const wchar_t *)env;
         if ((flags & CREATE_UNICODE_ENVIRONMENT) == 0) {
             converted_env = ansi_env_to_wide((const char *)env);
@@ -3143,8 +3221,8 @@ static BOOL WINAPI hook_CreateProcessInternalW(
             }
             wide_env = converted_env;
         }
-        owned_env = merge_child_soft_env(wide_env);
-        if (owned_env == NULL && !env_block_has(wide_env, ENV_RECYCLE_PORT)) {
+        owned_env = merge_child_soft_env(wide_env, &env_ok);
+        if (!env_ok) {
             HeapFree(GetProcessHeap(), 0, converted_env);
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
             return FALSE;
