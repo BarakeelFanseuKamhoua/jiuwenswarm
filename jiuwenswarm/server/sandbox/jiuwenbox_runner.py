@@ -225,6 +225,9 @@ def probe_runner_python(
     try:
         proc = subprocess.run(
             [python_exe, "-c", RUNNER_PROBE_IMPORT],
+            # Desktop stdin carries protocol frames and has a blocking reader.
+            # Inheriting that pipe can stall CPython before executing -c.
+            stdin=subprocess.DEVNULL,
             env=env, capture_output=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -399,7 +402,12 @@ class JiuwenBoxRunner:
         try:
             async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
                 resp = await client.get(url)
-                return resp.status_code == 200
+                if resp.status_code != 200:
+                    return False
+                data = resp.json()
+                return data.get("status") == "ok" and (
+                    sys.platform != "win32" or data.get("windows_supported") is True
+                )
         except Exception:
             return False
 
@@ -609,6 +617,8 @@ class JiuwenBoxRunner:
                 env.pop("JIUWENBOX_POLICY_PATH", None)
 
             logger.info("[JiuwenBoxRunner] spawning: %s", " ".join(cmd))
+            if sys.platform == "win32":
+                await self._prepare_windows_setup(env, policy_path)
             try:
                 spawn_kwargs: dict = {
                     "stdout": asyncio.subprocess.PIPE,
@@ -622,6 +632,7 @@ class JiuwenBoxRunner:
                 # CTRL_BREAK_EVENT 触发 uvicorn FastAPI lifespan shutdown (清活沙箱),
                 # 而非 TerminateProcess 即时强杀 (活沙箱成孤儿).
                 if sys.platform == "win32":
+                    spawn_kwargs["stdin"] = asyncio.subprocess.DEVNULL
                     create_new_process_group = 0x00000200  # noqa: N806 - Win32 常量风格
                     create_no_window = 0x08000000  # noqa: N806 - CREATE_NO_WINDOW
                     spawn_kwargs["creationflags"] = create_new_process_group | create_no_window
@@ -674,7 +685,34 @@ class JiuwenBoxRunner:
                         self.process.pid if self.process else None,
                         tail or "(empty)",
                     )
+                await self._stop_no_lock()
             return ok
+
+    async def _prepare_windows_setup(self, env: dict[str, str], policy_path: Optional[Path]) -> None:
+        """Run setup before creating the box-server Job, with its exact environment."""
+        import subprocess
+
+        cmd = [sys.executable]
+        if getattr(sys, "frozen", False):
+            cmd.append("--desktop-run-win-setup")
+        else:
+            cmd += ["-m", "jiuwenbox.supervisor.win_setup"]
+        cmd.append("--ensure")
+        if policy_path is not None:
+            cmd += ["--policy-path", str(policy_path)]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, env=env, capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=90, **_win_hidden_kwargs(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Windows 沙箱初始化超时, 未启动 box-server") from exc
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", errors="replace")[-6000:]
+            logger.error("Windows sandbox setup failed: %s", detail)
+            summary = detail.strip().splitlines()[-1] if detail.strip() else "没有错误输出"
+            raise RuntimeError(f"Windows 沙箱初始化失败 (退出码 {result.returncode}): {summary}")
 
     async def _pump_stream(self, stream: Any, kind: str) -> None:  # type: ignore[override]
         """持续读取子进程 stdout/stderr, 写入 logger info; stderr 额外保留滚动尾部.

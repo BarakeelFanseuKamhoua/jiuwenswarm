@@ -88,6 +88,7 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     monkeypatch.setattr(runner_module, "_resolve_jiuwenbox_src_dir", lambda: None)
     monkeypatch.setattr(runner, "_register_atexit_once", Mock())
     monkeypatch.setattr(runner, "_bind_win_job", Mock())
+    monkeypatch.setattr(runner, "_prepare_windows_setup", AsyncMock())
     monkeypatch.setattr(runner, "_wait_until_ready", AsyncMock(return_value=True))
     monkeypatch.setattr(runner, "_pump_stream", AsyncMock())
     monkeypatch.delenv("JIUWENBOX_RUNNER_PYTHON", raising=False)
@@ -117,6 +118,8 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(tmp
     assert spawn.await_count == 2
     for call in spawn.await_args_list:
         env = call.kwargs["env"]
+        if sys.platform == "win32":
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
         assert env["JIUWENBOX_RUNNER_PYTHON"] == "C:/Python312/python.exe"
         assert env["JIUWENBOX_SKILLS_DIR"] == "C:/workspace/skills"
         assert env["JIUWENBOX_POLICY_PATH"] == str(policy)
@@ -175,6 +178,7 @@ def test_runner_probe_uses_startup_source_path(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", run)
 
     assert runner_module.probe_runner_python("runner-python", {"SystemRoot": "C:/Windows"}) is None
+    assert run.call_args.kwargs["stdin"] == subprocess.DEVNULL
     env = run.call_args.kwargs["env"]
     assert env["PYTHONPATH"] == os.pathsep.join((str(source), "existing-source"))
     assert env["SystemRoot"] == "C:/Windows"
@@ -193,3 +197,37 @@ def test_runner_probe_reports_failure(monkeypatch, result, reason):
     run = Mock(side_effect=result) if isinstance(result, Exception) else Mock(return_value=result)
     monkeypatch.setattr(subprocess, "run", run)
     assert reason in runner_module.probe_runner_python("runner-python", {})
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows inherited stdin pipe")
+def test_runner_probe_with_desktop_stdin_reader():
+    # Keep the desktop pipe open while its reader blocks, as Electron does.
+    # CPython must run the probe with a separate stdin before any -c code runs.
+    code = r'''
+import os, sys, threading, time
+from jiuwenswarm.server.sandbox.jiuwenbox_runner import probe_runner_python
+reader = threading.Thread(target=lambda: sys.stdin.buffer.read(1), daemon=True)
+reader.start()
+time.sleep(0.1)
+result = probe_runner_python(sys.executable, {}, timeout=3)
+print(repr(result), flush=True)
+# The intentionally blocked test reader must not enter interpreter teardown.
+os._exit(0 if result is None else 1)
+'''
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        proc.wait(timeout=12)
+        stdout, stderr = proc.stdout.read(), proc.stderr.read()
+        assert proc.returncode == 0, (stdout, stderr)
+        assert stdout.strip() == b"None", (stdout, stderr)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            stream.close()

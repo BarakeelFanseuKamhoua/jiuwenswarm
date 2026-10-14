@@ -3206,27 +3206,19 @@ class ProcessRuntime(RuntimeAdapter):
                         sandbox_id, _runner_py, exc_info=True,
                     )
                 logger.info("[SandboxWin] %s grant_parent_traverse done", sandbox_id)
-            # 增量检测: per-sandbox policy 的 deny/allow 路径是否需要预授 WRITE_DAC.
-            # 运行时 box-server 是普通用户, 对 owner=Administrators 的目录 (如 D:/software)
-            # 没有 WRITE_DAC, grant_ace 会 WinError 5 → Deny Read ACE 不生效.
-            # 检测到新路径时弹 UAC 补授权.
-            try:
-                _all_acl_paths = list(dict.fromkeys(
-                    allow_read_paths + deny_read_paths + allow_write_paths + deny_write_paths
-                ))
-                win_setup.ensure_acl_policy_paths_authorized(
-                    _all_acl_paths,
-                    proxy_port_start=policy.windows.proxy.port_range_start,
-                    proxy_port_end=policy.windows.proxy.port_range_end,
-                    policy_path=str(policy_path),
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug("[SandboxWin] %s deny/allow 路径 WRITE_DAC 增量检测失败 (非致命)", sandbox_id, exc_info=True)
-            # install 预装读 ACL 的路径
-            try:
-                _preinstalled = win_setup.get_preinstalled_read_paths()
-            except Exception:  # noqa: BLE001 - best-effort, 读注册表失败不阻断创建
-                _preinstalled = set()
+            # Preinstalled read-only tool paths need no runtime DACL mutation.
+            _preinstalled = win_setup.get_preinstalled_read_paths()
+            _all_acl_paths = list(dict.fromkeys(
+                [p for p in allow_read_paths if os.path.expandvars(p).rstrip("\\/").lower() not in _preinstalled]
+                + deny_read_paths + allow_write_paths + deny_write_paths
+            ))
+            win_setup.ensure_acl_policy_paths_authorized(
+                _all_acl_paths,
+                proxy_port_start=policy.windows.proxy.port_range_start,
+                proxy_port_end=policy.windows.proxy.port_range_end,
+                policy_path=str(policy_path),
+                allow_elevation=False,
+            )
             _t_acl0 = time.perf_counter()
             desktop_data_dir = win_acl.resolve_desktop_data_dir()
 
