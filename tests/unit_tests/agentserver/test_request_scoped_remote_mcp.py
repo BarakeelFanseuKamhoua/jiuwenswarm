@@ -30,6 +30,13 @@ from jiuwenswarm.common.mcp_config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _allow_loopback_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests use 127.0.0.1 connector URLs; allow loopback MCP explicitly
+    so the request-scoped SSRF guard does not reject them."""
+    monkeypatch.setenv("JIUWENSWARM_ALLOW_LOOPBACK_MCP", "1")
+
+
 def _sse_config() -> dict:
     return {
         "name": "baidu-netdisk",

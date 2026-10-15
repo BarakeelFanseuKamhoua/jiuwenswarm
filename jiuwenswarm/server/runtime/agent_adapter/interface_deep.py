@@ -2080,6 +2080,17 @@ class _RequestMcpToolBuffers:
     seen_names: set[str]
 
 
+@dataclass
+class _RequestMcpAppendContext:
+    """One-request MCP tool-append shared context (G.FNM.03)."""
+
+    request: AgentRequest
+    request_scope: str
+    buffers: _RequestMcpToolBuffers
+    replaceable_tool_ids: frozenset[str]
+    empty_registration: OfficeClawMcpRegistration | None = None
+
+
 class JiuWenSwarmDeepAdapter:
     SESSION_ADAPTER_IDLE_TTL_SEC = 2 * 60 * 60
     SESSION_ADAPTER_EVICT_BATCH_SIZE = 3
@@ -2236,6 +2247,12 @@ class JiuWenSwarmDeepAdapter:
         # adapter. Used for safe short-name cleanup and diagnostics; invoke
         # allowlisting is enforced via bind_active_office_claw_mcp_tools.
         self._active_office_claw_mcp: OfficeClawMcpRegistration | None = None
+        # Tool ids installed by an in-flight request-scoped registration that has
+        # not yet been published as the active registration. A later request for
+        # the same session adapter may replace these short-name bindings (they
+        # belong to a superseded request), unlike foreign request-scoped tools
+        # which must fail closed.
+        self._pending_office_claw_tool_ids: set[str] = set()
         # Tenant tip namespace for Track-B env reads (sync_agents_configs).
         # Defaults match unbound single-tenant; AgentManager / copy_tenant_env_bindings_from
         # overwrite for per-agent scopes.
@@ -4033,17 +4050,18 @@ class JiuWenSwarmDeepAdapter:
 
     async def _append_identity_pinned_office_claw_tools(
         self,
-        request: AgentRequest,
+        ctx: _RequestMcpAppendContext,
         raw_config: dict[str, Any],
-        request_scope: str,
-        buffers: _RequestMcpToolBuffers,
-        replaceable_tool_ids: frozenset[str],
-        empty_registration: OfficeClawMcpRegistration | None = None,
         *,
         yield_to_existing: bool = False,
     ) -> str:
         """Register identity-pinned office-claw system tools. Returns invocation_id or '-'."""
 
+        request = ctx.request
+        request_scope = ctx.request_scope
+        buffers = ctx.buffers
+        replaceable_tool_ids = ctx.replaceable_tool_ids
+        empty_registration = ctx.empty_registration
         tool_ids = buffers.tool_ids
         tool_names = buffers.tool_names
         registered_tools = buffers.registered_tools
@@ -4096,6 +4114,9 @@ class JiuWenSwarmDeepAdapter:
             tool_names.append(tool_name)
             registered_tools.append(tool)
             self._install_office_claw_ability_card(card, replaceable_tool_ids)
+            pending = getattr(self, "_pending_office_claw_tool_ids", None)
+            if pending is not None:
+                pending.add(tool_id)
         request_env = params.get("env") if isinstance(params.get("env"), dict) else {}
         return str(request_env.get("OFFICE_CLAW_INVOCATION_ID") or "").strip() or "-"
 
@@ -4119,18 +4140,19 @@ class JiuWenSwarmDeepAdapter:
 
     async def _append_request_mcp_server_tools(
         self,
-        request: AgentRequest,
+        ctx: _RequestMcpAppendContext,
         request_mcp_servers: dict[str, dict[str, Any]],
-        request_scope: str,
-        buffers: _RequestMcpToolBuffers,
         invocation_id: str,
-        replaceable_tool_ids: frozenset[str],
-        empty_registration: OfficeClawMcpRegistration | None = None,
         *,
         skip_office_claw: bool = False,
     ) -> str:
         """Register request_mcp_servers tools. Returns possibly updated invocation_id."""
 
+        request = ctx.request
+        request_scope = ctx.request_scope
+        buffers = ctx.buffers
+        replaceable_tool_ids = ctx.replaceable_tool_ids
+        empty_registration = ctx.empty_registration
         tool_ids = buffers.tool_ids
         tool_names = buffers.tool_names
         registered_tools = buffers.registered_tools
@@ -4234,13 +4256,16 @@ class JiuWenSwarmDeepAdapter:
                 tool_ids.append(tool_id)
                 tool_names.append(tool_name)
                 registered_tools.append(tool)
+                pending = getattr(self, "_pending_office_claw_tool_ids", None)
+                if pending is not None:
+                    pending.add(tool_id)
                 try:
                     self._install_office_claw_ability_card(card, replaceable_tool_ids)
                 except OfficeClawMcpBuiltinNameConflict as exc:
                     # 与内置工具撞名（如 filesystem 连接器的 read_file 撞内置
                     # read_file）：仅跳过该工具，不回滚整次注册——否则已注册好
                     # 的同连接器/其他连接器工具会被一并清掉，导致 tools_search 0命中
-                    # 注意：仅对“内置撞名”降级，对外部短名冲突（foreign request-scoped）仍 raise
+                    # 注意：仅对"内置撞名"降级，对外部短名冲突（foreign request-scoped）仍 raise
                     # RuntimeError 走外层 fail-closed 回滚。
                     try:
                         tool_ids.pop()
@@ -4248,6 +4273,9 @@ class JiuWenSwarmDeepAdapter:
                         registered_tools.pop()
                     except IndexError:
                         pass
+                    pending = getattr(self, "_pending_office_claw_tool_ids", None)
+                    if pending is not None:
+                        pending.discard(tool_id)
                     try:
                         Runner.resource_mgr.remove_tool(tool_id)
                     except Exception as cleanup_exc:
@@ -4423,6 +4451,9 @@ class JiuWenSwarmDeepAdapter:
                     tool_ids.append(tool_id)
                     tool_names.append(tool_name)
                     registered_tools.append(tool)
+                    pending = getattr(self, "_pending_office_claw_tool_ids", None)
+                    if pending is not None:
+                        pending.add(tool_id)
                     try:
                         self._install_office_claw_ability_card(
                             card,
@@ -4436,6 +4467,9 @@ class JiuWenSwarmDeepAdapter:
                             registered_tools.pop()
                         except IndexError:
                             pass
+                        pending = getattr(self, "_pending_office_claw_tool_ids", None)
+                        if pending is not None:
+                            pending.discard(tool_id)
                         try:
                             Runner.resource_mgr.remove_tool(tool_id)
                         except Exception as cleanup_exc:
@@ -4464,24 +4498,23 @@ class JiuWenSwarmDeepAdapter:
                     [str(t.get("name") or "") for t in tool_defs],
                 )
             if leftover_servers:
-                invocation_id = await self._append_request_mcp_server_tools(
-                    request,
-                    leftover_servers,
-                    request_scope,
-                    install_buffers,
-                    invocation_id,
-                    replaceable_tool_ids,
+                append_ctx = _RequestMcpAppendContext(
+                    request=request,
+                    request_scope=request_scope,
+                    buffers=install_buffers,
+                    replaceable_tool_ids=replaceable_tool_ids,
                     empty_registration=empty_registration,
+                )
+                invocation_id = await self._append_request_mcp_server_tools(
+                    append_ctx,
+                    leftover_servers,
+                    invocation_id,
                     skip_office_claw=office_claw_config is not None,
                 )
             if office_claw_config is not None:
                 invocation_id = await self._append_identity_pinned_office_claw_tools(
-                    request,
+                    append_ctx,
                     office_claw_config,
-                    request_scope,
-                    install_buffers,
-                    replaceable_tool_ids,
-                    empty_registration=empty_registration,
                     yield_to_existing=True,
                 )
             registration = _build_registration()
@@ -4652,27 +4685,26 @@ class JiuWenSwarmDeepAdapter:
             )
 
             # --- Source 1: 自带 office-claw MCP（identity-pinned）。 ---
+            append_ctx = _RequestMcpAppendContext(
+                request=request,
+                request_scope=request_scope,
+                buffers=install_buffers,
+                replaceable_tool_ids=replaceable_tool_ids,
+                empty_registration=empty_registration,
+            )
             if raw_config is not None:
                 invocation_id = await self._append_identity_pinned_office_claw_tools(
-                    request,
+                    append_ctx,
                     raw_config,
-                    request_scope,
-                    install_buffers,
-                    replaceable_tool_ids,
-                    empty_registration=empty_registration,
                 )
 
             # --- Source 2: 用户连接器（request_mcp_servers）。 ---
             # 单连接器失败不中断整次注册（对齐 Relay 的 per-connector skip 语义）。
             if request_mcp_servers is not None:
                 invocation_id = await self._append_request_mcp_server_tools(
-                    request,
+                    append_ctx,
                     request_mcp_servers,
-                    request_scope,
-                    install_buffers,
                     invocation_id,
-                    replaceable_tool_ids,
-                    empty_registration=empty_registration,
                     skip_office_claw=raw_config is not None,
                 )
 
@@ -4781,9 +4813,10 @@ class JiuWenSwarmDeepAdapter:
 
     def _owned_office_claw_tool_ids(self) -> frozenset[str]:
         active = self._active_office_claw_mcp
-        if active is None:
-            return frozenset()
-        return frozenset(active.tool_ids)
+        owned = set(getattr(self, "_pending_office_claw_tool_ids", None) or ())
+        if active is not None:
+            owned.update(active.tool_ids)
+        return frozenset(owned)
 
     def _install_office_claw_ability_card(
         self,
@@ -4906,6 +4939,9 @@ class JiuWenSwarmDeepAdapter:
         for registered_tool in registration.tool_instances:
             unregister_live_office_claw_tool_instance(registered_tool)
         for tool_id in registration.tool_ids:
+            pending = getattr(self, "_pending_office_claw_tool_ids", None)
+            if pending is not None:
+                pending.discard(tool_id)
             try:
                 Runner.resource_mgr.remove_tool(tool_id)
             except Exception as exc:
