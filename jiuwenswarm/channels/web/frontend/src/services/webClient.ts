@@ -9,8 +9,8 @@ import {
   WsResponse,
 } from '../types';
 import { getWsBase } from '../utils/env';
-import { resolveUserId } from '../utils/userId';
 import i18n from '../i18n';
+import { appendRuntimeScopeQuery } from './runtimeScope';
 import { GoalRecord } from '../types/goal';
 import { createSessionEventGate } from './sessionEventGate';
 
@@ -583,11 +583,9 @@ class WebClient {
     if (options.apiBase) params.set('api_base', options.apiBase);
     if (options.model) params.set('model', options.model);
     if (options.projectDir) params.set('project_dir', options.projectDir);
-    // user_id 来自 URL ?user_id= 或 localStorage（见 utils/userId.ts），
-    // 供 gateway 为 faas 注入 X-Session-Context（CreateSandbox 绑定用户标识）。
-    // 浏览器 new WebSocket 无法设置自定义 header，只能走 query string。
-    const userId = resolveUserId();
-    if (userId) params.set('user_id', userId);
+    // 浏览器 new WebSocket 无法设置自定义 header，身份走 query：
+    // user_id / group_id / bot_id（见 runtimeScope.ts；个人版可仅有 user_id）。
+    appendRuntimeScopeQuery(params);
     const query = params.toString();
     const target = `${base}${path}`;
     return query ? `${target}?${query}` : target;

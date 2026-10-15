@@ -47,6 +47,7 @@ from logging.handlers import BaseRotatingHandler
 from ruamel.yaml import YAML
 
 from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+from jiuwenswarm.edition import is_enterprise
 from jiuwenswarm.common.runtime_log_filter import install_runtime_log_filter
 
 _LOG_FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -1757,16 +1758,39 @@ def get_root_dir() -> Path:
     return _root_dir
 
 
-def get_agent_workspace_dir() -> Path:
+def get_agent_workspace_dirname() -> str:
+    """Agent workspace directory name under ``agent/``.
+
+    - 个人版: ``workspace``
+    - 企业版: ``jiuwenclaw_workspace``
+    """
+    return "jiuwenclaw_workspace" if is_enterprise() else "workspace"
+
+
+def get_agent_workspace_dir(tenant_key: str | None = None) -> Path:
     """Get the agent workspace directory path.
 
     This is the DeepAgent standard workspace directory under the agent root.
     It contains standard nodes like skills, memory, todo, messages, etc.
 
-    Returns:
-        Path to agent workspace: ~/.jiuwenswarm/agent/workspace
+    - 个人版: ``~/.jiuwenswarm/agent/workspace``
+    - 企业版: ``~/.jiuwenswarm/workspace_{tenant_key}/agent/jiuwenclaw_workspace``
+
+    ``tenant_key`` 可选：显式传入时按该租户解析；未传时优先读
+    ``TenantContext`` 绑定路径，再兜底 ``get_agent_root_dir() / dirname``。
     """
-    return get_agent_root_dir() / "workspace"
+    if tenant_key is None:
+        try:
+            from jiuwenswarm.server.runtime.tenant_context import TenantContext
+
+            bound = TenantContext.current_agent_workspace_root()
+            if bound is not None:
+                return bound
+        except ImportError:
+            logger.debug(
+                "tenant_context unavailable for workspace bind", exc_info=True
+            )
+    return get_agent_root_dir(tenant_key) / get_agent_workspace_dirname()
 
 
 def get_default_project_workspace_dir() -> Path:
@@ -1803,8 +1827,28 @@ def get_default_project_session_workspace_dir(session_id: str | None = None) -> 
     return workspace
 
 
-def get_agent_root_dir() -> Path:
-    return get_user_workspace_dir() / "agent"
+def get_agent_root_dir(tenant_key: str | None = None) -> Path:
+    """Get the agent root directory path.
+
+    - 个人版: ``~/.jiuwenswarm/agent/``
+    - 企业版: ``~/.jiuwenswarm/workspace_{tenant_key}/agent/``
+
+    ``tenant_key`` 可选：显式传入时按该租户解析；未传时优先读
+    ``TenantContext`` 绑定路径，再兜底 ``get_multi_tenant_user_workspace_dir()``
+    （个人版即 ``get_user_workspace_dir()``，企业版未绑定则为 default 三元组）。
+    """
+    if tenant_key is None:
+        try:
+            from jiuwenswarm.server.runtime.tenant_context import TenantContext
+
+            bound = TenantContext.current_agent_root()
+            if bound is not None:
+                return bound
+        except ImportError:
+            logger.debug(
+                "tenant_context unavailable for agent root bind", exc_info=True
+            )
+    return get_multi_tenant_user_workspace_dir(tenant_key) / "agent"
 
 
 def get_agent_home_dir() -> Path:
@@ -2343,8 +2387,13 @@ def get_builtin_skills_dir() -> Path:
     return fallback_path
 
 
-def get_agent_sessions_dir() -> Path:
-    return get_agent_root_dir() / "sessions"
+def get_agent_sessions_dir(tenant_key: str | None = None) -> Path:
+    """Get ``<agent_root>/sessions``.
+
+    ``tenant_key`` 可选：显式传入时按该租户解析；未传时走
+    ``get_agent_root_dir()``（含 TenantContext 绑定与兜底）。
+    """
+    return get_agent_root_dir(tenant_key) / "sessions"
 
 
 # 当前 git 分支解析（带短 TTL 缓存），用于 /resume 按分支过滤会话。
@@ -3122,6 +3171,135 @@ def wait_for_pid_exit(pid: int, timeout: float = 60.0) -> None:
                 return
             time.sleep(0.5)
     logger.warning("process %d did not exit within %.1f seconds", pid, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant workspace paths (tenant_key = group_id::bot_id::user_id)
+# ---------------------------------------------------------------------------
+
+_TENANT_KEY_SEP = "::"
+
+
+def normalize_tenant_key_part(value: str | None, *, default: str = "default") -> str:
+    text = default if value is None else str(value).strip() or default
+    return text
+
+
+def build_tenant_key(
+    group_id: str | None = None,
+    bot_id: str | None = None,
+    user_id: str | None = None,
+) -> str:
+    """Compose ``tenant_key = "{group_id}::{bot_id}::{user_id}"``."""
+    return _TENANT_KEY_SEP.join(
+        (
+            normalize_tenant_key_part(group_id),
+            normalize_tenant_key_part(bot_id),
+            normalize_tenant_key_part(user_id),
+        )
+    )
+
+
+def get_agent_workspace_relative_dir() -> Path:
+    """Relative agent workspace under a tenant root."""
+    return Path("agent") / get_agent_workspace_dirname()
+
+
+def get_agent_root_relative_dir() -> Path:
+    return Path("agent")
+
+
+def get_agent_sessions_relative_dir() -> Path:
+    return Path("agent") / "sessions"
+
+
+def _require_tenant_key(tenant_key: str | None) -> str:
+    text = str(tenant_key or "").strip()
+    if not text:
+        raise ValueError(f"tenant_key required: tenant_key={tenant_key!r}")
+    if any(token in text for token in ("\x00", "/", "\\")) or text in {".", ".."}:
+        raise ValueError(f"tenant_key must not contain path syntax: {text!r}")
+    return text
+
+
+def _effective_tenant_key(tenant_key: str | None = None) -> str:
+    """Explicit tenant_key > bound TenantContext > personal default."""
+    if tenant_key is not None:
+        return _require_tenant_key(tenant_key)
+    try:
+        from jiuwenswarm.server.runtime.tenant_context import TenantContext
+
+        bound = TenantContext.current_tenant_key()
+        if bound:
+            return _require_tenant_key(bound)
+    except ImportError:
+        pass
+    return build_tenant_key()
+
+
+def get_multi_tenant_user_workspace_dir(tenant_key: str | None = None) -> Path:
+    """Tenant workspace root.
+
+    - Enterprise: ``~/.jiuwenswarm/workspace_{tenant_key}``
+    - Personal: develop layout unchanged (``~/.jiuwenswarm``)
+    """
+    if is_enterprise():
+        tk = _effective_tenant_key(tenant_key)
+        return get_user_workspace_dir() / f"workspace_{tk}"
+    return get_user_workspace_dir()
+
+
+def seed_tenant_agent_workspace(tenant_root: Path) -> None:
+    """为租户工作区补种 DeepAgent 标准模板文件（幂等，已存在一律跳过）。
+
+    ``prepare_workspace`` 只初始化默认工作区（个人版 ``~/.jiuwenswarm``），
+    企业版各租户目录（``workspace_{tenant_key}``）由 ``TenantAgentPool`` 懒创建，
+    此前从未播种 AGENT/SOUL/IDENTITY/HEARTBEAT/USER/MEMORY.md 等模板。
+    首次进入某租户请求时调用本函数补齐，使 write_memory/read_memory 等记忆工具
+    有完整的工作区骨架。
+    """
+    workspace = Path(tenant_root) / get_agent_workspace_relative_dir()
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    package_root = _find_package_root()
+    if package_root is None:
+        logger.warning("seed_tenant_agent_workspace: package root not found, skip seeding")
+        return
+    template_workspace = package_root / "resources" / "agent" / "workspace"
+    if not template_workspace.is_dir():
+        logger.warning(
+            "seed_tenant_agent_workspace: template missing: %s, skip seeding",
+            template_workspace,
+        )
+        return
+
+    resolved_lang = _resolve_preferred_language(get_config_file(), None)
+    suffix = "_ZH" if resolved_lang == "zh" else "_EN"
+    # (模板内相对路径, 落盘相对路径)，多语言文件去掉 _ZH/_EN 后缀
+    entries: list[tuple[str, str]] = [
+        (f"AGENT{suffix}.md", "AGENT.md"),
+        (f"HEARTBEAT{suffix}.md", "HEARTBEAT.md"),
+        (f"IDENTITY{suffix}.md", "IDENTITY.md"),
+        (f"SOUL{suffix}.md", "SOUL.md"),
+        ("USER.md", "USER.md"),
+        (f"memory/MEMORY{suffix}.md", "memory/MEMORY.md"),
+    ]
+    added: list[str] = []
+    for src_rel, dst_rel in entries:
+        src = template_workspace / src_rel
+        if not src.is_file():
+            continue
+        dst = workspace / dst_rel
+        if dst.exists():
+            continue
+        try:
+            shutil.copy2(src, dst)
+            added.append(dst_rel)
+        except OSError as e:
+            logger.warning("seed_tenant_agent_workspace: copy %s failed: %s", dst_rel, e)
+    if added:
+        logger.info("seed_tenant_agent_workspace: %s -> %s", ", ".join(added), workspace)
 
 
 logger = logging.getLogger(__name__)

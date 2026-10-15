@@ -1,29 +1,61 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""多租户 AgentManager 池，按 ``tenant_key`` 缓存实例.
+
+``tenant_key = "{group_id}::{bot_id}::{user_id}"``。缺省字段补
+``\"default\"``，个人版在三元组缺失时仍可兼容为单一逻辑租户。
+"""
+
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator, Hashable
+from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
+from jiuwenswarm.common.utils import (
+    build_tenant_key,
+    get_multi_tenant_user_workspace_dir,
+    normalize_tenant_key_part,
+    seed_tenant_agent_workspace,
+)
+from jiuwenswarm.edition import is_enterprise
+from jiuwenswarm.infrastructure.async_lru_cache import AsyncLRUCache
 from jiuwenswarm.server.runtime.agent_manager import AgentManager
+from jiuwenswarm.server.runtime.tenant_context import TenantContext
 
 logger = logging.getLogger(__name__)
 
 
 class TenantAgentPool:
-    """AgentManager 管理器（单例）.
+    """多租户 AgentManager 管理器（单例）.
 
     职责：
-    1. 管理 AgentManager 实例的创建和生命周期
-    2. 提供统一的函数调用接口
-    3. 调用 AgentManager 的方法（简单分发）
+    1. 按 ``tenant_key`` 用 LRU 创建 / 缓存多个 ``AgentManager``
+    2. 请求进入时绑定 ``TenantContext``，再分发到对应 Manager
+    3. 管理实例生命周期（cleanup / 测试重置）
+
+    每个 AgentManager 仍管理该租户内多个 Agent（按 channel_id 等区分）。
     """
 
     _instance: ClassVar[TenantAgentPool | None] = None
 
-    def __init__(self) -> None:
-        # 单个 AgentManager 实例
-        self._agent_manager = AgentManager()
-        logger.info("[TenantAgentPool] Initialized with AgentManager")
+    def __init__(
+        self,
+        cache_max_size: int | None = None,
+        cache_ttl: int | None = None,
+    ) -> None:
+        # LRU 缓存: key=tenant_key, value=AgentManager
+        # 默认 None：不限制容量与 TTL，避免长阻塞（如 ask_user_question）期间误淘汰
+        self._agent_wrappers = AsyncLRUCache(
+            max_size=cache_max_size,
+            ttl_seconds=cache_ttl,
+        )
+        self._locks: dict[Hashable, asyncio.Lock] = {}
+        self._lock_loops: dict[Hashable, asyncio.AbstractEventLoop] = {}
+        self._global_lock = asyncio.Lock()
 
     @classmethod
     def get_instance(cls) -> "TenantAgentPool":
@@ -34,14 +66,175 @@ class TenantAgentPool:
         return cls._instance
 
     @classmethod
+    def peek_instance(cls) -> "TenantAgentPool | None":
+        """返回已初始化的单例；若尚未创建则返回 None（不触发构造）."""
+        return cls._instance
+
+    @classmethod
     def reset_instance(cls) -> None:
         """重置单例（仅用于测试）."""
         if cls._instance is not None:
             logger.info("[TenantAgentPool] Resetting singleton instance")
+            try:
+                # 避免 asyncio.run / 残留 task 在 pytest 下触发 unclosed loop
+                cls._instance._agent_wrappers = AsyncLRUCache(
+                    max_size=None,
+                    ttl_seconds=None,
+                )
+            except Exception:
+                logger.debug(
+                    "[TenantAgentPool] reset_instance cache replace failed",
+                    exc_info=True,
+                )
+            cls._instance._locks.clear()
+            cls._instance._lock_loops.clear()
         cls._instance = None
 
+    def _get_lock(self, cache_key: Hashable) -> asyncio.Lock:
+        """按 cache_key 取创建锁；若 event loop 已切换则重建锁."""
+        current_loop = asyncio.get_running_loop()
+        if cache_key not in self._locks:
+            self._locks[cache_key] = asyncio.Lock()
+            self._lock_loops[cache_key] = current_loop
+        else:
+            stored_loop = self._lock_loops.get(cache_key)
+            if stored_loop is not current_loop:
+                self._locks[cache_key] = asyncio.Lock()
+                self._lock_loops[cache_key] = current_loop
+        return self._locks[cache_key]
+
+    @staticmethod
+    def normalize_part(value: str | None, *, default: str = "default") -> str:
+        """归一化三元组字段：空则回落 default."""
+        return normalize_tenant_key_part(value, default=default)
+
+    @classmethod
+    def extract_tenant_key(cls, request: Any) -> str:
+        """从请求三元组拼出 tenant_key（有则用、无则 default）."""
+        group_id, bot_id, user_id = cls.extract_triple(request)
+        return build_tenant_key(group_id, bot_id, user_id)
+
+    @classmethod
+    def extract_triple(cls, request: Any) -> tuple[str, str, str]:
+        """从请求提取 (group_id, bot_id, user_id)，缺省补 default.
+
+        字段来源：
+        - group_id: ``group_id`` / ``chat_id`` / metadata
+        - bot_id: ``bot_id`` / ``app_id`` / metadata
+        - user_id: ``user_id`` / metadata
+        """
+        meta = getattr(request, "metadata", None)
+        meta = meta if isinstance(meta, dict) else {}
+        routing = meta.get("routing") if isinstance(meta.get("routing"), dict) else {}
+
+        def _pick(*names: str) -> str | None:
+            for name in names:
+                val = getattr(request, name, None)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+                for src in (meta, routing):
+                    mval = src.get(name)
+                    if mval is not None and str(mval).strip():
+                        return str(mval).strip()
+            return None
+
+        group_id = _pick("group_id", "chat_id")
+        bot_id = _pick("bot_id", "app_id")
+        user_id = _pick("user_id")
+        return (
+            cls.normalize_part(group_id),
+            cls.normalize_part(bot_id),
+            cls.normalize_part(user_id),
+        )
+
+    async def _ensure_agent_manager(self, tenant_key: str) -> AgentManager:
+        """确保 ``tenant_key`` 对应的 AgentManager 已创建（双检锁 + LRU）."""
+        cache_key = tenant_key
+        lock = self._get_lock(cache_key)
+        async with lock:
+            cached = await self._agent_wrappers.get(cache_key)
+            if cached is not None:
+                return cached
+
+            logger.info(
+                "[TenantAgentPool] creating AgentManager tenant_key=%s enterprise=%s",
+                tenant_key,
+                is_enterprise(),
+            )
+            # 企业版：懒建 workspace_{tenant_key} 并补种模板；个人版路径不变，无需播种
+            if is_enterprise():
+                tenant_root = get_multi_tenant_user_workspace_dir(tenant_key)
+                seed_tenant_agent_workspace(tenant_root)
+
+            manager = AgentManager()
+            await self._agent_wrappers.put(cache_key, manager)
+
+            # LRU 淘汰后清理对应创建锁，避免锁表无限增长
+            async with self._global_lock:
+                active_keys = await self._agent_wrappers.keys()
+                stale = [k for k in self._locks if k not in active_keys]
+                for stale_key in stale:
+                    self._locks.pop(stale_key, None)
+                    self._lock_loops.pop(stale_key, None)
+
+            return manager
+
+    async def adopt_manager(
+        self, tenant_key: str, manager: AgentManager
+    ) -> AgentManager:
+        """若槽位为空，将已有 Manager 登记到 ``tenant_key``（不覆盖）.
+
+        供 ``AgentRuntime.start`` 登记启动时的默认租户 Manager，
+        避免请求路径再 ``new`` 一份与 Runtime 脱节。
+        """
+        key = str(tenant_key).strip() or build_tenant_key()
+        lock = self._get_lock(key)
+        async with lock:
+            cached = await self._agent_wrappers.get(key)
+            if cached is not None:
+                return cached
+            await self._agent_wrappers.put(key, manager)
+            return manager
+
+    async def get_agent_manager(self, tenant_key: str | None = None) -> AgentManager:
+        """获取指定租户的 AgentManager（不存在则懒创建）."""
+        key = (
+            str(tenant_key).strip()
+            if tenant_key is not None and str(tenant_key).strip()
+            else build_tenant_key()
+        )
+        return await self._ensure_agent_manager(key)
+
+    async def get_cached_agent_manager(
+        self, tenant_key: str | None = None
+    ) -> AgentManager | None:
+        """异步读取已有 Manager，不自动创建.
+
+        控制面 handler 与缓存同 loop，须 await；不可在同 loop 上同步 future.result。
+        """
+        key = (
+            str(tenant_key).strip()
+            if tenant_key is not None and str(tenant_key).strip()
+            else build_tenant_key()
+        )
+        return await self._agent_wrappers.get(key)
+
+    @asynccontextmanager
+    async def tenant_scope(self, request: Any):
+        """绑定 TenantContext，yield 该租户的 AgentManager；退出时 reset 并续约 LRU."""
+        tenant_key = self.extract_tenant_key(request)
+        ctx = TenantContext.bind(tenant_key)
+        try:
+            manager = await self._ensure_agent_manager(tenant_key)
+            try:
+                yield manager
+            finally:
+                await self._agent_wrappers.touch_if_same(tenant_key, manager)
+        finally:
+            ctx.reset()
+
     async def process_message(self, request: AgentRequest) -> AgentResponse:
-        """处理非流式请求（简单分发到 AgentManager）.
+        """处理非流式请求：进租户作用域后分发到对应 AgentManager.
 
         Args:
             request: AgentRequest 对象
@@ -51,18 +244,24 @@ class TenantAgentPool:
         """
         try:
             logger.info(
-                "[TenantAgentPool] process_message called | request_id=%s | channel_id=%s",
+                "[TenantAgentPool] process_message request_id=%s channel_id=%s "
+                "tenant_key=%s",
                 request.request_id,
                 request.channel_id,
+                self.extract_tenant_key(request),
             )
-            return await self._agent_manager.process_message(request)
+            async with self.tenant_scope(request) as agent_manager:
+                return await agent_manager.process_message(request)
         except Exception as e:
-            logger.error(f"[TenantAgentPool] Error in process_message: {e}", exc_info=True)
-            # 可以选择返回错误响应或重新抛出异常
+            logger.error(
+                "[TenantAgentPool] Error in process_message: %s", e, exc_info=True
+            )
             raise
 
-    async def process_message_stream(self, request: AgentRequest):
-        """处理流式请求（简单分发到 AgentManager）.
+    async def process_message_stream(
+        self, request: AgentRequest
+    ) -> AsyncIterator[Any]:
+        """处理流式请求：进租户作用域后分发到对应 AgentManager.
 
         Args:
             request: AgentRequest 对象
@@ -72,18 +271,65 @@ class TenantAgentPool:
         """
         try:
             logger.info(
-                "[TenantAgentPool] process_message_stream called | request_id=%s | channel_id=%s",
+                "[TenantAgentPool] process_message_stream request_id=%s "
+                "channel_id=%s tenant_key=%s",
                 request.request_id,
                 request.channel_id,
+                self.extract_tenant_key(request),
             )
-            async for chunk in self._agent_manager.process_message_stream(request):
-                yield chunk
+            async with self.tenant_scope(request) as agent_manager:
+                async for chunk in agent_manager.process_message_stream(request):
+                    yield chunk
         except Exception as e:
-            logger.error(f"[TenantAgentPool] Error in process_message_stream: {e}", exc_info=True)
+            logger.error(
+                "[TenantAgentPool] Error in process_message_stream: %s",
+                e,
+                exc_info=True,
+            )
             raise
 
+    async def reload_tenant_config(
+        self,
+        tenant_key: str,
+        config_base: Any = None,
+        env_overrides: dict | None = None,
+    ) -> None:
+        """重新加载指定租户的 Agent 配置（懒创建 Manager 后调用 reload）."""
+        manager = await self._ensure_agent_manager(tenant_key)
+        ctx = TenantContext.bind(tenant_key)
+        try:
+            reload = getattr(manager, "reload_agents_config", None)
+            if callable(reload):
+                await reload(config_base, env_overrides)
+        finally:
+            ctx.reset()
+
     async def cleanup(self) -> None:
-        """清理资源."""
+        """清理所有缓存的 AgentManager（shutdown 或重置）."""
         logger.info("[TenantAgentPool] Cleaning up...")
-        await self._agent_manager.cleanup()
+        # 用 snapshot（不过滤过期、不删条目），避免 keys()/get() 在 TTL 下
+        # 先丢掉过期项导致跳过 manager.cleanup()。
+        managers = self._agent_wrappers.snapshot_values_nowait()
+        for manager in managers:
+            if not isinstance(manager, AgentManager):
+                continue
+            try:
+                await manager.cleanup()
+            except Exception as e:
+                logger.warning(
+                    "[TenantAgentPool] AgentManager cleanup failed: %s",
+                    e,
+                )
+        await self._agent_wrappers.clear()
+        self._locks.clear()
+        self._lock_loops.clear()
         logger.info("[TenantAgentPool] Cleanup complete")
+
+    def iter_agent_managers_nowait(self) -> list[AgentManager]:
+        """同步快照当前缓存中的 AgentManager（不创建新实例）."""
+        values = self._agent_wrappers.snapshot_values_nowait()
+        return [v for v in values if isinstance(v, AgentManager)]
+
+    async def get_agent_count(self) -> int:
+        """当前活跃的 AgentManager 实例数量."""
+        return len(self._agent_wrappers)

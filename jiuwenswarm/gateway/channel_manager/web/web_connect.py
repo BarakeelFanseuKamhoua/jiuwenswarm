@@ -1314,6 +1314,21 @@ class WebChannel(BaseWsChannel):
         connection_user_id, _user_id = self._resolve_ws_identity(
             ws, _flat_query, remote, route_type="ws",
         )
+        # 连接级权威身份：user_id + group/bot/gateway（进站时再拆到顶层 / routing）。
+        from jiuwenswarm.common.request_identity import normalize_routing_identity
+        from jiuwenswarm.edition import is_enterprise
+
+        _routing = normalize_routing_identity(
+            _flat_query,
+            {"user_id": connection_user_id} if connection_user_id else None,
+        )
+        setattr(ws, "_web_routing", _routing)
+        if is_enterprise() and not _routing.get("bot_id"):
+            logger.warning(
+                "WebChannel 新连接缺少 bot_id: remote=%s routing=%s",
+                remote,
+                _routing,
+            )
 
         # ── V2: 从 query 提取身份字段，构造默认 RoutingKey ──
         # session_id 和 agent_id 可能在首条消息中更新
@@ -1646,6 +1661,28 @@ class WebChannel(BaseWsChannel):
         # Preserve client top-level is_stream (e.g. command.goal set/resume).
         # chat.send / history.get still become stream in _normalize_gateway_message
         # even when the client omits this field.
+        from jiuwenswarm.common.request_identity import (
+            apply_routing_metadata,
+            normalize_routing_identity,
+        )
+
+        _routing = getattr(ws, "_web_routing", None)
+        if not isinstance(_routing, dict):
+            _routing = normalize_routing_identity(
+                {"user_id": req_user_id} if req_user_id else None,
+            )
+        _meta = apply_routing_metadata(
+            {
+                "query": query,
+                "method": method,
+                # V2: 注入 ws_id 供 MessageHandler 构造 WebDeliveryTarget(ws_id=真值)。
+                "ws_id": getattr(ws, "_jiuwen_ws_id", ""),
+                # 登录会话id（握手时认的)。Gateway据此
+                # 给登录模型挂上**这个用户**的凭据，见 common/auth/passthrough.py。
+                "auth_session": getattr(ws, "_jiuwen_auth_session", "") or "",
+            },
+            _routing,
+        )
         user_message = Message(
             id=req_id,
             type="req",
@@ -1660,16 +1697,7 @@ class WebChannel(BaseWsChannel):
             app_id=_app_id,
             agent_ref={"mode": _mode, "id": _agent_id},
             user_id=req_user_id,
-            metadata={
-                "query": query,
-                "method": method,
-                # V2: 注入 ws_id 供 MessageHandler 构造 WebDeliveryTarget(ws_id=真值)。
-                "ws_id": getattr(ws, "_jiuwen_ws_id", ""),
-                "user_id": req_user_id,
-                # 登录会话id（握手时认的)。Gateway据此
-                # 给登录模型挂上**这个用户**的凭据，见 common/auth/passthrough.py。
-                "auth_session": getattr(ws, "_jiuwen_auth_session", "") or "",
-            },
+            metadata=_meta,
         )
 
         # 发布到 route 或回调
