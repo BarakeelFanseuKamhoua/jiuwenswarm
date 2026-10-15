@@ -32,6 +32,16 @@ _PERMISSIONS_CFG_METHODS: frozenset[ReqMethod] = frozenset(
         ReqMethod.PERMISSIONS_APPROVAL_OVERRIDES_DELETE,
         ReqMethod.PERMISSIONS_NET_GUARD_GET,
         ReqMethod.PERMISSIONS_NET_GUARD_SET,
+        ReqMethod.SECURITY_CONFIG_GET,
+        ReqMethod.SECURITY_CONFIG_INITIALIZE,
+        ReqMethod.SECURITY_CONFIG_SETTINGS_UPDATE,
+        ReqMethod.SECURITY_CONFIG_LOCAL_UPDATE,
+        ReqMethod.SECURITY_CONFIG_MODULE_UPDATE,
+        ReqMethod.SECURITY_CONFIG_PROFILE_UPDATE,
+        ReqMethod.SECURITY_CONFIG_APPLY,
+        ReqMethod.SECURITY_CONFIG_SANDBOX_GET,
+        ReqMethod.SECURITY_CONFIG_SANDBOX_UPDATE,
+        ReqMethod.SECURITY_BUILTIN_GET,
     }
 )
 
@@ -86,8 +96,8 @@ def _net_guard_payload() -> dict[str, Any]:
         "defaults": str(raw.get("defaults") or "allow"),
         "urls": dict(raw.get("urls") or {}) if isinstance(raw.get("urls"), dict) else {},
         "enforce_host_exit": raw.get("enforce_host_exit", True) is not False,
-        "max_request_mb": raw.get("max_request_mb", 10),
-        "timeout_seconds": raw.get("timeout_seconds", 120),
+        "max_request_mb": raw.get("max_request_mb", 1024),
+        "timeout_seconds": raw.get("timeout_seconds", 3600),
     }
     warnings: list[str] = []
     if section["enabled"] and not section["enforce_host_exit"]:

@@ -1298,6 +1298,8 @@ class AgentWebSocketServer:
         # 桌面形态标记：start(listen_tcp=False) 后置位（stdio+命名管道替代 TCP
         # 监听；TCP 形态的「已在运行」守卫是 self._server 非 None，桌面形态用本标记）
         self._desktop_listenerless = False
+        self._startup_complete: asyncio.Event | None = None
+        self._startup_error: Exception | None = None
         # 当前 Gateway 连接，用于 send_push 主动推送
         self._current_ws: Any = None
         self._current_send_lock: asyncio.Lock | None = None
@@ -1410,6 +1412,12 @@ class AgentWebSocketServer:
 
     # ---------- 生命周期 ----------
 
+    def begin_startup(self) -> None:
+        """Desktop channels can open early, but cannot acknowledge readiness yet."""
+        if sys.platform == "win32":
+            self._startup_complete = asyncio.Event()
+            self._startup_error = None
+
     async def start(self, *, listen_tcp: bool = True) -> None:
         """启动 E2A 服务端。优先使用 legacy.server.serve 以与 Gateway 的 legacy client 握手兼容.
 
@@ -1433,6 +1441,20 @@ class AgentWebSocketServer:
         # 延后到这里再导入，避免加载本模块时拉起 auto_harness。
         from jiuwenswarm.agents.harness.common.auto_harness import reset_harness_packages_state
         reset_harness_packages_state()
+
+        if sys.platform == "win32":
+            if self._startup_complete is None:
+                self.begin_startup()
+            try:
+                # Existing desktop stdio clients wait 120s for the handshake.
+                try:
+                    await asyncio.wait_for(self._bootstrap_internal_jiuwenbox(), timeout=100.0)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("Windows 沙箱启动超时, 本地服务未就绪; 请重试并及时完成 UAC 授权") from exc
+            except Exception as exc:
+                self._startup_error = exc
+                self._startup_complete.set()
+                raise
 
         if listen_tcp:
             try:
@@ -1485,9 +1507,11 @@ class AgentWebSocketServer:
             _warmup_checkpointer(), name="checkpointer-warmup"
         )
         # WS 监听已经开放, 现在按 config.yaml::sandbox 的 runtime.enabled +
-        # startup_mode 决定要不要自动把 jiuwenbox 子进程也拉起来。失败不阻塞
-        # 启动 (用户依然可以在 TUI 里跑 /sandbox enable 重试)。
-        await self._bootstrap_internal_jiuwenbox()
+        # Windows startup requires sandbox readiness before acknowledging connections.
+        if sys.platform != "win32":
+            await self._bootstrap_internal_jiuwenbox()
+        elif self._startup_complete is not None:
+            self._startup_complete.set()
 
     async def _bootstrap_internal_jiuwenbox(self) -> None:
         """启动时按 ``config.yaml::sandbox`` 自动拉起 jiuwenbox 子进程。
@@ -1513,9 +1537,7 @@ class AgentWebSocketServer:
         与 :meth:`_handle_sandbox_enable` 的其余差别:
         - 不调用 ``agent_manager.recreate_agent``: 启动阶段还没有任何会话/agent
           实例, 没东西需要重建; 后续会话首次进入时按现有 ``sandbox.url`` 直接装载。
-        - 严格 best-effort: 任何失败 (policy 缺失 / 端口/spawn 失败) 一律记
-          warning, 绝不让 agent-server 自身启动失败 (否则运维误配 yaml 会让整
-          产品起不来, 也无从修复)。
+        - Windows internal 沙箱是启用后的必需依赖; 失败必须阻止成功握手.
         """
         try:
             # sandbox.enabled 门控: false 时整个跳过 (不拉起 box-server, 不触发
@@ -1592,6 +1614,8 @@ class AgentWebSocketServer:
                     effective_policy_file,
                     policy_path,
                 )
+                if sys.platform == "win32":
+                    raise RuntimeError(f"沙箱启动失败: policy 文件不存在: {effective_policy_file}")
                 return
 
             # Windows: policy = 打包基底 (windows-policy.yaml) + workspace 副本
@@ -1660,6 +1684,8 @@ class AgentWebSocketServer:
             # JIUWENBOX_RUNNER_PYTHON 等动态路径 (runner 用的标准 CPython, 非 uv venv).
             sandbox_env = await _build_sandbox_env()
             if sandbox_env is None:
+                if sys.platform == "win32":
+                    raise RuntimeError("沙箱启动失败: 没有可用的 runner Python, 详见 agent-server 日志")
                 return
 
             ok = await self._jiuwenbox_runner.ensure_running(
@@ -1686,6 +1712,8 @@ class AgentWebSocketServer:
                     policy_path,
                     stderr_tail or "(empty)",
                 )
+                if sys.platform == "win32":
+                    raise RuntimeError(f"沙箱服务启动失败 ({host}:{port}): {stderr_tail}")
                 return
 
             # 端口可能在 _allocate_internal_jiuwenbox_port 里换过, 把最终生效
@@ -1744,6 +1772,9 @@ class AgentWebSocketServer:
                 policy_path,
             )
         except Exception:  # noqa: BLE001
+            if sys.platform == "win32":
+                logger.exception("[AgentWebSocketServer] Windows 沙箱初始化失败, 阻止本地服务启动")
+                raise
             logger.exception(
                 "[AgentWebSocketServer] jiuwenbox auto-start raised an "
                 "unexpected error; skipping (用户可在 TUI 里 /sandbox enable 重试)"
@@ -1886,6 +1917,12 @@ class AgentWebSocketServer:
         """
         if remote is None:
             remote = getattr(transport, "remote_address", None)
+        startup = getattr(self, "_startup_complete", None)
+        if startup is not None:
+            await startup.wait()
+            if self._startup_error is not None:
+                await transport.close()
+                raise RuntimeError(f"本地服务初始化失败: {self._startup_error}") from self._startup_error
         logger.info("[AgentWebSocketServer] 新连接: %s", remote)
 
         send_lock = asyncio.Lock()
@@ -5395,7 +5432,96 @@ class AgentWebSocketServer:
         from jiuwenswarm.agents.harness.common.rails.permissions.permissions_config_rpc import \
             dispatch_permissions_config_request
 
-        resp = dispatch_permissions_config_request(request)
+        from jiuwenswarm.server.security_config_rpc import (
+            dispatch_security_config_request,
+            is_security_config_method,
+        )
+        from jiuwenswarm.server.security_config_legacy_rpc import (
+            dispatch_managed_permissions_request,
+            is_managed_permissions_method,
+        )
+        from jiuwenswarm.common.security_config_service import SecurityConfigService
+
+        service = SecurityConfigService()
+        try:
+            managed_legacy = service.is_initialized() and is_managed_permissions_method(request.req_method)
+        except RuntimeError as exc:
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=False, payload={"error": str(exc), "code": "SOURCE_UNAVAILABLE"},
+                metadata=request.metadata,
+            )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+        if is_security_config_method(request.req_method) or managed_legacy:
+            try:
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    if managed_legacy:
+                        payload = await dispatch_managed_permissions_request(
+                            request.req_method, request.params or {},
+                            agent_manager=self._agent_manager,
+                            restart_sandboxes=self._restart_configured_sandboxes,
+                            service=service,
+                        )
+                    else:
+                        payload = await dispatch_security_config_request(
+                            request.req_method, request.params or {},
+                            agent_manager=self._agent_manager,
+                            restart_sandboxes=self._restart_configured_sandboxes,
+                            service=service,
+                        )
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=payload.get("applied", True), payload=payload,
+                    metadata=request.metadata,
+                )
+            except Exception as exc:
+                logger.exception("[security.config] request failed: %s", exc)
+                code = "NOT_FOUND" if isinstance(exc, LookupError) else "BAD_REQUEST" if isinstance(exc, ValueError) else "SECURITY_CONFIG_FAILED"
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": code},
+                    metadata=request.metadata,
+                )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+
+        apply_lock = getattr(self, "_security_config_apply_lock", None)
+        if apply_lock is None:
+            apply_lock = self._security_config_apply_lock = asyncio.Lock()
+        used_legacy_direct = False
+        async with apply_lock:
+            try:
+                if service.is_initialized() and is_managed_permissions_method(request.req_method):
+                    payload = await dispatch_managed_permissions_request(
+                        request.req_method, request.params or {},
+                        agent_manager=self._agent_manager,
+                        restart_sandboxes=self._restart_configured_sandboxes,
+                        service=service,
+                    )
+                    resp = AgentResponse(
+                        request_id=request.request_id, channel_id=request.channel_id,
+                        ok=payload.get("applied", True), payload=payload,
+                        metadata=request.metadata,
+                    )
+                else:
+                    used_legacy_direct = True
+                    resp = dispatch_permissions_config_request(request)
+            except Exception as exc:
+                logger.exception("[security.config] legacy request failed: %s", exc)
+                code = "NOT_FOUND" if isinstance(exc, LookupError) else "BAD_REQUEST" if isinstance(exc, ValueError) else "SOURCE_UNAVAILABLE"
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": code},
+                    metadata=request.metadata,
+                )
 
         # After any successful mutation (delete / update / set / create),
         # reload agent config so the PermissionInterruptRail picks up the
@@ -5405,7 +5531,7 @@ class AgentWebSocketServer:
             get_permissions_read_only_req_methods,
         )
 
-        if resp.ok and request.req_method not in get_permissions_read_only_req_methods():
+        if resp.ok and used_legacy_direct and request.req_method not in get_permissions_read_only_req_methods():
             # 后台异步重载: 不阻塞权限 RPC 回包(避免 reload 慢导致 AgentServer
             # request timed out)。reload_agents_config 内部有 _reload_lock 串行化
             # + fingerprint 去重,fire-and-forget 安全。
@@ -5423,8 +5549,47 @@ class AgentWebSocketServer:
     async def _handle_sandbox_config(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """处理 sandbox.* 配置 E2A 请求 (officeAce 经 WS 控制沙箱开关/启动方式/文件/网络)."""
         from jiuwenswarm.server.sandbox_config_rpc import dispatch_sandbox_config_request
+        from jiuwenswarm.server.security_config_rpc import (
+            dispatch_managed_sandbox_request, is_managed_sandbox_method,
+        )
+        from jiuwenswarm.common.security_config_service import SecurityConfigService
 
-        if request.req_method == ReqMethod.SANDBOX_RESTART:
+        service = SecurityConfigService()
+        try:
+            managed_sandbox = is_managed_sandbox_method(request.req_method) and service.is_initialized()
+        except RuntimeError as exc:
+            resp = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id,
+                ok=False, payload={"error": str(exc), "code": "SOURCE_UNAVAILABLE"},
+                metadata=request.metadata,
+            )
+            wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+            async with send_lock:
+                await send_wire_payload(ws, wire)
+            return
+        if managed_sandbox:
+            try:
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    payload = await dispatch_managed_sandbox_request(
+                        request.req_method, request.params or {},
+                        restart_sandboxes=self._restart_configured_sandboxes,
+                        service=service,
+                    )
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=payload.get("applied", True), payload=payload,
+                    metadata=request.metadata,
+                )
+            except Exception as exc:
+                resp = AgentResponse(
+                    request_id=request.request_id, channel_id=request.channel_id,
+                    ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
+                    metadata=request.metadata,
+                )
+        elif request.req_method == ReqMethod.SANDBOX_RESTART:
             try:
                 payload = await self._restart_configured_sandboxes(request.params or {})
                 resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,

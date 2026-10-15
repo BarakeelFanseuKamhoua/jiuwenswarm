@@ -14,6 +14,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from openjiuwen.harness.security.permission_engine.policy_sources import SOURCE_BUILTIN
+
 from jiuwenswarm.agents.harness.common.rails.interrupt.permission_prompt import (
     build_permission_prompt,
 )
@@ -291,15 +293,24 @@ def build_permission_rail(
     )
     from jiuwenswarm.common.config import get_config
     from jiuwenswarm.common.e2a.acp.acp_tool_updates import build_acp_tool_descriptor
-    from jiuwenswarm.common.utils import get_config_file, get_workspace_dir
+    from jiuwenswarm.common.utils import (
+        get_agent_skills_dir,
+        get_config_dir,
+        get_config_file,
+        get_workspace_dir,
+    )
 
     from jiuwenswarm.common.behavior_security import (
-        ACTIVE_BEHAVIOR, desktop_security_active, runtime_permission_config, skill_confirmation_pending,
+        ACTIVE_BEHAVIOR, cloud_authorization_enabled, desktop_security_active, runtime_permission_config, skill_confirmation_pending,
     )
+    from jiuwenswarm.common.permission_profile import resolve_permission_profile_rules
+
     behavior_enabled = desktop_security_active()
     permission_config = runtime_permission_config(config)
     tools_config = permission_config.setdefault("tools", {})
-    if isinstance(tools_config, dict):
+    composition = permission_config.get("composition")
+    builtin_active = not isinstance(composition, dict) or SOURCE_BUILTIN in composition.get("source_order", [])
+    if isinstance(tools_config, dict) and builtin_active:
         tools_config.setdefault("configure_channel", "allow")
         tools_config.setdefault("get_wechat_login_status", "allow")
     logger.info(
@@ -573,17 +584,23 @@ def build_permission_rail(
                 get_permissions_with_session_overlay,
             )
 
-            snapshot = get_permissions_with_session_overlay(session_id=session_id)
-            snapshot = {**snapshot}
+            snapshot = resolve_permission_profile_rules(
+                get_permissions_with_session_overlay(session_id=session_id)
+            )
             snapshot.pop("strict_tool_command_merge", None)
             if behavior_enabled:
-                # Hot reload updates the rail's runtime config in place. Do not
-                # restore a cloud switch captured when this closure was built.
+                # Composed policies read the live cloud switch. Other hosts use
+                # the rail's current config so hot reload cannot restore stale state.
                 runtime_config = permission_rail._engine.config
+                cloud_enabled = (
+                    cloud_authorization_enabled(get_config())
+                    if isinstance(snapshot.get("composition"), dict)
+                    else runtime_config.get("defer_unmatched") is True
+                )
                 snapshot.update({
                     "enabled": True,
-                    "defer_unmatched": runtime_config.get("defer_unmatched") is True,
-                    "strict_tool_command_merge": runtime_config.get("strict_tool_command_merge") is True,
+                    "defer_unmatched": cloud_enabled,
+                    "strict_tool_command_merge": cloud_enabled,
                 })
             return build_trusted_dirs_permission_config(
                 snapshot,
@@ -616,6 +633,10 @@ def build_permission_rail(
             persist_allow_rule=_persist_allow_rule,
             persist_session_allow_rule=_persist_session_allow_rule,
             resolve_workspace_dir=get_workspace_dir,
+            resolve_immutable_control_roots=lambda: [
+                get_config_dir(),
+                get_agent_skills_dir(),
+            ],
             permission_yaml_path=get_config_file(),
             request_permission_confirmation=_request_permission_confirmation,
             permission_scene_hook=_permission_scene_hook,

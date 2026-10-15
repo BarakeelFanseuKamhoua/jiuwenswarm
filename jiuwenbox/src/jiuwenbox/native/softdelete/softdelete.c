@@ -3,11 +3,19 @@
  *
  * Windows user-mode soft delete. Loaded once into an agent or sandbox
  * process; the CreateProcessInternalW hook then loads it into children.
- * MSYS/Cygwin images such as Git Bash are not injected: any extra DLL
+ * MSYS/Cygwin shells such as Git Bash are not injected: any extra DLL
  * makes their fork wait forever. They are started under a debug loop
- * that loads this DLL into Windows descendants before main runs.
+ * that loads this DLL into Windows descendants before main runs, and
+ * also into short-lived POSIX delete tools those shells spawn (rm,
+ * rmdir, unlink, shred). Those tools unlink in-process and do not fork
+ * like bash, so the ntdll delete hooks can see Git Bash `rm -rf`.
  * Console hosts (conhost.exe) are left alone: injecting them crashes
  * the host and the parent exits with STATUS_DLL_INIT_FAILED.
+ * MinGW images (libwinpthread-1.dll beside the exe, including git.exe)
+ * and explorer.exe are not injected either. They live outside the
+ * install directory and would keep this file locked across an upgrade.
+ * A Git `rm` that holds this DLL is short-lived; overwrite-install still
+ * finds it with Restart Manager on this file, same as other holders.
  *
  * Delete calls are turned into a recycle-bin move, or a same-volume rename
  * into the archive directory. A sandbox process turns a relative name into a
@@ -15,7 +23,11 @@
  * box-server does not share this process's current directory. The file stays
  * when that request fails. The original delete is not called after a
  * successful soft delete. A move that fails leaves the file in place and
- * returns STATUS_ACCESS_DENIED.
+ * returns STATUS_ACCESS_DENIED. NtClose and NtSetInformationFile put the
+ * calling thread's last error back: those calls also run while another
+ * API is cleaning up, and that API still needs its own error. If one
+ * hook cannot be installed, every hook is removed and the loader records
+ * which export failed.
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -278,6 +290,12 @@ static int decode_one(const uint8_t *code, int avail, int *is_rel) {
     if (avail < 1) {
         return -1;
     }
+    /* ENDBR64 / ENDBR32. CET builds of kernelbase start with this. It is
+     * not a branch, so it can be copied into the trampoline. */
+    if (avail >= 4 && code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E
+        && (code[3] == 0xFA || code[3] == 0xFB)) {
+        return 4;
+    }
     for (;;) {
         uint8_t pref;
         if (i >= avail) {
@@ -426,12 +444,17 @@ static int decode_one(const uint8_t *code, int avail, int *is_rel) {
     return -1;
 }
 
+/* Positive length, -1 if the prologue cannot be decoded, -2 if a relative
+ * instruction sits inside the bytes a 5-byte jump would overwrite. */
 static int steal_length(const uint8_t *code, int avail) {
     int total = 0;
     while (total < 5) {
         int rel = 0;
         int n = decode_one(code + total, avail - total, &rel);
-        if (n <= 0 || rel) {
+        if (n == -2 || rel) {
+            return -2;
+        }
+        if (n <= 0) {
             return -1;
         }
         total += n;
@@ -515,7 +538,31 @@ static int write_rel_jmp(uint8_t *at, void *dest) {
     return 1;
 }
 
-static int install_hook(void *target, void *hook_fn) {
+/* jmp qword ptr [rip+0]; dq dest. Valid from any address, so the trampoline
+ * does not have to sit within 2GB of the hooked function. */
+#define ABS_JMP_LEN 14
+#if STOLEN_MAX + ABS_JMP_LEN > 64
+#error trampoline return jump overlaps the relay slot
+#endif
+
+static void write_abs_jmp(uint8_t *at, void *dest) {
+    uint64_t abs_dest = (uint64_t)(uintptr_t)dest;
+    at[0] = 0xFF;
+    at[1] = 0x25;
+    at[2] = 0x00;
+    at[3] = 0x00;
+    at[4] = 0x00;
+    at[5] = 0x00;
+    memcpy(at + 6, &abs_dest, sizeof abs_dest);
+}
+
+static void set_hook_reason(const wchar_t **reason, const wchar_t *text) {
+    if (reason != NULL) {
+        *reason = text;
+    }
+}
+
+static int install_hook(void *target, void *hook_fn, const wchar_t **reason) {
     Hook *hook;
     int stolen;
     uint8_t *page;
@@ -523,16 +570,38 @@ static int install_hook(void *target, void *hook_fn) {
     DWORD old_prot = 0;
     int32_t rel = 0;
     void *jmp_dest;
-    if (g_hook_count >= HOOK_MAX || target == NULL || hook_fn == NULL) {
+    int hook_is_far;
+    set_hook_reason(reason, L"unknown");
+    if (g_hook_count >= HOOK_MAX) {
+        set_hook_reason(reason, L"hook table is full");
+        return 0;
+    }
+    if (target == NULL || hook_fn == NULL) {
+        set_hook_reason(reason, L"target is missing");
         return 0;
     }
     stolen = steal_length((const uint8_t *)target, 48);
-    if (stolen < 5) {
+    if (stolen == -2) {
+        set_hook_reason(reason, L"relative instruction in prologue");
         return 0;
     }
-    page = (uint8_t *)alloc_near(target, 4096);
-    if (page == NULL) {
+    if (stolen < 5) {
+        set_hook_reason(reason, L"prologue could not be decoded");
         return 0;
+    }
+    hook_is_far = !rel32_ok((uint8_t *)target + 5, hook_fn, &rel);
+    page = (uint8_t *)alloc_near(target, 4096);
+    if (page == NULL && hook_is_far) {
+        set_hook_reason(reason, L"no executable page within 2GB of target");
+        return 0;
+    }
+    if (page == NULL) {
+        page = (uint8_t *)VirtualAlloc(
+            NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (page == NULL) {
+            set_hook_reason(reason, L"executable page allocation failed");
+            return 0;
+        }
     }
     hook = &g_hooks[g_hook_count];
     memset(hook, 0, sizeof *hook);
@@ -541,37 +610,31 @@ static int install_hook(void *target, void *hook_fn) {
     hook->stolen = stolen;
     memcpy(hook->saved, target, (size_t)stolen);
     memcpy(page, target, (size_t)stolen);
-    if (!rel32_ok(page + stolen + 5, (uint8_t *)target + stolen, &rel)) {
-        VirtualFree(page, 0, MEM_RELEASE);
-        return 0;
-    }
-    page[stolen] = 0xE9;
-    memcpy(page + stolen + 1, &rel, sizeof rel);
+    write_abs_jmp(page + stolen, (uint8_t *)target + stolen);
 
     relay = page + 64;
-    if (rel32_ok((uint8_t *)target + 5, hook_fn, &rel)) {
+    if (!hook_is_far) {
         jmp_dest = hook_fn;
         hook->relay = NULL;
+    } else if (!rel32_ok((uint8_t *)target + 5, relay, &rel)) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        set_hook_reason(reason, L"no executable page within 2GB of target");
+        return 0;
     } else {
         /* Absolute jump lives next to the target; the 5-byte patch stays in range. */
-        uint64_t abs_dest = (uint64_t)(uintptr_t)hook_fn;
-        relay[0] = 0xFF;
-        relay[1] = 0x25;
-        relay[2] = 0x00;
-        relay[3] = 0x00;
-        relay[4] = 0x00;
-        relay[5] = 0x00;
-        memcpy(relay + 6, &abs_dest, sizeof abs_dest);
+        write_abs_jmp(relay, hook_fn);
         jmp_dest = relay;
         hook->relay = relay;
     }
     if (!VirtualProtect(target, (SIZE_T)stolen, PAGE_EXECUTE_READWRITE, &old_prot)) {
         VirtualFree(page, 0, MEM_RELEASE);
+        set_hook_reason(reason, L"target page protection could not be changed");
         return 0;
     }
     if (!write_rel_jmp((uint8_t *)target, jmp_dest)) {
         VirtualProtect(target, (SIZE_T)stolen, old_prot, &old_prot);
         VirtualFree(page, 0, MEM_RELEASE);
+        set_hook_reason(reason, L"jump to hook is out of range");
         return 0;
     }
     VirtualProtect(target, (SIZE_T)stolen, old_prot, &old_prot);
@@ -860,8 +923,53 @@ static int path_from_object(OBJECT_ATTRIBUTES_ *oa, wchar_t *out, size_t cch) {
     return ok;
 }
 
+/* Keep DOS names for comparisons and IPC; extend only filesystem API inputs.
+ * A process without longPathAware must work even when LongPathsEnabled is 0. */
+static wchar_t *filesystem_path(const wchar_t *path) {
+    wchar_t *full;
+    wchar_t *extended;
+    DWORD n;
+    size_t prefix;
+    int unc;
+    if (path == NULL) {
+        return NULL;
+    }
+    if (wcslen(path) < MAX_PATH || wcsncmp(path, L"\\\\?\\", 4) == 0) {
+        return heap_wcs_dup(path);
+    }
+    full = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, PATH_CAP * sizeof(wchar_t));
+    if (full == NULL) {
+        return NULL;
+    }
+    n = GetFullPathNameW(path, PATH_CAP, full, NULL);
+    if (n == 0 || n >= PATH_CAP) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+    unc = n > 1 && full[0] == L'\\' && full[1] == L'\\';
+    prefix = unc ? 6 : 4;
+    if (n + prefix >= PATH_CAP) {
+        HeapFree(GetProcessHeap(), 0, full);
+        return NULL;
+    }
+    extended = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (n + prefix + 1) * sizeof(wchar_t));
+    if (extended != NULL) {
+        wcscpy_s(extended, n + prefix + 1, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\");
+        wcscat_s(extended, n + prefix + 1, full + (unc ? 2 : 0));
+    }
+    HeapFree(GetProcessHeap(), 0, full);
+    return extended;
+}
+
+static DWORD path_attributes(const wchar_t *path) {
+    wchar_t *api_path = filesystem_path(path);
+    DWORD attr = api_path == NULL ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(api_path);
+    HeapFree(GetProcessHeap(), 0, api_path);
+    return attr;
+}
+
 static int path_exists(const wchar_t *path) {
-    DWORD attr = GetFileAttributesW(path);
+    DWORD attr = path_attributes(path);
     return attr != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -1263,10 +1371,21 @@ static void sanitize_name(const wchar_t *path, wchar_t *out, size_t cch) {
 static int same_volume(const wchar_t *left, const wchar_t *right) {
     wchar_t a[MAX_PATH];
     wchar_t b[MAX_PATH];
-    if (!GetVolumePathNameW(left, a, MAX_PATH) || !GetVolumePathNameW(right, b, MAX_PATH)) {
+    wchar_t dos_a[MAX_PATH];
+    wchar_t dos_b[MAX_PATH];
+    wchar_t *api_left = filesystem_path(left);
+    wchar_t *api_right = filesystem_path(right);
+    int ok = api_left != NULL && api_right != NULL
+        && GetVolumePathNameW(api_left, a, MAX_PATH)
+        && GetVolumePathNameW(api_right, b, MAX_PATH);
+    HeapFree(GetProcessHeap(), 0, api_left);
+    HeapFree(GetProcessHeap(), 0, api_right);
+    if (!ok) {
         return 0;
     }
-    return _wcsicmp(a, b) == 0;
+    to_dos_path(a, dos_a, MAX_PATH);
+    to_dos_path(b, dos_b, MAX_PATH);
+    return _wcsicmp(dos_a, dos_b) == 0;
 }
 
 static int move_to_archive(const wchar_t *dos_path) {
@@ -1313,8 +1432,16 @@ static int move_to_archive(const wchar_t *dos_path) {
         return 0;
     }
     /* No MOVEFILE_COPY_ALLOWED: a cross-volume copy would delete the source. */
-    if (!MoveFileExW(dos_path, dest, MOVEFILE_WRITE_THROUGH)) {
-        return 0;
+    {
+        wchar_t *api_source = filesystem_path(dos_path);
+        wchar_t *api_dest = filesystem_path(dest);
+        int moved = api_source != NULL && api_dest != NULL
+            && MoveFileExW(api_source, api_dest, MOVEFILE_WRITE_THROUGH);
+        HeapFree(GetProcessHeap(), 0, api_source);
+        HeapFree(GetProcessHeap(), 0, api_dest);
+        if (!moved) {
+            return 0;
+        }
     }
     {
         wchar_t msg[1024];
@@ -1555,7 +1682,7 @@ static int soft_delete_path(const wchar_t *dos_path) {
         return 0;
     }
     t_bypass = 1;
-    attr = GetFileAttributesW(dos_path);
+    attr = path_attributes(dos_path);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         t_bypass = 0;
         return 0;
@@ -1781,9 +1908,16 @@ static int path_has_file_id(
     if (!have_id) {
         return 1;
     }
-    opened = CreateFileW(
-        path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    {
+        wchar_t *api_path = filesystem_path(path);
+        if (api_path == NULL) {
+            return 0;
+        }
+        opened = CreateFileW(
+            api_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        HeapFree(GetProcessHeap(), 0, api_path);
+    }
     if (opened == INVALID_HANDLE_VALUE) {
         return 0;
     }
@@ -1796,6 +1930,7 @@ static int path_has_file_id(
 }
 
 static NTSTATUS NTAPI hook_NtClose(HANDLE handle) {
+    DWORD saved;
     wchar_t *path;
     NTSTATUS status;
     int pending;
@@ -1807,8 +1942,12 @@ static NTSTATUS NTAPI hook_NtClose(HANDLE handle) {
     if (t_bypass) {
         return g_nt_close(handle);
     }
+    /* Save before any Win32 call. CreateSymbolicLink reads this slot after
+     * the cleanup close and ignores the NTSTATUS we return. */
+    saved = GetLastError();
     path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PATH_CAP * sizeof(wchar_t));
     if (path == NULL) {
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     pending = pending_take(handle, path, PATH_CAP);
@@ -1819,47 +1958,57 @@ static NTSTATUS NTAPI hook_NtClose(HANDLE handle) {
         index_low = before.nFileIndexLow;
     }
     status = g_nt_close(handle);
-    if (!pending) {
+    if (!pending || status < 0) {
+        DWORD close_error = GetLastError();
+        if (status < 0 && pending) {
+            pending_put(handle, path);
+        }
         HeapFree(GetProcessHeap(), 0, path);
-        return status;
-    }
-    if (status < 0) {
-        pending_put(handle, path);
-        HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(close_error);
         return status;
     }
     if (!path_has_file_id(path, have_id, volume, index_high, index_low)) {
         HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     if (is_skipped_path(path)) {
         HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(saved);
         return status;
     }
     if (!soft_delete_path(path)) {
         int gone = !path_exists(path);
         HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(saved);
         if (gone) {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+            /* The close already succeeded and the path is empty. Reporting
+             * STATUS_OBJECT_NAME_NOT_FOUND here becomes WinError 2. */
+            return status;
         }
         return STATUS_ACCESS_DENIED;
     }
     HeapFree(GetProcessHeap(), 0, path);
+    SetLastError(saved);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI hook_NtDeleteFile(OBJECT_ATTRIBUTES_ *oa) {
+    DWORD saved;
     wchar_t *path;
     int ok;
     if (t_bypass) {
         return g_nt_delete_file(oa);
     }
+    saved = GetLastError();
     path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PATH_CAP * sizeof(wchar_t));
     if (path == NULL) {
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     if (!path_from_object(oa, path, PATH_CAP)) {
         HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     if (is_skipped_path(path)) {
@@ -1868,18 +2017,22 @@ static NTSTATUS NTAPI hook_NtDeleteFile(OBJECT_ATTRIBUTES_ *oa) {
     }
     if (!path_exists(path)) {
         HeapFree(GetProcessHeap(), 0, path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     ok = soft_delete_path(path);
     HeapFree(GetProcessHeap(), 0, path);
     if (!ok) {
+        SetLastError(ERROR_ACCESS_DENIED);
         return STATUS_ACCESS_DENIED;
     }
+    SetLastError(saved);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI hook_NtSetInformationFile(
     HANDLE file, IO_STATUS_BLOCK_ *iosb, PVOID info, ULONG length, ULONG cls) {
+    DWORD saved;
     uint8_t *bytes = NULL;
     wchar_t *path = NULL;
     wchar_t *dest = NULL;
@@ -1892,16 +2045,20 @@ static NTSTATUS NTAPI hook_NtSetInformationFile(
         && cls != FILE_RENAME_INFORMATION && cls != FILE_RENAME_INFORMATION_EX) {
         return g_nt_set_info(file, iosb, info, length, cls);
     }
+    saved = GetLastError();
     if (info == NULL || length == 0 || !memory_ok(info, length < 20 ? length : 20, 0)) {
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     if (length > INFO_COPY_MAX) {
         /* A normal rename still has to work. Only a delete or replace that we cannot inspect is refused. */
         if (cls == FILE_DISPOSITION_INFORMATION || cls == FILE_DISPOSITION_INFORMATION_EX) {
             if (disposition_wants_delete(cls, (const uint8_t *)info, length)) {
+                SetLastError(saved);
                 return STATUS_ACCESS_DENIED;
             }
         } else if (rename_replaces(cls, (const uint8_t *)info, length)) {
+            SetLastError(saved);
             return STATUS_ACCESS_DENIED;
         }
         return g_nt_set_info(file, iosb, info, length, cls);
@@ -1913,12 +2070,14 @@ static NTSTATUS NTAPI hook_NtSetInformationFile(
         HeapFree(GetProcessHeap(), 0, bytes);
         HeapFree(GetProcessHeap(), 0, path);
         HeapFree(GetProcessHeap(), 0, dest);
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     if (!memory_ok(info, length, 0)) {
         HeapFree(GetProcessHeap(), 0, bytes);
         HeapFree(GetProcessHeap(), 0, path);
         HeapFree(GetProcessHeap(), 0, dest);
+        SetLastError(saved);
         return STATUS_ACCESS_DENIED;
     }
     memcpy(bytes, info, length);
@@ -1956,10 +2115,12 @@ static NTSTATUS NTAPI hook_NtSetInformationFile(
     }
     if (!handled) {
         status = g_nt_set_info(file, iosb, info, length, cls);
+        saved = GetLastError();
     }
     HeapFree(GetProcessHeap(), 0, bytes);
     HeapFree(GetProcessHeap(), 0, path);
     HeapFree(GetProcessHeap(), 0, dest);
+    SetLastError(saved);
     return status;
 }
 
@@ -1967,20 +2128,24 @@ static NTSTATUS NTAPI hook_NtCreateFile(
     HANDLE *file_handle, ACCESS_MASK access, OBJECT_ATTRIBUTES_ *oa, IO_STATUS_BLOCK_ *iosb,
     LARGE_INTEGER *alloc_size, ULONG attributes, ULONG share, ULONG disposition,
     ULONG options, PVOID ea, ULONG ea_length) {
+    DWORD saved;
     ULONG cleaned = options;
     wchar_t *path = NULL;
     NTSTATUS status;
+    DWORD after;
     int strip;
     if (t_bypass) {
         return g_nt_create_file(
             file_handle, access, oa, iosb, alloc_size, attributes, share, disposition,
             options, ea, ea_length);
     }
+    saved = GetLastError();
     strip = (options & FILE_DELETE_ON_CLOSE) != 0;
     if (strip) {
         path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PATH_CAP * sizeof(wchar_t));
         if (path == NULL || !path_from_object(oa, path, PATH_CAP)) {
             HeapFree(GetProcessHeap(), 0, path);
+            SetLastError(saved);
             return STATUS_ACCESS_DENIED;
         }
         if (!is_skipped_path(path)) {
@@ -2004,28 +2169,35 @@ static NTSTATUS NTAPI hook_NtCreateFile(
                 *file_handle = NULL;
             }
             set_iosb(iosb, STATUS_ACCESS_DENIED);
+            SetLastError(saved);
             return STATUS_ACCESS_DENIED;
         }
     }
+    after = GetLastError();
     HeapFree(GetProcessHeap(), 0, path);
+    SetLastError(after);
     return status;
 }
 
 static NTSTATUS NTAPI hook_NtOpenFile(
     HANDLE *file_handle, ACCESS_MASK access, OBJECT_ATTRIBUTES_ *oa, IO_STATUS_BLOCK_ *iosb,
     ULONG share, ULONG options) {
+    DWORD saved;
     ULONG cleaned = options;
     wchar_t *path = NULL;
     NTSTATUS status;
+    DWORD after;
     int strip;
     if (t_bypass) {
         return g_nt_open_file(file_handle, access, oa, iosb, share, options);
     }
+    saved = GetLastError();
     strip = (options & FILE_DELETE_ON_CLOSE) != 0;
     if (strip) {
         path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PATH_CAP * sizeof(wchar_t));
         if (path == NULL || !path_from_object(oa, path, PATH_CAP)) {
             HeapFree(GetProcessHeap(), 0, path);
+            SetLastError(saved);
             return STATUS_ACCESS_DENIED;
         }
         if (!is_skipped_path(path)) {
@@ -2047,10 +2219,13 @@ static NTSTATUS NTAPI hook_NtOpenFile(
                 *file_handle = NULL;
             }
             set_iosb(iosb, STATUS_ACCESS_DENIED);
+            SetLastError(saved);
             return STATUS_ACCESS_DENIED;
         }
     }
+    after = GetLastError();
     HeapFree(GetProcessHeap(), 0, path);
+    SetLastError(after);
     return status;
 }
 
@@ -2370,11 +2545,14 @@ static int first_command_token(const wchar_t *cmd, wchar_t *out, size_t cap) {
     return n > 0;
 }
 
-static int child_is_posix_image(LPCWSTR app, LPCWSTR cmd) {
+static int resolve_child_image(LPCWSTR app, LPCWSTR cmd, wchar_t *full, DWORD cap) {
     wchar_t token[1024];
-    wchar_t full[1024];
-    DWORD n;
     const wchar_t *raw = app;
+    DWORD n;
+    if (full == NULL || cap < 2) {
+        return 0;
+    }
+    full[0] = L'\0';
     if (raw == NULL || raw[0] == L'\0') {
         if (!first_command_token(cmd, token, 1024)) {
             return 0;
@@ -2382,17 +2560,47 @@ static int child_is_posix_image(LPCWSTR app, LPCWSTR cmd) {
         raw = token;
     }
     if (wcschr(raw, L'\\') == NULL && wcschr(raw, L'/') == NULL) {
-        n = SearchPathW(NULL, raw, L".exe", 1024, full, NULL);
-        if (n == 0 || n >= 1024) {
-            return 0;
-        }
-        return image_is_posix(full);
+        n = SearchPathW(NULL, raw, L".exe", cap, full, NULL);
+        return n > 0 && n < cap;
     }
-    n = GetFullPathNameW(raw, 1024, full, NULL);
-    if (n > 0 && n < 1024) {
-        return image_is_posix(full);
+    n = GetFullPathNameW(raw, cap, full, NULL);
+    return n > 0 && n < cap;
+}
+
+static int image_leaf_is(const wchar_t *exe, const wchar_t *leaf) {
+    const wchar_t *slash;
+    const wchar_t *name;
+    if (exe == NULL || leaf == NULL) {
+        return 0;
     }
-    return image_is_posix(raw);
+    slash = wcsrchr(exe, L'\\');
+    name = (slash != NULL) ? slash + 1 : exe;
+    return _wcsicmp(name, leaf) == 0;
+}
+
+/* POSIX delete helpers spawned by Git Bash. Do not add bash/sh/find:
+ * those fork, and an extra DLL makes the fork wait forever. */
+static int image_is_posix_delete_tool(const wchar_t *exe) {
+    return image_leaf_is(exe, L"rm.exe")
+        || image_leaf_is(exe, L"rmdir.exe")
+        || image_leaf_is(exe, L"unlink.exe")
+        || image_leaf_is(exe, L"shred.exe");
+}
+
+/* These images are not injected. MinGW keeps the DLL mapped from outside
+ * the install tree (git.exe). Explorer must keep running after uninstall. */
+static int image_skip_inject(const wchar_t *exe) {
+    return image_is_console_host(exe)
+        || image_leaf_is(exe, L"explorer.exe")
+        || directory_has_leaf(exe, L"libwinpthread-1.dll");
+}
+
+static int child_is_posix_image(LPCWSTR app, LPCWSTR cmd) {
+    wchar_t full[1024];
+    if (!resolve_child_image(app, cmd, full, 1024)) {
+        return 0;
+    }
+    return image_is_posix(full);
 }
 
 static void fail_created_process(LPPROCESS_INFORMATION pi) {
@@ -2522,7 +2730,9 @@ static void close_create_handles(CREATE_PROCESS_DEBUG_INFO *info) {
      * events. Closing them here lets that later close hit a reused handle. */
 }
 
-/* 1 means do not inject: MSYS/Cygwin, a console host, or an unreadable image. */
+/* 1 means do not inject: MSYS/Cygwin shells, a console host, MinGW, or
+ * an unreadable image. POSIX delete tools are injected so Git Bash rm
+ * still hits the ntdll delete hooks. */
 static int created_image_skip_inject(HANDLE process, HANDLE file) {
     wchar_t path[1024];
     DWORD cap = 1024;
@@ -2548,7 +2758,13 @@ static int created_image_skip_inject(HANDLE process, HANDLE file) {
         log_line(L"softdelete: debug image path unavailable, leaving it unhooked");
         return 1;
     }
-    return image_is_posix(bare) || image_is_console_host(bare);
+    if (image_skip_inject(bare)) {
+        return 1;
+    }
+    if (image_is_posix_delete_tool(bare)) {
+        return 0;
+    }
+    return image_is_posix(bare);
 }
 
 static void on_debug_create(DebugTree *tree, DEBUG_EVENT *ev) {
@@ -2932,23 +3148,26 @@ static wchar_t *ansi_env_to_wide(const char *block) {
     return wide;
 }
 
-/* A sandboxed child that builds its own environment must still see the recycle port. */
-static wchar_t *merge_child_soft_env(const wchar_t *block) {
+/* Preserve broker settings and the Windows socket provider's SystemRoot.
+ * Do not copy the rest of the parent's environment into a custom block. */
+static wchar_t *merge_child_soft_env(const wchar_t *block, int *ok) {
     static const wchar_t *keys[] = {
         ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN,
+        L"SystemRoot",
     };
-    wchar_t *values[5];
+    wchar_t *values[sizeof keys / sizeof keys[0]];
     size_t base = 1;
     size_t extra = 0;
     size_t pos = 0;
     const wchar_t *cursor;
     wchar_t *out;
     int i;
+    *ok = 0;
     memset(values, 0, sizeof values);
     for (cursor = block; *cursor != L'\0'; cursor += wcslen(cursor) + 1) {
         base += wcslen(cursor) + 1;
     }
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
         if (env_block_has(block, keys[i])) {
             continue;
         }
@@ -2958,11 +3177,12 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         }
     }
     if (extra == 0) {
+        *ok = 1;
         return NULL;
     }
     out = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (base + extra) * sizeof(wchar_t));
     if (out == NULL) {
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
             HeapFree(GetProcessHeap(), 0, values[i]);
         }
         return NULL;
@@ -2972,7 +3192,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         memcpy(out + pos, cursor, count * sizeof(wchar_t));
         pos += count;
     }
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
         int wrote;
         if (values[i] == NULL) {
             continue;
@@ -2981,7 +3201,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         HeapFree(GetProcessHeap(), 0, values[i]);
         values[i] = NULL;
         if (wrote < 0) {
-            for (; i < 5; i++) {
+            for (; i < (int)(sizeof keys / sizeof keys[0]); i++) {
                 HeapFree(GetProcessHeap(), 0, values[i]);
             }
             HeapFree(GetProcessHeap(), 0, out);
@@ -2990,6 +3210,7 @@ static wchar_t *merge_child_soft_env(const wchar_t *block) {
         pos += (size_t)wrote + 1;
     }
     out[pos] = L'\0';
+    *ok = 1;
     return out;
 }
 
@@ -2999,6 +3220,7 @@ static BOOL WINAPI hook_CreateProcessInternalW(
     LPCWSTR cwd, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION pi, HANDLE *new_token) {
     DWORD used = flags;
     int added_suspend = 0;
+    int env_ok;
     BOOL ok;
     wchar_t *owned_env = NULL;
     wchar_t *converted_env = NULL;
@@ -3009,7 +3231,8 @@ static BOOL WINAPI hook_CreateProcessInternalW(
             token, app, cmd, process_attr, thread_attr, inherit, flags, env, cwd, startup, pi,
             new_token);
     }
-    if (GetEnvironmentVariableW(ENV_RECYCLE_PORT, NULL, 0) > 1 && env != NULL) {
+    if (env != NULL && (recycle_delegation_configured()
+        || GetEnvironmentVariableW(ENV_ARCHIVE, NULL, 0) > 1)) {
         wide_env = (const wchar_t *)env;
         if ((flags & CREATE_UNICODE_ENVIRONMENT) == 0) {
             converted_env = ansi_env_to_wide((const char *)env);
@@ -3020,8 +3243,8 @@ static BOOL WINAPI hook_CreateProcessInternalW(
             }
             wide_env = converted_env;
         }
-        owned_env = merge_child_soft_env(wide_env);
-        if (owned_env == NULL && !env_block_has(wide_env, ENV_RECYCLE_PORT)) {
+        owned_env = merge_child_soft_env(wide_env, &env_ok);
+        if (!env_ok) {
             HeapFree(GetProcessHeap(), 0, converted_env);
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
             return FALSE;
@@ -3046,6 +3269,16 @@ static BOOL WINAPI hook_CreateProcessInternalW(
             return FALSE;
         }
         return TRUE;
+    }
+    {
+        wchar_t image[1024];
+        if (resolve_child_image(app, cmd, image, 1024) && image_skip_inject(image)) {
+            ok = g_create_process(
+                token, app, cmd, process_attr, thread_attr, inherit, used, use_env, cwd, startup, pi,
+                new_token);
+            HeapFree(GetProcessHeap(), 0, owned_env);
+            return ok;
+        }
     }
     if ((used & CREATE_SUSPENDED) == 0) {
         used |= CREATE_SUSPENDED;
@@ -3099,6 +3332,7 @@ static int directory_is_empty(const wchar_t *path) {
 }
 
 static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
+    DWORD saved;
     DWORD attr;
     if (t_bypass) {
         return g_delete_file(path);
@@ -3106,6 +3340,7 @@ static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
     if (path == NULL || path[0] == L'\0') {
         return g_delete_file(path);
     }
+    saved = GetLastError();
     attr = GetFileAttributesW(path);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         SetLastError(ERROR_FILE_NOT_FOUND);
@@ -3122,10 +3357,12 @@ static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
+    SetLastError(saved);
     return TRUE;
 }
 
 static BOOL WINAPI hook_RemoveDirectoryW(LPCWSTR path) {
+    DWORD saved;
     DWORD attr;
     if (t_bypass) {
         return g_remove_directory(path);
@@ -3133,6 +3370,7 @@ static BOOL WINAPI hook_RemoveDirectoryW(LPCWSTR path) {
     if (path == NULL || path[0] == L'\0') {
         return g_remove_directory(path);
     }
+    saved = GetLastError();
     attr = GetFileAttributesW(path);
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
         return g_remove_directory(path);
@@ -3148,6 +3386,7 @@ static BOOL WINAPI hook_RemoveDirectoryW(LPCWSTR path) {
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
+    SetLastError(saved);
     return TRUE;
 }
 
@@ -3174,6 +3413,20 @@ static void write_load_error(const wchar_t *text) {
         WriteFile(file, utf8, (DWORD)(n - 1), &written, NULL);
     }
     CloseHandle(file);
+}
+
+static int install_named(void *target, void *hook_fn, const wchar_t *name) {
+    const wchar_t *reason = L"unknown";
+    wchar_t msg[512];
+    if (install_hook(target, hook_fn, &reason)) {
+        return 1;
+    }
+    if (reason == NULL || reason[0] == L'\0') {
+        reason = L"unknown";
+    }
+    swprintf_s(msg, 512, L"inline hook could not be installed: %s: %s", name, reason);
+    write_load_error(msg);
+    return 0;
 }
 
 static int install_all(void) {
@@ -3206,35 +3459,35 @@ static int install_all(void) {
         return 0;
     }
     t_bypass = 1;
-    if (!install_hook(nt_close, (void *)hook_NtClose)) {
+    if (!install_named(nt_close, (void *)hook_NtClose, L"NtClose")) {
         goto fail;
     }
     g_nt_close = (FnNtClose)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(nt_delete, (void *)hook_NtDeleteFile)) {
+    if (!install_named(nt_delete, (void *)hook_NtDeleteFile, L"NtDeleteFile")) {
         goto fail;
     }
     g_nt_delete_file = (FnNtDeleteFile)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(nt_set, (void *)hook_NtSetInformationFile)) {
+    if (!install_named(nt_set, (void *)hook_NtSetInformationFile, L"NtSetInformationFile")) {
         goto fail;
     }
     g_nt_set_info = (FnNtSetInformationFile)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(nt_create, (void *)hook_NtCreateFile)) {
+    if (!install_named(nt_create, (void *)hook_NtCreateFile, L"NtCreateFile")) {
         goto fail;
     }
     g_nt_create_file = (FnNtCreateFile)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(nt_open, (void *)hook_NtOpenFile)) {
+    if (!install_named(nt_open, (void *)hook_NtOpenFile, L"NtOpenFile")) {
         goto fail;
     }
     g_nt_open_file = (FnNtOpenFile)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(create_process, (void *)hook_CreateProcessInternalW)) {
+    if (!install_named(create_process, (void *)hook_CreateProcessInternalW, L"CreateProcessInternalW")) {
         goto fail;
     }
     g_create_process = (FnCreateProcessInternalW)g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(delete_file, (void *)hook_DeleteFileW)) {
+    if (!install_named(delete_file, (void *)hook_DeleteFileW, L"DeleteFileW")) {
         goto fail;
     }
     g_delete_file = (BOOL(WINAPI *)(LPCWSTR))g_hooks[g_hook_count - 1].trampoline;
-    if (!install_hook(remove_directory, (void *)hook_RemoveDirectoryW)) {
+    if (!install_named(remove_directory, (void *)hook_RemoveDirectoryW, L"RemoveDirectoryW")) {
         goto fail;
     }
     g_remove_directory = (BOOL(WINAPI *)(LPCWSTR))g_hooks[g_hook_count - 1].trampoline;
@@ -3243,7 +3496,6 @@ static int install_all(void) {
 fail:
     remove_hooks();
     t_bypass = 0;
-    write_load_error(L"inline hook could not be installed");
     return 0;
 }
 

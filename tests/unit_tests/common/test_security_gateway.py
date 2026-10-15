@@ -137,8 +137,8 @@ def test_net_guard_rpc_get_and_set(monkeypatch):
         )
         assert resp.ok and resp.payload["apply_mode"] == "hot_reload"
         assert resp.payload["net_guard"]["enforce_host_exit"] is True
-        assert resp.payload["net_guard"]["max_request_mb"] == 10
-        assert resp.payload["net_guard"]["timeout_seconds"] == 120
+        assert resp.payload["net_guard"]["max_request_mb"] == 1024
+        assert resp.payload["net_guard"]["timeout_seconds"] == 3600
 
         resp = rpc.dispatch_permissions_config_request(
             AgentRequest(
@@ -193,8 +193,8 @@ def test_sandbox_limits_have_simple_defaults_and_strict_validation():
     from jiuwenswarm.common.config import _ensure_sandbox_runtime_shape
 
     assert _ensure_sandbox_runtime_shape({})["limits"] == {
-        "max_file_mb": 100,
-        "exec_timeout_seconds": 600,
+        "max_file_mb": 1024,
+        "exec_timeout_seconds": 3600,
     }
     assert _ensure_sandbox_runtime_shape(
         {"limits": {"max_file_mb": 12, "exec_timeout_seconds": 34}}
@@ -254,6 +254,7 @@ async def test_reload_continues_when_host_exit_publish_fails(monkeypatch):
     from jiuwenswarm.agents.harness.common.rails.permissions import (
         permissions_config_rpc,
     )
+    from jiuwenswarm.agents.harness import team as team_module
     from jiuwenswarm.server.runtime import agent_manager as agent_manager_module
 
     class FakeAgent:
@@ -266,8 +267,12 @@ async def test_reload_continues_when_host_exit_publish_fails(monkeypatch):
     def boom(_config=None):
         raise RuntimeError("publish broken")
 
+    class FakeTeam:
+        async def update_evolution_config(self, _config):
+            return None
+
     monkeypatch.setattr(permissions_config_rpc, "publish_host_exit_policy_from_config", boom)
-    monkeypatch.setattr(agent_manager_module, "get_team_manager", lambda _cid: None)
+    monkeypatch.setattr(team_module, "get_team_manager", lambda _cid: FakeTeam())
     manager = agent_manager_module.AgentManager()
     agent = FakeAgent()
     manager.agents = {"web": {"agent": agent}}

@@ -69,6 +69,60 @@ def test_desktop_grants_keep_yaml_denies_and_old_explicit_allows(tmp_path, monke
     assert (masks(denied), masks(allowed)) == before
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="uses real NTFS ACLs on temporary files")
+@pytest.mark.parametrize("writable", [False, True])
+def test_parent_traverse_preserves_workspace_acl(tmp_path, monkeypatch, writable):
+    import win32security
+
+    # Both trustees are synthetic, so the host user's permissions are untouched.
+    sids = [
+        "S-1-5-21-111111111-222222222-333333333-12345",
+        "S-1-5-21-111111111-222222222-333333333-12346",
+    ]
+    parent = tmp_path / "projects"
+    root = parent / "workspace"
+    readonly = root / "readonly"
+    readonly.mkdir(parents=True)
+    rights = const.FILE_GENERIC_READ | const.FILE_GENERIC_EXECUTE
+    if writable:
+        rights |= const.ALLOW_WRITE_RIGHTS
+    win_acl.grant_aces(str(root), [(sid, rights, "ALLOW") for sid in sids])
+    win_acl.grant_aces(
+        str(readonly), [(sid, const.DENY_WRITE_RIGHTS, "DENY") for sid in sids],
+    )
+    policy = {
+        "allow_read": [str(root)],
+        "allow_write": [str(root)] if writable else [],
+        "deny_read": [],
+        "deny_write": [str(readonly)],
+    }
+    monkeypatch.setattr(win_acl, "_is_host_dacl_frozen", lambda p: p == tmp_path)
+    monkeypatch.setattr(win_acl, "_desktop_data_dir_keys", lambda: set())
+
+    def entries(path):
+        acl = win32security.GetFileSecurity(
+            str(path), win32security.DACL_SECURITY_INFORMATION,
+        ).GetSecurityDescriptorDacl()
+        return win_acl._acl_entries(acl)
+
+    before = entries(root), entries(readonly)
+    for sid in sids:
+        win_acl.grant_parent_traverse(str(root), sid, filesystem_policy=policy)
+    assert (entries(root), entries(readonly)) == before
+    for sid in sids:
+        assert [mask for kind, _, mask, trustee in entries(parent)
+                if kind == const.ACCESS_ALLOWED_ACE_TYPE and trustee == sid] == [
+                    const.FILE_GENERIC_EXECUTE,
+                ]
+    # New files must still inherit the workspace's original read/write grants.
+    new_file = root / "new.txt"
+    new_file.write_text("test", encoding="utf-8")
+    for sid in sids:
+        masks = [mask for kind, _, mask, trustee in entries(new_file)
+                 if kind == const.ACCESS_ALLOWED_ACE_TYPE and trustee == sid]
+        assert masks == [rights]
+
+
 @pytest.fixture(params=["ro-root", "rw-root-ro-child", "rw-root-remount-child"])
 def policy_workspace(request, tmp_path):
     if request.param == "ro-root":

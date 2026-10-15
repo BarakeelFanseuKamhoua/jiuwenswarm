@@ -145,7 +145,7 @@ def _teardown_registered_sandbox_sysops() -> int:
     return removed
 
 
-async def _apply_sandbox_change(kind: str) -> None:
+async def _apply_sandbox_change(kind: str, *, strict: bool = False) -> None:
     """set 后的生效动作 (异步, 不阻塞 RPC 响应).
 
     kind ∈ {'enabled', 'startup_mode', 'limits', 'files', 'network'}.
@@ -182,6 +182,8 @@ async def _apply_sandbox_change(kind: str) -> None:
             else:
                 logger.info("[sandbox] enabled 变更为开启, 拉起 box-server")
                 if _internal_bootstrap is None:
+                    if strict:
+                        raise RuntimeError("Sandbox service bootstrap is unavailable")
                     logger.warning(
                         "[sandbox] 无 bootstrap 回调, 无法拉起 box-server; "
                         "请重启 AgentServer 或确认 sandbox.enabled=true"
@@ -243,6 +245,8 @@ async def _apply_sandbox_change(kind: str) -> None:
         logger.warning("[sandbox] unknown apply kind: %s", kind)
     except Exception:  # noqa: BLE001
         logger.exception("[sandbox] _apply_sandbox_change(%s) failed", kind)
+        if strict:
+            raise
 
 
 def _trigger_apply(kind: str) -> None:

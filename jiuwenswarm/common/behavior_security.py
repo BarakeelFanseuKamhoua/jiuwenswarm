@@ -17,10 +17,14 @@ from openjiuwen.harness.security import PermissionLevel, PermissionResult, Skill
 from openjiuwen.harness.security.permission_engine.toolguard.tool_policy import evaluate_tiered_policy
 from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_SESSION_ID
 from jiuwenswarm.common.np_transport import named_pipe_transport_for
+from jiuwenswarm.common.permission_profile import resolve_permission_profile_rules
 from jiuwenswarm.common.utils import logger
 
 ACTIVE_BEHAVIOR: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("active_behavior", default=None)
 PENDING_SKILL = "behavior_security.pending_skill"
+_OUTPUT_CHUNK_CHARS = 5500
+_OUTPUT_CHUNK_OVERLAP = 256
+_MAX_OUTPUT_INSPECTION_CHARS = 64 * 1024
 
 
 def desktop_security_active() -> bool:
@@ -39,7 +43,7 @@ def runtime_permission_config(config: dict) -> dict:
     Only the runtime copy is changed; the stored permission mode and other
     hosts retain their existing semantics.
     """
-    permissions = copy.deepcopy(config.get("permissions", {}))
+    permissions = resolve_permission_profile_rules(config.get("permissions", {}))
     # Host-owned policy: persisted settings and session overlays cannot opt in.
     permissions.pop("strict_tool_command_merge", None)
     if desktop_security_active():
@@ -60,7 +64,8 @@ def _event_id(ctx: Any, stage: str, suffix: str = "") -> str:
     call = ctx.inputs.tool_call
     turn = ctx.extra.get("behavior.turn_id", "")
     args = json.dumps(ctx.inputs.tool_args, sort_keys=True, ensure_ascii=False, default=str)
-    raw = f"{_session_id(ctx)}:{turn}:{getattr(call, 'id', '')}:{ctx.inputs.tool_name}:{args}:{stage}:{suffix}"
+    revision = ctx.extra.get("behavior.policy_revision", "")
+    raw = f"{revision}:{_session_id(ctx)}:{turn}:{getattr(call, 'id', '')}:{ctx.inputs.tool_name}:{args}:{stage}:{suffix}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -91,6 +96,21 @@ class BehaviorSecurityBridge:
         self.decisions: OrderedDict[str, PermissionResult] = OrderedDict()
         self.local_decisions: OrderedDict[str, PermissionResult] = OrderedDict()
 
+    def policy_revision(self) -> str:
+        permissions = self.config.get("permissions", {})
+        composition = permissions.get("composition", {}) if isinstance(permissions, dict) else {}
+        identity = (
+            composition.get("revision") if isinstance(composition, dict) else None,
+            cloud_authorization_enabled(self.config),
+            self.config.get("security", {}).get("fail_closed", {}).get("enabled") is True,
+        )
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def update_config(self, config: dict) -> None:
+        self.config = config
+        self.decisions.clear()
+        self.local_decisions.clear()
+
     async def _send(self, event: dict) -> dict:
         section = self.config.get("xiaoyi_work_security", {}).get("cloud_authorization", {})
         timeout = max(0.1, min(float(section.get("timeout_ms", 4000)) / 1000, 30))
@@ -116,7 +136,69 @@ class BehaviorSecurityBridge:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
+    @staticmethod
+    def _output_inspection_events(event: dict) -> list[dict] | None:
+        """Bound output requests without dropping an unscanned middle section."""
+        tool = event.get("tool")
+        result = tool.get("result") if isinstance(tool, dict) else None
+        text = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(text) <= _OUTPUT_CHUNK_CHARS:
+            return [event]
+        if len(text) > _MAX_OUTPUT_INSPECTION_CHARS:
+            return None
+        step = _OUTPUT_CHUNK_CHARS - _OUTPUT_CHUNK_OVERLAP
+        chunks = [text[start:start + _OUTPUT_CHUNK_CHARS] for start in range(0, len(text), step)]
+        output = []
+        for index, chunk in enumerate(chunks):
+            item = copy.deepcopy(event)
+            item["eventId"] = hashlib.sha256(
+                f"{event['eventId']}:{index}:{len(chunks)}".encode(),
+            ).hexdigest()
+            item["tool"]["arguments"] = {}
+            item["tool"]["result"] = {
+                "chunkIndex": index,
+                "chunkCount": len(chunks),
+                "content": chunk,
+            }
+            output.append(item)
+        return output
+
+    async def inspect(self, event: dict) -> PermissionResult:
+        """Synchronously decide whether a tool result may be exposed to the model.
+
+        Output inspection is fail-closed: unlike pre-tool authorization there is
+        no safe user-approval fallback for exposing an untrusted payload.
+        """
+        events = self._output_inspection_events(event)
+        if events is None:
+            return PermissionResult(
+                PermissionLevel.DENY,
+                reason="工具输出超过安全检测上限",
+            )
+        replies = await asyncio.gather(*(
+            self._send({**item, "mode": "inspect"}) for item in events
+        ))
+        for reply in replies:
+            decision = reply.get("decision")
+            if decision == "deny":
+                return PermissionResult(
+                    PermissionLevel.DENY,
+                    reason=str(reply.get("reason") or "工具输出安全检测未通过"),
+                )
+            if decision != "allow":
+                return PermissionResult(
+                    PermissionLevel.DENY,
+                    reason="工具输出安全检测不可用",
+                )
+        if replies:
+            return PermissionResult(PermissionLevel.ALLOW, reason="cloud:allow")
+        return PermissionResult(
+            PermissionLevel.DENY,
+            reason="工具输出安全检测不可用",
+        )
+
     async def decide(self, event: dict, local: PermissionResult) -> PermissionResult:
+        revision = self.policy_revision()
         key = event["eventId"]
         if key in self.decisions:
             return self.decisions[key]
@@ -150,7 +232,13 @@ class BehaviorSecurityBridge:
             elif decision == "deny":
                 result = PermissionResult(PermissionLevel.DENY, reason=str(reply.get("reason") or "云端拒绝本次操作"))
             else:
-                result = PermissionResult(PermissionLevel.ASK, reason="云端不可用，请授权本次操作")
+                fail_closed = self.config.get("security", {}).get("fail_closed", {}).get("enabled") is True
+                result = PermissionResult(
+                    PermissionLevel.DENY if fail_closed else PermissionLevel.ASK,
+                    reason="云端不可用，拒绝本次操作" if fail_closed else "云端不可用，请授权本次操作",
+                )
+        if revision != self.policy_revision():
+            return PermissionResult(PermissionLevel.DENY, reason="安全策略已变更，请重新发起操作")
         self.decisions[key] = result
         if len(self.decisions) > 512:
             self.decisions.popitem(last=False)

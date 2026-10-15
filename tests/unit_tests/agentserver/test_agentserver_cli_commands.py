@@ -889,3 +889,52 @@ async def test_handle_permissions_config_does_not_block_on_slow_reload(server, f
     # reload 在后台被调度: 等它跑完确认调用过一次
     await asyncio.sleep(0.3)
     assert reload_calls["n"] == 1, f"期望 reload 被调用 1 次, 实际 {reload_calls['n']}"
+
+
+@pytest.mark.asyncio
+async def test_handle_permissions_config_routes_managed_legacy_to_service(server, fake_ws, monkeypatch):
+    from jiuwenswarm.common.security_config_service import SecurityConfigService
+    from jiuwenswarm.server import security_config_legacy_rpc
+
+    monkeypatch.setattr(SecurityConfigService, "is_initialized", lambda self: True)
+    routed = []
+
+    async def managed(method, params, **kwargs):
+        routed.append((method, params, kwargs["service"]))
+        return {"tools": {"bash": "deny"}, "saved": True, "applied": True}
+
+    monkeypatch.setattr(security_config_legacy_rpc, "dispatch_managed_permissions_request", managed)
+    request = AgentRequest(
+        request_id="managed-tool-update", channel_id="tui", session_id="sess_demo",
+        req_method=ReqMethod.PERMISSIONS_TOOLS_UPDATE,
+        params={"tool": "bash", "level": "deny"},
+    )
+    await server.handle_permissions_config_for_test(fake_ws, request, asyncio.Lock())
+    assert routed[0][:2] == (ReqMethod.PERMISSIONS_TOOLS_UPDATE, request.params)
+    assert isinstance(routed[0][2], SecurityConfigService)
+    assert fake_ws.sent[0]["ok"] is True
+    assert fake_ws.sent[0]["payload"]["tools"] == {"bash": "deny"}
+
+
+@pytest.mark.asyncio
+async def test_handle_permissions_config_rechecks_mode_after_waiting_for_apply_lock(server, fake_ws, monkeypatch):
+    from jiuwenswarm.common.security_config_service import SecurityConfigService
+    from jiuwenswarm.server import security_config_legacy_rpc
+
+    checks = iter([False, True])
+    monkeypatch.setattr(SecurityConfigService, "is_initialized", lambda self: next(checks))
+    called = []
+
+    async def managed(method, params, **_kwargs):
+        called.append(method)
+        return {"tools": {"bash": "deny"}, "saved": True, "applied": True}
+
+    monkeypatch.setattr(security_config_legacy_rpc, "dispatch_managed_permissions_request", managed)
+    request = AgentRequest(
+        request_id="initialization-race", channel_id="tui", session_id="sess_demo",
+        req_method=ReqMethod.PERMISSIONS_TOOLS_UPDATE,
+        params={"tool": "bash", "level": "deny"},
+    )
+    await server.handle_permissions_config_for_test(fake_ws, request, asyncio.Lock())
+    assert called == [ReqMethod.PERMISSIONS_TOOLS_UPDATE]
+    assert fake_ws.sent[0]["ok"] is True

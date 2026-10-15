@@ -28,7 +28,6 @@ async def handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             return
 
         request_text = request_data.decode(errors="replace")
-        logger.info("[%s] Received request:\n%s", protocol, request_text[:500])
 
         request_json = {}
         extracted_api_key = None

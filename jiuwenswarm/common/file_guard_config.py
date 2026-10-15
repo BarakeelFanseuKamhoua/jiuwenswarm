@@ -38,8 +38,8 @@ def get_file_guard_config():
     return deepcopy((get_config().get("permissions") or {}).get("file_guard") or {})
 
 
-def update_file_guard_config(patch):
-    from jiuwenswarm.common.config import update_config
+def patch_file_guard(data, patch):
+    """Apply the existing FileGuard patch contract to a config dictionary."""
     if not isinstance(patch, dict) or set(patch) - {"enabled", "defaults", "workspace", "paths"}:
         raise ValueError("patch accepts only enabled/defaults/workspace/paths")
     if "enabled" in patch and not isinstance(patch["enabled"], bool):
@@ -54,21 +54,24 @@ def update_file_guard_config(patch):
     if "paths" in patch:
         validate_paths(patch["paths"])
 
-    def mutate(data):
-        guard = data.setdefault("permissions", {}).setdefault("file_guard", {})
-        for key, value in patch.items():
-            if key in ("defaults", "workspace"):
-                guard.setdefault(key, {}).update(deepcopy(value))
-                if guard[key].get("read") == "deny" and guard[key].get("write") == "allow":
-                    raise ValueError(f"{key}: write allow requires read allow")
-            else:
-                replacement = deepcopy(value)
-                if key == "paths":
-                    replacement = validate_paths(replacement)
-                guard[key] = replacement
-        return data
+    guard = data.setdefault("permissions", {}).setdefault("file_guard", {})
+    for key, value in patch.items():
+        if key in ("defaults", "workspace"):
+            guard.setdefault(key, {}).update(deepcopy(value))
+            if guard[key].get("read") == "deny" and guard[key].get("write") == "allow":
+                raise ValueError(f"{key}: write allow requires read allow")
+        else:
+            replacement = deepcopy(value)
+            if key == "paths":
+                replacement = validate_paths(replacement)
+            guard[key] = replacement
+    return data
 
-    data = update_config(mutate)
+
+def update_file_guard_config(patch):
+    from jiuwenswarm.common.config import update_config
+
+    data = update_config(lambda data: patch_file_guard(data, patch))
     return deepcopy(data["permissions"]["file_guard"])
 
 
@@ -103,46 +106,72 @@ def sandbox_file_buckets(files):
     return buckets, blocked
 
 
+def project_file_guard_to_sandbox(guard):
+    """Reuse the native projection without saving a partial sandbox policy."""
+    skipped = []
+    raw_paths = guard.get("paths", [])
+    composed = any(isinstance(rule, dict) and "layer" in rule for rule in raw_paths)
+    if composed:
+        selected = {}
+        for rule in raw_paths:
+            clean = {key: value for key, value in rule.items() if key != "layer"}
+            key = (clean.get("match", "prefix"), clean.get("path"))
+            if key not in selected:
+                selected[key] = clean
+            else:
+                for axis in ("read", "write", "exec"):
+                    value = clean.get(axis)
+                    if value == "deny" or (axis not in selected[key] and value is not None):
+                        selected[key][axis] = value
+        raw_paths = list(selected.values())
+    paths = validate_paths(raw_paths)
+    defaults = guard.get("defaults") or {}
+    files = []
+    candidates = []
+    for rule in paths:
+        if composed and "exec" in rule and not (
+            rule.get("read") == "deny" and rule.get("exec") == "deny"
+        ):
+            skipped.append({"path": rule["path"], "reason": "sandbox has no independent exec permission"})
+            continue
+        candidate = {"path": rule["path"]}
+        for axis in ("read", "write"):
+            candidate[axis] = rule.get(axis, defaults.get(axis, "ask"))
+        if candidate["read"] == "deny":
+            candidate["write"] = "deny"
+        try:
+            sandbox_file_buckets([{**candidate, "match": rule.get("match", "prefix")}])
+        except ValueError as exc:
+            skipped.append({"path": rule["path"], "reason": str(exc)})
+            continue
+        candidates.append(candidate)
+    candidates.sort(key=lambda r: (r["read"] != "deny", r["write"] != "deny"))
+    for candidate in candidates:
+        try:
+            sandbox_file_buckets([*files, candidate])
+        except ValueError as exc:
+            skipped.append({"path": candidate["path"], "reason": str(exc)})
+            continue
+        files.append(candidate)
+    return files, skipped
+
+
 def sync_file_guard_to_sandbox():
+    from jiuwenswarm.common.behavior_security import runtime_permission_config
     from jiuwenswarm.common.config import update_config
     from jiuwenswarm.server.runtime.agent_adapter.sysop_builder import build_filesystem_policy
 
     skipped = []
 
     def mutate(data):
-        permissions = data.get("permissions") or {}
+        permissions = runtime_permission_config(data)
         if (data.get("sandbox") or {}).get("type", "jiuwenbox") != "jiuwenbox":
             raise ValueError("sandbox.files.sync currently supports jiuwenbox only")
         guard = permissions.get("file_guard") or {}
         if not permissions.get("enabled") or guard.get("enabled") is False:
             raise ValueError("FileGuard must be enabled before synchronization")
-        paths = validate_paths(guard.get("paths", []))
-        defaults = guard.get("defaults") or {}
-        files = []
-        candidates = []
-        for rule in paths:
-            # FileGuard supports rules the sandbox cannot represent. Report those
-            # rules without preventing the supported paths from being synchronized.
-            candidate = {"path": rule["path"]}
-            for axis in ("read", "write"):
-                candidate[axis] = rule.get(axis, defaults.get(axis, "ask"))
-            if candidate["read"] == "deny":
-                candidate["write"] = "deny"
-            try:
-                sandbox_file_buckets([{**candidate, "match": rule.get("match", "prefix")}])
-            except ValueError as exc:
-                skipped.append({"path": rule["path"], "reason": str(exc)})
-                continue
-            candidates.append(candidate)
-        # Restrictive rules win regardless of their order in FileGuard.
-        candidates.sort(key=lambda r: (r["read"] != "deny", r["write"] != "deny"))
-        for candidate in candidates:
-            try:
-                sandbox_file_buckets([*files, candidate])
-            except ValueError as exc:
-                skipped.append({"path": candidate["path"], "reason": str(exc)})
-                continue
-            files.append(candidate)
+        files, omitted = project_file_guard_to_sandbox(guard)
+        skipped.extend(omitted)
         build_filesystem_policy(files)
         data.setdefault("sandbox", {})["files"] = files
         return data
