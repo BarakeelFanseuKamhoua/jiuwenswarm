@@ -254,6 +254,7 @@ async def test_reload_continues_when_host_exit_publish_fails(monkeypatch):
     from jiuwenswarm.agents.harness.common.rails.permissions import (
         permissions_config_rpc,
     )
+    from jiuwenswarm.agents.harness import team as team_module
     from jiuwenswarm.server.runtime import agent_manager as agent_manager_module
 
     class FakeAgent:
@@ -266,8 +267,12 @@ async def test_reload_continues_when_host_exit_publish_fails(monkeypatch):
     def boom(_config=None):
         raise RuntimeError("publish broken")
 
+    class FakeTeam:
+        async def update_evolution_config(self, _config):
+            return None
+
     monkeypatch.setattr(permissions_config_rpc, "publish_host_exit_policy_from_config", boom)
-    monkeypatch.setattr(agent_manager_module, "get_team_manager", lambda _cid: None)
+    monkeypatch.setattr(team_module, "get_team_manager", lambda _cid: FakeTeam())
     manager = agent_manager_module.AgentManager()
     agent = FakeAgent()
     manager.agents = {"web": {"agent": agent}}

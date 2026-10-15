@@ -6118,7 +6118,19 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
         ac = _resolve(agent_client)
         if ac is None or not getattr(ac, "server_ready", False):
-            if req_method.value.startswith("sandbox."):
+            from jiuwenswarm.common.security_config_service import SecurityConfigService
+            from jiuwenswarm.server.security_config_legacy_rpc import is_managed_permissions_method
+
+            try:
+                managed = SecurityConfigService().is_initialized()
+            except RuntimeError as exc:
+                await channel.send_response(
+                    ws, req_id, ok=False, error=str(exc), code="SOURCE_UNAVAILABLE",
+                )
+                return
+            if req_method.value.startswith(("sandbox.", "security.config.")) or req_method == ReqMethod.SECURITY_BUILTIN_GET or (
+                managed and is_managed_permissions_method(req_method)
+            ):
                 await channel.send_response(
                     ws, req_id, ok=False, error="AgentServer is not ready", code="AGENT_NOT_READY",
                 )
@@ -6166,6 +6178,13 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             return
         if not resp.ok:
             pl = resp.payload if isinstance(resp.payload, dict) else {}
+            if pl.get("saved") and not pl.get("applied", False):
+                await channel.send_response(
+                    ws, req_id, ok=False, payload=pl,
+                    error="security policy was saved but not fully applied",
+                    code="SECURITY_APPLY_INCOMPLETE",
+                )
+                return
             await channel.send_response(
                 ws,
                 req_id,
@@ -6186,6 +6205,16 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         channel.register_method(method_name, _handler)
 
     _register_perm("permissions.file_guard.get", _PermReq.PERMISSIONS_FILE_GUARD_GET)
+    _register_perm("security.config.get", _PermReq.SECURITY_CONFIG_GET)
+    _register_perm("security.config.initialize", _PermReq.SECURITY_CONFIG_INITIALIZE)
+    _register_perm("security.config.settings.update", _PermReq.SECURITY_CONFIG_SETTINGS_UPDATE)
+    _register_perm("security.config.local.update", _PermReq.SECURITY_CONFIG_LOCAL_UPDATE)
+    _register_perm("security.config.module.update", _PermReq.SECURITY_CONFIG_MODULE_UPDATE)
+    _register_perm("security.config.profile.update", _PermReq.SECURITY_CONFIG_PROFILE_UPDATE)
+    _register_perm("security.config.apply", _PermReq.SECURITY_CONFIG_APPLY)
+    _register_perm("security.config.sandbox.get", _PermReq.SECURITY_CONFIG_SANDBOX_GET)
+    _register_perm("security.config.sandbox.update", _PermReq.SECURITY_CONFIG_SANDBOX_UPDATE)
+    _register_perm("security.builtin.get", _PermReq.SECURITY_BUILTIN_GET)
     _register_perm("permissions.shell_guard.get", _PermReq.PERMISSIONS_SHELL_GUARD_GET)
     _register_perm("permissions.shell_guard.update", _PermReq.PERMISSIONS_SHELL_GUARD_UPDATE)
     _register_perm("permissions.file_guard.update", _PermReq.PERMISSIONS_FILE_GUARD_UPDATE)

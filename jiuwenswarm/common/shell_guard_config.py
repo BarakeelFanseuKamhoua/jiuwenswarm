@@ -29,19 +29,21 @@ def get_shell_guard_config():
     return {"builtin_rules_enabled": guard.get("builtin_rules_enabled", True)}
 
 
-def update_shell_guard_config(patch):
-    from jiuwenswarm.common.config import update_config
-
+def patch_shell_guard(data, patch):
+    """Apply the native ShellGuard settings patch to an in-memory config."""
     if not isinstance(patch, dict) or set(patch) - {"builtin_rules_enabled"}:
         raise ValueError("patch accepts only builtin_rules_enabled")
     if any(not isinstance(value, bool) for value in patch.values()):
         raise ValueError("builtin_rules_enabled must be boolean")
 
-    def mutate(data):
-        guard = data.setdefault("permissions", {}).setdefault("shell_guard", {})
-        guard.update(deepcopy(patch))
-        return data
+    guard = data.setdefault("permissions", {}).setdefault("shell_guard", {})
+    guard.update(deepcopy(patch))
+    return data
 
-    data = update_config(mutate)
+
+def update_shell_guard_config(patch):
+    from jiuwenswarm.common.config import update_config
+
+    data = update_config(lambda data: patch_shell_guard(data, patch))
     guard = data["permissions"]["shell_guard"]
     return {"builtin_rules_enabled": guard.get("builtin_rules_enabled", True)}

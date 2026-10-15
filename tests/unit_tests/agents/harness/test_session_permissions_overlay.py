@@ -104,6 +104,36 @@ def test_apply_session_overlay_merges_file_guard_exec_allow():
     assert defaults.get("exec") == "ask"
 
 
+def test_composed_overlay_cannot_replace_cloud_deny(tmp_path):
+    from openjiuwen.harness.security.permission_engine.fileguard.file_guard import (
+        FileGuardChecker, normalize_path_guard_config,
+    )
+    from openjiuwen.harness.security.permission_engine.models import PermissionLevel
+
+    pp = _load_permissions_persist()
+    target = str(tmp_path / "private")
+    base = {
+        "composition": {"schema_version": 1, "revision": "sec-test", "source_order": ["user", "cloud"]},
+        "file_guard": {"enabled": True, "paths": [{"path": target, "read": "deny", "layer": "cloud"}]},
+    }
+    overlay = {"file_guard": {"paths": [{"path": target, "read": "allow", "write": "allow"}]}}
+    merged = pp.apply_session_permissions_overlay(base, overlay)
+    paths = merged["file_guard"]["paths"]
+    assert len(paths) == 2
+    assert paths[0]["layer"] == "cloud" and paths[0]["read"] == "deny"
+    assert paths[1]["layer"] == "user"
+    checker = FileGuardChecker(normalize_path_guard_config(merged, workspace_root=tmp_path))
+    assert checker._resolve_one(tmp_path / "private" / "data.txt", "read")[0] == PermissionLevel.DENY
+
+    base["composition"]["source_order"] = ["cloud"]
+    disabled = pp.apply_session_permissions_overlay(base, overlay)
+    assert disabled["file_guard"]["paths"] == base["file_guard"]["paths"]
+    base["composition"]["source_order"] = ["user", "cloud"]
+    base["file_guard"]["enabled"] = False
+    overlay["file_guard"]["enabled"] = True
+    assert pp.apply_session_permissions_overlay(base, overlay)["file_guard"]["enabled"] is False
+
+
 @pytest.mark.parametrize("overlay_enabled,with_path", [(True, False), (None, True), (True, True)])
 def test_session_overlay_preserves_explicit_file_guard_disable(overlay_enabled, with_path):
     pp = _load_permissions_persist()

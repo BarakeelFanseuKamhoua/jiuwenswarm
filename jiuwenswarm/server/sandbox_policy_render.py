@@ -47,6 +47,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 _RUNTIME_COPY_NAME = "windows-policy.runtime.yaml"
+_NATIVE_NETWORK_NAME = "security.sandbox-network.local.yaml"
 
 # P1-13: 同进程串行化副本读写 (防 lost-update). WS handler 虽串行, 但
 # sandbox.files.set + sandbox.network.set 可能并发触发 (officeAce 前端同时改文件
@@ -269,6 +271,35 @@ def get_sandbox_files_config() -> dict[str, Any]:
     }
 
 
+def get_sandbox_files_axes() -> dict[str, list[str]]:
+    """Return the original four-axis ACL without collapsing read and write."""
+    fs = _load_copy().get("windows", {}).get("filesystem", {})
+    return {key: _norm_str_list(fs.get(key) or []) for key in (
+        "allow_read", "allow_write", "deny_read", "deny_write",
+    )}
+
+
+def validate_sandbox_files_axes(files: dict[str, Any]) -> dict[str, list[str]]:
+    keys = {"allow_read", "allow_write", "deny_read", "deny_write"}
+    if not isinstance(files, dict) or set(files) != keys:
+        raise ValueError("filesystem requires allow_read/allow_write/deny_read/deny_write")
+    normalized = {}
+    for key in keys:
+        values = files[key]
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError(f"filesystem.{key} must be a list of paths")
+        normalized[key] = list(dict.fromkeys(_validate_file_path(value) for value in values))
+    return normalized
+
+
+def set_sandbox_files_axes(files: dict[str, Any]) -> dict[str, list[str]]:
+    normalized = validate_sandbox_files_axes(files)
+    data = _load_copy()
+    data["windows"]["filesystem"].update(normalized)
+    _save_copy(data)
+    return normalized
+
+
 def set_sandbox_files_config(allow: list[Any], deny: list[Any]) -> dict[str, Any]:
     """整体替换用户文件白/黑名单.
 
@@ -371,6 +402,86 @@ def get_sandbox_network_config() -> dict[str, Any]:
         "allow_domains": _norm_str_list(eg.get("allowed_domains") or []),
         "deny_domains": _norm_str_list(eg.get("blocked_domains") or []),
     }
+
+
+def _native_network_path(config_path: Path | None = None) -> Path:
+    return (Path(config_path).parent if config_path is not None else _config_dir()) / _NATIVE_NETWORK_NAME
+
+
+def has_native_sandbox_network_config() -> bool:
+    return _native_network_path().is_file()
+
+
+def validate_native_sandbox_network(network: Any) -> dict[str, Any]:
+    if not isinstance(network, dict) or set(network) != {"disable_all", "allow_domains", "deny_domains"}:
+        raise ValueError("native network requires disable_all/allow_domains/deny_domains")
+    if not isinstance(network["disable_all"], bool):
+        raise ValueError("disable_all must be boolean")
+    if network["disable_all"] and not _is_windows():
+        raise ValueError("disable_all is only supported on Windows sandbox")
+    normalized = {"disable_all": network["disable_all"]}
+    for key in ("allow_domains", "deny_domains"):
+        values = network[key]
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError(f"{key} must be a list of domains")
+        normalized[key] = list(dict.fromkeys(_validate_domain(value) for value in values))
+    return normalized
+
+
+def _save_native_network(path: Path, network: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(yaml.safe_dump(network, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def initialize_native_sandbox_network(config_path: Path, projected_urls: dict[str, str]) -> None:
+    """Capture the old runtime network once, before composition can rewrite it."""
+    if not isinstance(projected_urls, dict):
+        raise ValueError("sandbox.urls must be a domain map")
+    path = _native_network_path(config_path)
+    if path.exists():
+        return
+    runtime_path = Path(config_path).parent / (
+        _RUNTIME_COPY_NAME if _is_windows() else _LINUX_RUNTIME_COPY_NAME
+    )
+    if runtime_path.is_file():
+        data = yaml.safe_load(runtime_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError("invalid sandbox runtime policy")
+        net = (data.get("windows") or {}).get("network", {}) if _is_windows() else data.get("network", {})
+        egress = net.get("egress") or {}
+        network = {
+            "disable_all": bool(net.get("disable_all", False)),
+            "allow_domains": egress.get("allowed_domains") or [],
+            "deny_domains": egress.get("blocked_domains") or [],
+        }
+    else:
+        network = {"disable_all": False, "allow_domains": [], "deny_domains": []}
+    network = validate_native_sandbox_network(network)
+    if any(
+        domain in network["allow_domains" if action == "allow" else "deny_domains"]
+        for domain, action in projected_urls.items()
+    ):
+        raise ValueError("sandbox network origin is ambiguous; review existing projected URLs before initialization")
+    _save_native_network(path, network)
+
+
+def get_native_sandbox_network_config() -> dict[str, Any]:
+    path = _native_network_path()
+    if not path.is_file():
+        return get_sandbox_network_config()
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return validate_native_sandbox_network(data)
+
+
+def set_native_sandbox_network_config(network: dict[str, Any]) -> dict[str, Any]:
+    normalized = validate_native_sandbox_network(network)
+    _save_native_network(_native_network_path(), normalized)
+    return normalized
 
 
 def set_sandbox_network_config(
