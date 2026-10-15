@@ -4497,14 +4497,14 @@ class JiuWenSwarmDeepAdapter:
                     request.request_id,
                     [str(t.get("name") or "") for t in tool_defs],
                 )
+            append_ctx = _RequestMcpAppendContext(
+                request=request,
+                request_scope=request_scope,
+                buffers=install_buffers,
+                replaceable_tool_ids=replaceable_tool_ids,
+                empty_registration=empty_registration,
+            )
             if leftover_servers:
-                append_ctx = _RequestMcpAppendContext(
-                    request=request,
-                    request_scope=request_scope,
-                    buffers=install_buffers,
-                    replaceable_tool_ids=replaceable_tool_ids,
-                    empty_registration=empty_registration,
-                )
                 invocation_id = await self._append_request_mcp_server_tools(
                     append_ctx,
                     leftover_servers,
