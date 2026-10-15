@@ -127,6 +127,13 @@ def register_http_routes(app: FastAPI, channel: WebChannel) -> None:
     attach_trajectory_routes(app, channel)
     # register auth http routes for huawei account login
     register_auth_routes(app)
+    # Manager → Gateway 配置下发（与用户 Web 共用 WEB_PORT；受开关控制）
+    try:
+        from jiuwenswarm.gateway.manager_config import register_manager_config_routes
+
+        register_manager_config_routes(app)
+    except Exception:  # noqa: BLE001 — 管理面注册失败不应阻断用户 Web
+        logger.exception("failed to register Manager config routes")
 
 
 async def _serve_channel_websocket(channel: WebChannel, websocket: WebSocket) -> None:

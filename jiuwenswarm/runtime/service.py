@@ -2764,16 +2764,14 @@ class AgentRuntime:
                     except BaseException as exc:
                         cleanup_errors.append(exc)
             self._stateless_agents.clear()
-            try:
-                await self.agent_manager.cleanup()
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-            # 默认 Manager 已在 start() 登记进池；请求路径还会懒建其它租户。
-            # peek 避免关闭路径误创建新单例；pool.cleanup 覆盖全部缓存 Manager。
+            # 默认 Manager 在 start() 已 adopt 进池，与池内条目为同一对象。
+            # 有池时只走 pool.cleanup()，避免对默认 Manager 重复 cleanup。
             try:
                 pool = TenantAgentPool.peek_instance()
                 if pool is not None:
                     await pool.cleanup()
+                else:
+                    await self.agent_manager.cleanup()
             except BaseException as exc:
                 cleanup_errors.append(exc)
             async with self._agent_execution_owner_lock:

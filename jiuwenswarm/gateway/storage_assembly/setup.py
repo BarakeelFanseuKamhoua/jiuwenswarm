@@ -194,9 +194,10 @@ def _wire_config_repositories(
     store: PersistentStore,
     cfg: dict[str, Any] | None,
 ) -> None:
-    """注入 channel / permissions / logging Repository。"""
+    """注入 channel / permissions / logging / memory Repository。"""
     from jiuwenswarm.gateway.config.channel.access import set_channel_config_repository
     from jiuwenswarm.gateway.config.logging.access import set_logging_config_repository
+    from jiuwenswarm.gateway.config.memory.access import set_memory_config_repository
     from jiuwenswarm.gateway.config.permissions.access import (
         set_permissions_config_repository,
     )
@@ -212,6 +213,9 @@ def _wire_config_repositories(
     set_logging_config_repository(
         create_logging_config_repository(store, instance_id=instance_id)
     )
+    set_memory_config_repository(
+        create_memory_config_repository(store, instance_id=instance_id)
+    )
     set_persistent_store(store)
 
 
@@ -221,6 +225,7 @@ def _clear_config_repositories() -> None:
         clear_enterprise_record_repositories,
     )
     from jiuwenswarm.gateway.config.logging.access import clear_logging_config_repository
+    from jiuwenswarm.gateway.config.memory.access import clear_memory_config_repository
     from jiuwenswarm.gateway.config.permissions.access import (
         clear_permissions_config_repository,
     )
@@ -229,6 +234,7 @@ def _clear_config_repositories() -> None:
     clear_channel_config_repository()
     clear_permissions_config_repository()
     clear_logging_config_repository()
+    clear_memory_config_repository()
     clear_enterprise_record_repositories()
     clear_persistent_store()
 
@@ -277,8 +283,29 @@ async def setup_gateway_storage_repositories(
                 instance_id="",
             )
         )
+        await _cold_load_memory_configs()
 
     return ctx
+
+
+async def _cold_load_memory_configs() -> None:
+    """企业版：从 Gateway DB 冷加载 memory / task_memory 缓存。"""
+    try:
+        from jiuwenswarm.agents.harness.common.memory.config import (
+            reload_memory_config_from_gateway_db,
+            reload_task_memory_config_from_gateway_db,
+        )
+
+        await reload_task_memory_config_from_gateway_db()
+        await reload_memory_config_from_gateway_db()
+        logger.info(
+            "[StorageAssembly] memory/task_memory_config loaded from Gateway DB (if any)"
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[StorageAssembly] memory/task_memory_config cold load skipped",
+            exc_info=True,
+        )
 
 
 async def teardown_gateway_storage_repositories(ctx: StorageContext) -> None:
@@ -349,6 +376,8 @@ async def wire_enterprise_persistent_repositories_async(
 
     if get_channel_config_repository() is None:
         _wire_config_repositories(store, cfg)
+
+    await _cold_load_memory_configs()
 
 
 async def setup_session_map_repository(
@@ -456,6 +485,25 @@ def create_logging_config_repository(
     return LoggingConfigRepository(store, codec, instance_id=instance_id)
 
 
+def create_memory_config_repository(
+    store: PersistentStore,
+    *,
+    instance_id: str = "",
+):
+    from jiuwenswarm.gateway.config.memory import (
+        DbBodySectionCodec,
+        MemoryConfigRepository,
+        YamlSectionCodec,
+    )
+
+    codec = (
+        DbBodySectionCodec()
+        if is_enterprise()
+        else YamlSectionCodec()
+    )
+    return MemoryConfigRepository(store, codec, instance_id=instance_id)
+
+
 def create_enterprise_record_repository(
     store: PersistentStore,
     store_name: str,
@@ -500,6 +548,7 @@ __all__ = [
     "create_enterprise_record_repositories",
     "create_gateway_storage_context",
     "create_logging_config_repository",
+    "create_memory_config_repository",
     "create_permissions_config_repository",
     "create_session_map_repository",
     "create_session_sharing_registry",
