@@ -951,14 +951,12 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
     # CreateProcessAsUserW 的 lpCommandLine 需可变 buffer (Windows 原地修改),
     # 不能直接传 str (ctypes 转 c_wchar_p 只读, 修改触发段错误).
     cmd_line_buf = ctypes.create_unicode_buffer(cmd_line)
-    # 始终构造 env block (env=None 回退 os.environ). 不能传 NULL 给 CreateProcessAsUserW
+    # 以调用方环境构造 env block; 不继承 runner 的加载路径或凭据。
+    # 不能传 NULL 给 CreateProcessAsUserW
     # (空环境无 PATH → WinError 2). 自动注入 HTTP(S)_PROXY 指向代理端口 (文档 §6.6).
     env_block_buf = None
     env_block_ptr = None
-    if env is None:
-        env = dict(os.environ)
-    else:
-        env = dict(env)
+    env = dict(env or {})
     # 兜底补齐 DLL 加载/子进程运行所需基本变量: 缺 SystemRoot 等会 STATUS_DLL_INIT_FAILED (0xC0000142).
     # box-server 端 _build_windows_exec_env 已补一次, 经 IPC 序列化后调用方 env 可能残缺, 第二跳再补 (setdefault 不覆盖).
     for _var in ("SystemRoot", "windir", "PATHEXT", "COMSPEC"):
@@ -974,6 +972,7 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
     # (<profile>\AppData\Local\Temp\jiuwenbox\<sandbox_id>\). ms-playwright 安装目录跨沙箱共用不重下.
     # 降级: 拿不到 profile → 回落 workspace/.tmp.
     _sandbox_id = os.path.basename(workspace.rstrip("\\/")) if workspace else None
+    _profile_dir = None
     if _sandbox_id:
         _profile_dir = get_sandbox_profile_dir()
         if _profile_dir:
@@ -988,12 +987,14 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
                           f"{_child_tmp}: {_e}")
             env["TEMP"] = _child_tmp
             env["TMP"] = _child_tmp
+            env["TMPDIR"] = _child_tmp
             # 补全 profile 变量 (header env 不带).
-            env.setdefault("USERPROFILE", _profile_dir)
-            env.setdefault("LOCALAPPDATA", os.path.join(_profile_dir, "AppData", "Local"))
-            env.setdefault("APPDATA", os.path.join(_profile_dir, "AppData", "Roaming"))
+            env["USERPROFILE"] = _profile_dir
+            env["HOME"] = _profile_dir
+            env["LOCALAPPDATA"] = os.path.join(_profile_dir, "AppData", "Local")
+            env["APPDATA"] = os.path.join(_profile_dir, "AppData", "Roaming")
     # 降级: 拿不到 profile → 回落 workspace/.tmp.
-    if "TEMP" not in env and workspace:
+    if _profile_dir is None and workspace:
         _child_tmp = os.path.join(workspace, ".tmp")
         try:
             os.makedirs(_child_tmp, exist_ok=True)
@@ -1001,6 +1002,11 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
             pass
         env["TEMP"] = _child_tmp
         env["TMP"] = _child_tmp
+        env["TMPDIR"] = _child_tmp
+        env["USERPROFILE"] = workspace
+        env["HOME"] = workspace
+        env["LOCALAPPDATA"] = os.path.join(workspace, "AppData", "Local")
+        env["APPDATA"] = os.path.join(workspace, "AppData", "Roaming")
     elif "TEMP" not in env:
         for _var in ("TEMP", "TMP"):
             _val = os.environ.get(_var)
@@ -1009,13 +1015,15 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
     # 自动注入代理 env (文档 §6.6): 即使调用方没传, 也让遵守代理协议的程序
     # (pip/git/curl/node 等) 走 win_proxy, WFP 兜底拦截不走代理的出网.
     proxy_url = f"http://127.0.0.1:{_proxy_port_start}"
-    env.setdefault("HTTP_PROXY", proxy_url)
-    env.setdefault("HTTPS_PROXY", proxy_url)
-    env.setdefault("http_proxy", proxy_url)
-    env.setdefault("https_proxy", proxy_url)
-    env.setdefault("ALL_PROXY", proxy_url)
+    env["HTTP_PROXY"] = proxy_url
+    env["HTTPS_PROXY"] = proxy_url
+    env["http_proxy"] = proxy_url
+    env["https_proxy"] = proxy_url
+    env["ALL_PROXY"] = proxy_url
+    env["all_proxy"] = proxy_url
     # NO_PROXY 放行 loopback 自身 (代理 → 代理 不该再走代理).
-    env.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    env["no_proxy"] = env["NO_PROXY"]
     # JIUWENBOX_INJECT_ENV 通用约定键: 调用方把"子进程需要的额外 env"以 JSON 编码塞进此键,
     # 沙箱解析后 setdefault 注入子进程, 再删该键本身 (不泄漏). 沙箱不认识工具语义,
     # 新工具只改调用方. 解析失败只 warning 不阻断.

@@ -59,6 +59,7 @@ from jiuwenbox.server.runtime.base import (
     RuntimeFileOpResult,
 )
 from jiuwenbox.server.workspace import SANDBOX_WORKSPACE, WIN_SANDBOX_WORKSPACE_ROOT
+from jiuwenbox.server.environment import inherited_environment
 from jiuwenbox.supervisor import cgroup as cgroup_module
 from jiuwenbox.supervisor import network as network_module
 from jiuwenbox.supervisor.bwrap import BwrapConfig
@@ -951,6 +952,8 @@ class ProcessRuntime(RuntimeAdapter):
         scripts, seccomp BPF, landlock payload) keep the per-call cost low.
         """
         config = BwrapConfig.from_policy(policy, list(command))
+        config.extra_args.append("--clearenv")
+        config.env = {**inherited_environment(), **config.env}
         process_uid = config.uid
         process_gid = config.gid
         if sandbox_env:
@@ -3158,26 +3161,17 @@ class ProcessRuntime(RuntimeAdapter):
         )
         env.setdefault("TEMP", win_tmp_dir)
         env.setdefault("TMP", win_tmp_dir)
+        env.setdefault("TMPDIR", win_tmp_dir)
         # 补 profile 变量 (第一跳 runner env 缺这些, profile 加载只在不传 env
         # block 时自动填; 我们传了 env block → 需显式补, 否则 child 继承不到).
         env.setdefault("USERPROFILE", _profile_root)
+        env.setdefault("HOME", _profile_root)
         env.setdefault("LOCALAPPDATA", os.path.join(_profile_root, "AppData", "Local"))
         env.setdefault("APPDATA", os.path.join(_profile_root, "AppData", "Roaming"))
-        # CreateProcessWithLogonW 传自定义 env 块会替换整个环境, 必须把 box-server
-        # 自己的 PYTHONPATH 带给 runner, 否则 ``python -m jiuwenbox.supervisor.win_exec``
-        # 立刻 ModuleNotFoundError 退出 → 沙箱 phase=error.
-        for _inherit_key in (
-            "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING", "PYTHONUTF8",
-            "PATHEXT", "SystemRoot", "windir", "COMSPEC",
-            "JIUWENBOX_RUNNER_PYTHON",
-        ):
-            if not env.get(_inherit_key):
-                _inherit_val = os.environ.get(_inherit_key)
-                if _inherit_val:
-                    env[_inherit_key] = _inherit_val
-        for _k, _v in os.environ.items():
-            if _k.startswith("JIUWENBOX_") and _k not in env and _v:
-                env[_k] = _v
+        # Keep service loader/control settings in the runner, but inherit only
+        # configured tool keys alongside system requirements.
+        for _k, _v in inherited_environment(for_runner=True).items():
+            env.setdefault(_k, _v)
         logger.debug(
             "[SandboxWin] %s sandbox-writable temp injected: TEMP=%s",
             sandbox_id, win_tmp_dir,
@@ -3206,27 +3200,19 @@ class ProcessRuntime(RuntimeAdapter):
                         sandbox_id, _runner_py, exc_info=True,
                     )
                 logger.info("[SandboxWin] %s grant_parent_traverse done", sandbox_id)
-            # 增量检测: per-sandbox policy 的 deny/allow 路径是否需要预授 WRITE_DAC.
-            # 运行时 box-server 是普通用户, 对 owner=Administrators 的目录 (如 D:/software)
-            # 没有 WRITE_DAC, grant_ace 会 WinError 5 → Deny Read ACE 不生效.
-            # 检测到新路径时弹 UAC 补授权.
-            try:
-                _all_acl_paths = list(dict.fromkeys(
-                    allow_read_paths + deny_read_paths + allow_write_paths + deny_write_paths
-                ))
-                win_setup.ensure_acl_policy_paths_authorized(
-                    _all_acl_paths,
-                    proxy_port_start=policy.windows.proxy.port_range_start,
-                    proxy_port_end=policy.windows.proxy.port_range_end,
-                    policy_path=str(policy_path),
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug("[SandboxWin] %s deny/allow 路径 WRITE_DAC 增量检测失败 (非致命)", sandbox_id, exc_info=True)
-            # install 预装读 ACL 的路径
-            try:
-                _preinstalled = win_setup.get_preinstalled_read_paths()
-            except Exception:  # noqa: BLE001 - best-effort, 读注册表失败不阻断创建
-                _preinstalled = set()
+            # Preinstalled read-only tool paths need no runtime DACL mutation.
+            _preinstalled = win_setup.get_preinstalled_read_paths()
+            _all_acl_paths = list(dict.fromkeys(
+                [p for p in allow_read_paths if os.path.expandvars(p).rstrip("\\/").lower() not in _preinstalled]
+                + deny_read_paths + allow_write_paths + deny_write_paths
+            ))
+            win_setup.ensure_acl_policy_paths_authorized(
+                _all_acl_paths,
+                proxy_port_start=policy.windows.proxy.port_range_start,
+                proxy_port_end=policy.windows.proxy.port_range_end,
+                policy_path=str(policy_path),
+                allow_elevation=False,
+            )
             _t_acl0 = time.perf_counter()
             desktop_data_dir = win_acl.resolve_desktop_data_dir()
 

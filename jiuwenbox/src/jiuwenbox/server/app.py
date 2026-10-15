@@ -323,11 +323,13 @@ async def lifespan(_application: FastAPI):
                         else _wconst.DEFAULT_PROXY_PORT_RANGE_END
                     ),
                     policy_path=_policy_path or None,
+                    allow_elevation=False,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "ensure_windows_setup 失败; Windows 沙箱可能不可用",
                 )
+                raise
             # 启动时差集清理: 清掉历史 apply 过但当前 policy 不再包含的路径上的残留 ACE,
             # 避免配置变更 (路径从 allow_read 移除) 后旧 ACE 残留导致配置不生效
             try:

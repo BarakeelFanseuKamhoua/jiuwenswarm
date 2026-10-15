@@ -16,7 +16,7 @@ r"""Windows 沙箱一次性环境准备.
 
 安装入口:
   - 桌面安装器 (已提权) 调 ``--desktop-run-win-setup --install --force --recreate-user``.
-  - 显式 CLI 非管理员仍会 ShellExecuteW(runas); 运行时不再走这条路.
+  - agent 启动 box-server 前检查环境, 必要时只提升 setup 子进程.
 """
 
 from __future__ import annotations
@@ -62,6 +62,21 @@ def _require_windows() -> None:
 SW_HIDE = 0
 SW_SHOWNORMAL = 1
 SW_UAC_SHOW = SW_SHOWNORMAL
+
+
+class ShellExecuteInfo(ctypes.Structure):
+    """SHELLEXECUTEINFOW, including its pointer-sized icon/monitor union."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR), ("nShow", wintypes.INT),
+        ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
 
 
 def _resolve_install_log_dir() -> str:
@@ -256,6 +271,8 @@ def get_kernel32() -> ctypes.WinDLL:
         # 不依赖提权子进程的 process handle (ShellExecuteW 拿不到), 改靠命名 Event.
         _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         _kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         # CreateEventW: 主进程创建命名 Event (非信号态), 名字传给 install 子进程.
         _kernel32.CreateEventW.argtypes = [
             ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR,
@@ -292,6 +309,8 @@ def _get_shell32() -> ctypes.WinDLL:
             wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.INT,
         ]
         _shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+        _shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+        _shell32.ShellExecuteExW.restype = wintypes.BOOL
     return _shell32
 
 
@@ -399,14 +418,18 @@ def get_preinstalled_read_paths() -> "set[str]":
     """
     import json as _json
     raw = reg_get_str(const.REG_VALUE_PREINSTALLED_PATHS)
-    if not raw:
-        return set()
     try:
-        paths = _json.loads(raw)
+        paths = _json.loads(raw or "[]")
     except (ValueError, TypeError):  # noqa: BLE001
-        return set()
+        paths = []
     if not isinstance(paths, list):
-        return set()
+        paths = []
+    try:
+        cached = _json.loads((Path(_resolve_install_log_dir()) / "preinstalled_paths.json").read_text(encoding="utf-8"))
+        if isinstance(cached, list):
+            paths += cached
+    except (OSError, ValueError, TypeError):
+        pass
     return {os.path.expandvars(p).rstrip("\\/").lower() for p in paths if isinstance(p, str) and p}
 
 
@@ -492,7 +515,7 @@ def _sandbox_user_exists() -> bool:
             netapi32.NetApiBufferFree(buf)
 
 
-def _logon_sandbox_user(password: str) -> bool:
+def _logon_sandbox_user(password: str, *, interactive: bool = False) -> bool:
     """用给定密码 LogonUserW 校验 jbx-sandbox 能否登录 (不加载 profile)."""
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     token = ctypes.c_void_p()
@@ -503,10 +526,10 @@ def _logon_sandbox_user(password: str) -> bool:
     logon_interactive = 2  # noqa: N806 - Win32 常量
     ok = advapi32.LogonUserW(
         const.SANDBOX_USER_NAME, None, password,
-        logon_network, logon_provider_default,
+        logon_interactive if interactive else logon_network, logon_provider_default,
         ctypes.byref(token),
     )
-    if not ok:
+    if not ok and not interactive:
         network_err = ctypes.get_last_error()
         logger.debug(
             "jbx-sandbox network logon 失败 (WinError %d), 回退 interactive 校验密码",
@@ -1296,16 +1319,20 @@ def _write_uac_python_launcher(payload_exe: str, payload_args: list[str]) -> str
     import tempfile
 
     argv = [payload_exe, *payload_args]
+    setup_env = {k: v for k, v in os.environ.items() if k.startswith("JIUWENBOX_") or k in {
+        "PYTHONPATH", "JIUWENCLAW_DATA_DIR", "OFFICE_CLAW_DATA_DIR",
+    }}
     body = (
         "import os, subprocess, sys\n"
         f"_argv = {argv!r}\n"
+        f"os.environ.update({setup_env!r})\n"
         "if sys.platform == 'win32':\n"
         "    try:\n"
         "        import ctypes\n"
         "        ctypes.windll.kernel32.FreeConsole()\n"
         "    except Exception:\n"
         "        pass\n"
-        "_kw = {}\n"
+        "_kw = {'stdin': subprocess.DEVNULL}\n"
         "if sys.platform == 'win32':\n"
         "    _kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)\n"
         "try:\n"
@@ -1326,22 +1353,15 @@ def _write_uac_python_launcher(payload_exe: str, payload_args: list[str]) -> str
 
 def _uac_shell_execute_target(payload_exe: str, payload_args: list[str]) -> tuple[str, str]:
     """ShellExecuteW 的 (file, params); 能找到 python.exe 时用它做 UAC 展示名."""
-    direct_params = " ".join(_quote_arg(p) for p in payload_args)
     uac_py = _resolve_uac_python()
     if not uac_py:
         logger.warning(
             "未找到随包 python.exe, UAC 将显示 %s; 请确认桌面 runtime/python-win 已解压",
             payload_exe,
         )
-        return payload_exe, direct_params
-    try:
-        same = os.path.normcase(str(Path(uac_py).resolve())) == os.path.normcase(
-            str(Path(payload_exe).resolve())
-        )
-    except (OSError, RuntimeError):
-        same = False
-    if same:
-        return uac_py, direct_params
+        uac_py = payload_exe
+    # ShellExecute does not accept an environment block. Always carry the
+    # source/runtime bootstrap environment through the elevated launcher.
     launcher = _write_uac_python_launcher(payload_exe, payload_args)
     logger.info(
         "UAC 展示 python=%s, 实际 install payload=%s, launcher=%s",
@@ -1357,135 +1377,73 @@ def _elevate_and_run_install(
     proxy_port_end: int = const.DEFAULT_PROXY_PORT_RANGE_END,
     policy_path: str | None = None,
     recreate_user: bool = False,
+    host_user_sid: str | None = None,
+    acl_paths: list[str] | None = None,
+    authorize_only: bool = False,
 ) -> int:
-    """通过 UAC 拉起提权子进程执行 install, 并同步阻塞等待其完成.
+    """Elevate only setup and require a successful process exit."""
+    import base64
 
-    转发 force / recreate_user / preinstall_paths / proxy_port_* / policy_path
-    到提权子进程 (review MAJOR #9: 旧版只传 --install, force=True 会静默 no-op).
-
-    同步机制: 沿用旧版能正常弹 UAC 的 ShellExecuteW (它返回 HINSTANCE, 拿不到
-    子进程 handle, 无法直接 WaitForSingleObject 等进程). 改用一个命名 Event:
-    主进程 CreateEventW 创建非信号态 Event, 名字经 --install-done-event 参数传
-    给 install 子进程; ShellExecuteW 弹 UAC 拉起子进程后, 主进程
-    WaitForSingleObject(event, INFINITE) 阻塞; install 子进程在 install() 跑完
-    所有步骤 (用户/密码/installed 标记/PREINSTALLED_PATHS 全部就位) 后、return
-    前 SetEvent 通知主进程. 这样主进程继续往下时 install 已真完成, 不会再用半
-    成品密码 CreateProcessWithLogonW → 1326 (旧版异步返回的根因).
-
-    用户取消 UAC 弹窗 (点"否"): ShellExecuteW 返回 <= 32, WinError 1223
-    (ERROR_CANCELLED). 抛 RuntimeError 提示用户重试 (而非静默返回 0).
-    """
-    shell32 = _get_shell32()
-    kernel32 = get_kernel32()
-    # 冻结 exe 直接 runas 自身: pythonw launcher 会被桌面 taskkill /T 杀掉.
-    if getattr(sys, "frozen", False):
-        py = sys.executable
-        parts = ["--desktop-run-win-setup", const.INSTALL_SUBCOMMAND]
-    else:
-        py = (os.environ.get("JIUWENBOX_RUNNER_PYTHON") or "").strip() or sys.executable
-        parts = ["-m", "jiuwenbox.supervisor.win_setup", const.INSTALL_SUBCOMMAND]
-    # 每次调用生成唯一 event 名, 避免多 box-server 实例/并发 install 串扰.
-    event_name = f"Global\\JiuwenBox-Install-Done-{secrets.token_hex(8)}"
-    # 主进程先创建非信号态 Event (子进程将 OpenEvent 同名并 SetEvent).
-    # Manual reset=False (自动复位), initial=非信号. lpSecurityAttributes=None
-    # (Global 命名空间默认 ACL 允许同会话/管理员子进程打开).
-    h_event = kernel32.CreateEventW(None, False, False, event_name)
-    if not h_event:
-        err = ctypes.get_last_error()
-        raise RuntimeError(
-            f"创建 install 同步 Event 失败 (CreateEventW WinError {err})"
-        )
-
+    py = sys.executable
+    parts = (["--desktop-run-win-setup"] if getattr(sys, "frozen", False)
+             else ["-m", "jiuwenbox.supervisor.win_setup"])
+    parts.append(const.INSTALL_SUBCOMMAND)
     if force:
         parts.append("--force")
     if recreate_user:
         parts.append("--recreate-user")
-    parts.append("--proxy-port-start")
-    parts.append(str(proxy_port_start))
-    parts.append("--proxy-port-end")
-    parts.append(str(proxy_port_end))
-    # 把完成 Event 名传给子进程, 子进程 install 跑完后 SetEvent 通知本进程.
-    parts.append("--install-done-event")
-    parts.append(event_name)
-    # install_force.log 落盘到用户数据目录 (~/.office-claw/.jiuwenclaw/jiuwenbox),
-    # 子进程需显式接收路径, 否则会 fallback 回包目录写日志.
-    parts.append("--install-log-path")
-    parts.append(_install_log_path())
-    if preinstall_paths:
-        # 用 base64(JSON) 编码列表传参: json.dumps 含内层双引号, Windows 命令行解析会把内层 " 当闭合, 含空格路径被拆成多 argv →
-        # 子进程 argparse 报错退出, 到不了 install/SetEvent. base64 后是纯字母, 彻底避开命令行转义.
-        import base64
-        encoded = base64.b64encode(
-            json.dumps(preinstall_paths).encode("utf-8")
-        ).decode("ascii")
-        parts.append("--preinstall-paths")
-        parts.append(encoded)
+    if authorize_only:
+        parts.append("--authorize-only")
+    parts += ["--proxy-port-start", str(proxy_port_start),
+              "--proxy-port-end", str(proxy_port_end),
+              "--install-log-path", _install_log_path()]
+    for flag, paths in (("--preinstall-paths", preinstall_paths), ("--acl-paths", acl_paths)):
+        if paths is not None:
+            parts += [flag, base64.b64encode(json.dumps(paths).encode("utf-8")).decode("ascii")]
+    host_user_sid = host_user_sid or _lookup_current_user_sid()
+    if not host_user_sid:
+        raise RuntimeError("无法确定需要沙箱授权的宿主用户 SID")
+    parts += ["--host-user-sid", host_user_sid]
     if policy_path:
-        parts.append("--policy-path")
-        parts.append(policy_path)
-    if getattr(sys, "frozen", False) and py == sys.executable:
+        parts += ["--policy-path", policy_path]
+    if getattr(sys, "frozen", False):
         uac_file, params = py, " ".join(_quote_arg(p) for p in parts)
     else:
         uac_file, params = _uac_shell_execute_target(py, parts)
 
-    logger.info(
-        "install 提权调用: uac=%s payload=%s event=%s cmd='%s %s'",
-        uac_file, py, event_name, uac_file, params,
-    )
-
-    # ShellExecuteW(parent, verb, file, parameters, directory, show).
-    # SW_UAC_SHOW: 弹出可见 UAC 确认框 (SW_HIDE 时用户看不到, 120s 超时导致沙箱/AgentServer 反复重启).
-    result = shell32.ShellExecuteW(None, "runas", uac_file, params, None, SW_UAC_SHOW)
-    logger.info(
-        "ShellExecuteW(runas, SW_UAC_SHOW) 返回 %s (>32=已发起 UAC, 不代表用户已点确认)",
-        result,
-    )
-    if result <= 32:  # <= 32 表示失败.
-        kernel32.CloseHandle(wintypes.HANDLE(h_event))
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x40 | 0x100  # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = uac_file
+    info.lpParameters = params
+    info.nShow = SW_HIDE  # Hides the setup console, not Windows' UAC security prompt.
+    logger.info("正在请求管理员授权以安装、修复或补授权 Windows 沙箱")
+    if not _get_shell32().ShellExecuteExW(ctypes.byref(info)):
         err = ctypes.get_last_error()
-        if err == 1223:  # ERROR_CANCELLED: 用户点了"否".
-            raise RuntimeError(
-                "UAC 提权被用户取消; 请重新创建沙箱并同意 UAC, 或以管理员身份"
-                " 手动运行 'python -m jiuwenbox.supervisor.win_setup --install'"
-            )
-        raise RuntimeError(
-            f"UAC 提权失败 (ShellExecuteW 返回 {result}, WinError {err}); 请以"
-            f"管理员身份手动运行 'python -m jiuwenbox.supervisor.win_setup --install'"
-        )
-
-    # 阻塞等待 install 跑完 SetEvent (Event 自动复位). P1-10: 120s 超时兜底, 旧版 INFINITE 在子进程
-    # SetEvent 前崩溃会永久阻塞. 超时不 raise — install 可能仍在跑 (慢机器/用户离开 UAC), 降级 warning 让上层按 installed 标记判断.
-    wait_obj_0 = 0  # noqa: N806 - Win32 常量
-    wait_timeout = 0x00000102  # noqa: N806 - Win32 常量
-    wait_failed = 0xFFFFFFFF  # noqa: N806 - Win32 常量
-    install_wait_timeout = 120_000  # noqa: N806 - Win32 常量
-    logger.info("已通过 UAC 提权运行 install 子进程 (force=%s), 阻塞等待完成 (超时 %ds)...", force, install_wait_timeout // 1000)
+        if err == 1223:
+            raise RuntimeError("沙箱初始化已取消: 未批准管理员授权 (WinError 1223)")
+        raise RuntimeError(f"无法请求沙箱管理员权限 (WinError {err}): {ctypes.FormatError(err)}")
+    if not info.hProcess:
+        raise RuntimeError("沙箱提权未返回安装进程句柄, 无法确认初始化成功")
+    kernel32 = get_kernel32()
     try:
-        wait_result = kernel32.WaitForSingleObject(
-            wintypes.HANDLE(h_event), install_wait_timeout,
-        )
-        if wait_result == wait_failed:
+        wait_result = kernel32.WaitForSingleObject(info.hProcess, 90_000)
+        if wait_result == 0x102:
+            raise RuntimeError("沙箱初始化超时: 安装尚未完成, 本地服务未就绪")
+        if wait_result != 0:
             err = ctypes.get_last_error()
-            raise RuntimeError(
-                f"等待 install 子进程完成失败 (WaitForSingleObject WinError {err})"
-            )
-        if wait_result == wait_timeout:
-            # 未在 120s 内 SetEvent. 不 raise — 可能仍在跑或已崩溃, 降级 warning, 上层按 installed 标记判断.
-            logger.warning(
-                "install 提权子进程 %ds 未完成 SetEvent (超时降级). install 可能仍在"
-                "运行或已崩溃; 后续将按 installed 标记判断, 若失败请重试",
-                install_wait_timeout // 1000,
-            )
-        elif wait_result != wait_obj_0:
-            raise RuntimeError(
-                f"等待 install 子进程返回意外值 {wait_result:#x}"
-            )
-        else:
-            logger.info("install 提权子进程已 SetEvent, 视为完成")
-        # SetEvent 只表示执行流到 install() 末尾, 不代表退出码. 致命步骤失败会 raise 走回滚, 靠超时兜底.
+            raise RuntimeError(f"等待沙箱安装失败 (WinError {err}, result={wait_result:#x})")
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code)):
+            err = ctypes.get_last_error()
+            raise RuntimeError(f"无法读取沙箱安装退出码 (WinError {err})")
+        if code.value:
+            raise RuntimeError(f"沙箱安装、修复或补授权失败 (退出码 {code.value}); 详见 {_install_log_path()}")
+        logger.info("沙箱 setup 进程成功退出, 开始验证普通权限下的可用性")
+        return 0
     finally:
-        kernel32.CloseHandle(wintypes.HANDLE(h_event))
-    return 0
+        kernel32.CloseHandle(info.hProcess)
 
 
 # ---------------------------------------------------------------------------
@@ -1546,8 +1504,9 @@ def _preinstall_read_acl(
                 json.dumps(sorted(done)),
             )
             logger.debug("预装读 ACL 完成: %s", expanded)
-    except Exception:  # noqa: BLE001 - best-effort
-        logger.warning("预装读 ACL 失败", exc_info=True)
+    except Exception:
+        logger.error("预装读 ACL 失败", exc_info=True)
+        raise
 
 
 def _preinstall_read_acl_async(
@@ -1588,6 +1547,9 @@ def install(
     proxy_port_end: int = const.DEFAULT_PROXY_PORT_RANGE_END,
     policy_path: str | None = None,
     recreate_user: bool = False,
+    host_user_sid: str | None = None,
+    acl_paths: list[str] | None = None,
+    authorize_only: bool = False,
 ) -> None:
     """执行一次性安装 (需管理员权限).
 
@@ -1610,7 +1572,7 @@ def install(
     # 若给了 policy_path, 读其 read_acl_preinstall + tool_paths 合并进预装路径.
     # 用户改 tool_paths 后 --force --policy-path <yaml> 重装即可预装新工具目录
     # (运行时普通用户无权改这些目录 DACL, 必须管理员预装).
-    if policy_path:
+    if policy_path and preinstall_paths is None:
         try:
             _pp = _load_policy_preinstall_paths(policy_path)
             if _pp:
@@ -1625,7 +1587,32 @@ def install(
             proxy_port_end=proxy_port_end,
             policy_path=policy_path,
             recreate_user=recreate_user,
+            host_user_sid=host_user_sid,
+            acl_paths=acl_paths,
+            authorize_only=authorize_only,
         )
+        return
+
+    if authorize_only:
+        _verify_or_reset_sandbox_user_password()
+        from jiuwenbox.supervisor import win_acl
+        caller_sid = host_user_sid or _lookup_current_user_sid()
+        if not caller_sid:
+            raise RuntimeError("无法确定补授权的宿主用户 SID")
+        for path in acl_paths or []:
+            if os.path.exists(path):
+                win_acl.grant_ace(path, caller_sid, rights=const.WRITE_DAC | const.READ_CONTROL,
+                                  mode="ALLOW", recursive=True)
+        sandbox_sid = get_sandbox_user_sid()
+        if not sandbox_sid:
+            raise RuntimeError("无法读取沙箱账户 SID")
+        _preinstall_read_acl(preinstall_paths or [], sandbox_sid)
+        recorded = get_preinstalled_read_paths() | {
+            os.path.expandvars(p).rstrip("\\/").lower() for p in (preinstall_paths or []) if os.path.exists(p)
+        }
+        _reg_set_str(const.REG_VALUE_PREINSTALLED_PATHS, json.dumps(sorted(recorded)))
+        _record_acl_policy_paths(set(acl_paths or []))
+        logger.info("Windows 沙箱目录补授权完成")
         return
 
     # exe 重装必须跳过幂等: 已 installed=1 也要删用户重建.
@@ -1650,7 +1637,7 @@ def install(
     # install 主体 try/except, 致命步骤失败时调 _install_rollback 局部回滚并 raise,
     # 不写 installed=1 (旧版 best-effort 假成功).
     # 致命: 用户+组创建、SeInteractiveLogonRight、网络隔离至少一条路成功 (WFP 或降级).
-    # 非致命: 隐藏用户、DPAPI、合成 SID 缓存、读 ACL 预装.
+    # 隐藏登录界面用户等外观步骤失败可继续; 凭据和必要授权必须通过验证.
     # review #4: 失败回滚只清本次已成功步骤新增的资源 (用户/组/WFP filter), 不调
     # uninstall() 全量清理 (会删 jbx-sandbox 用户/profile, 影响并发运行的其他沙箱).
     steps_done: set[str] = set()
@@ -1719,7 +1706,7 @@ def install(
             # 用户已存在: 不能用本次新密码 (与实际不一致 → 1326). 读 DPAPI 旧密码保持一致;
             # 读不到 (旧版 "000000" 升级/DPAPI 损坏) 则用新随机密码 NetUserSetInfo 重设对齐.
             password = get_sandbox_user_password()
-            if not password:
+            if not password or not _logon_sandbox_user(password):
                 password = new_password
                 _set_user_password(const.SANDBOX_USER_NAME, password)
                 logger.info("jbx-sandbox DPAPI 无旧密码, 已重设为新随机密码")
@@ -1784,9 +1771,7 @@ def install(
             raise RuntimeError("网络隔离不可用 (未知原因)") from wfp_exc
         steps_done.add("wfp")  # 网络隔离已装 (WFP 或降级), 失败回滚需卸载
 
-        # 4. 异步预装读 ACL (非致命: S11 修后默认不 preinstall 系统目录,
-        # 只 grant 调用方显式传入的 preinstall_paths; 失败不影响 install 成功,
-        # 沙箱工作区读权限由 _create_windows 的 apply_sandbox_acl 在创建时 grant)。
+        # Only prepare explicitly requested tool paths; errors prevent setup success.
         if preinstall_paths:
             paths_to_preinstall = [
                 os.path.expandvars(p) for p in preinstall_paths if p
@@ -1824,7 +1809,7 @@ def install(
         # 运行时 box-server 进程 (普通用户) 没有 WRITE_DAC, apply_sandbox_acl
         # 实施 Allow Read ACE 时 WinError 5. install 阶段给当前用户加上 DACL 最小
         # 权限 (READ_CONTROL 读 SD + WRITE_DAC 写 DACL), 运行时能改这些目录的 DACL.
-        _current_user_sid = _lookup_current_user_sid()
+        _current_user_sid = host_user_sid or _lookup_current_user_sid()
         # 主线程合并授权的读 ACL 路径集: 打包目录同时 grant WRITE_DAC (当前用户)
         # 和 GENERIC_READ (沙箱用户), 后台预装线程对这些路径直接跳过, 省一遍重复递归.
         _merged_read_paths: set[str] = set()
@@ -1877,9 +1862,9 @@ def install(
 
         # 用户 policy 的 deny/allow 路径 (allow_read/deny_read/allow_write/deny_write)
         _acl_paths: list[str] = []
-        if _current_user_sid and policy_path and _wa is not None and _wc is not None:
+        if _current_user_sid and (policy_path or acl_paths) and _wa is not None and _wc is not None:
             try:
-                _acl_paths = _load_policy_acl_paths(policy_path)
+                _acl_paths = acl_paths if acl_paths is not None else _load_policy_acl_paths(policy_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("install 读 policy deny/allow 路径失败 (非致命): %s", exc)
             _granted_acl = 0
@@ -1899,23 +1884,13 @@ def install(
                         _p,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "grant WRITE_DAC 失败 (policy 路径, 非致命): %s=%s", _p, exc,
-                    )
+                    raise RuntimeError(f"沙箱目录补授权失败: {_p}: {exc}") from exc
             if _acl_paths:
                 logger.info(
                     "policy deny/allow 路径预授权完成: 总 %d 条, 成功 %d 条",
                     len(_acl_paths), _granted_acl,
                 )
-        preinstall_thread = _preinstall_read_acl_async(
-            paths_to_preinstall, sid, skip_paths=_merged_read_paths,
-        )
-        preinstall_thread.join(timeout=PREINSTALL_JOIN_TIMEOUT_SECONDS)
-        if preinstall_thread.is_alive():
-            logger.warning(
-                "读 ACL 预装未在 %.0fs 内完成, 剩余路径将由后续创建沙箱补做",
-                PREINSTALL_JOIN_TIMEOUT_SECONDS,
-            )
+        _preinstall_read_acl(paths_to_preinstall, sid, skip_paths=_merged_read_paths)
 
         # 5. 全部致命步骤通过, 写完成标记; 清进度标记 (断点续传已无用)。
         # 写 installed=1 前必须能用本次密码登录, 避免 installed=1 + 用户不存在/密码不对 → 运行时 1326.
@@ -1935,7 +1910,7 @@ def install(
         )
         # 记录本次已预授 WRITE_DAC 的 deny/allow 路径集, 供 ensure_windows_setup
         # 增量检测: 用户改 policy 新增 deny_read/deny_write 路径时自动弹 UAC 补授权.
-        if _current_user_sid and policy_path and _acl_paths:
+        if _current_user_sid and _acl_paths:
             _record_acl_policy_paths(
                 {_normalize_acl_path(p) for p in _acl_paths if p},
             )
@@ -2022,20 +1997,19 @@ def ensure_acl_policy_paths_authorized(
     proxy_port_start: int = const.DEFAULT_PROXY_PORT_RANGE_START,
     proxy_port_end: int = const.DEFAULT_PROXY_PORT_RANGE_END,
     policy_path: str | None = None,
+    *,
+    allow_elevation: bool = True,
 ) -> None:
     """确保 deny/allow 路径已预授 WRITE_DAC.
 
-    _create_windows 创建沙箱时调. 运行时不再弹 UAC: 未授权且当前不是管理员
-    时只记日志; 已是管理员则本进程只补授 WRITE_DAC, 不整段 install()
-    (避免每个新 workspace 都重装 WFP, 首次对话卡 30s+).
+    box-server 内只验证权限, 提权由启动前的 setup 检查负责.
     """
     _require_windows()
     if reg_get_str(const.REG_VALUE_INSTALLED) != "1":
-        return
-    acl_recorded = _get_acl_policy_paths_recorded()
+        raise RuntimeError("Windows 沙箱尚未安装")
     new_acl_paths = {
         _normalize_acl_path(p) for p in acl_paths if p
-    } - acl_recorded
+    }
     new_acl_paths = {p for p in new_acl_paths if p}
     if not new_acl_paths:
         return
@@ -2047,7 +2021,7 @@ def ensure_acl_policy_paths_authorized(
         if "{{" in p or (p.startswith("%") and "%" in p[1:] and not os.path.exists(p)):
             skipped.append(p)
             continue
-        if _path_owned_by_current_user(p):
+        if not os.path.exists(p) or _can_write_dac(p):
             skipped.append(p)
             continue
         need_elevate.add(p)
@@ -2060,17 +2034,12 @@ def ensure_acl_policy_paths_authorized(
     if not need_elevate:
         return
     if not _is_admin():
-        logger.warning(
-            "新增 deny/allow 路径未预授 WRITE_DAC, 运行时不再弹 UAC: %s. "
-            "请重新运行安装包以管理员补授权, 否则 grant_ace 可能 WinError 5.",
-            sorted(need_elevate),
-        )
+        if not allow_elevation:
+            raise RuntimeError(f"沙箱目录需要管理员补授权: {sorted(need_elevate)}; 请重新启动以请求 UAC")
+        install(force=True, policy_path=policy_path, acl_paths=sorted(need_elevate))
+        if any(not _can_write_dac(p) for p in need_elevate if os.path.exists(p)):
+            raise RuntimeError("沙箱目录补授权未完成")
         return
-    logger.info(
-        "检测到新增 deny/allow 路径未预授 WRITE_DAC: %s. "
-        "当前进程已是管理员, 本进程只补授 WRITE_DAC (不整段重装).",
-        sorted(need_elevate),
-    )
     _grant_write_dac_to_current_user(need_elevate)
 
 
@@ -2078,8 +2047,7 @@ def _grant_write_dac_to_current_user(paths: set[str]) -> None:
     """给当前用户对 paths 预授 WRITE_DAC|READ_CONTROL, 不调 install()."""
     sid = _lookup_current_user_sid()
     if not sid:
-        logger.warning("无法解析当前用户 SID, 跳过 WRITE_DAC 补授: %s", sorted(paths))
-        return
+        raise RuntimeError("无法解析宿主用户 SID, 不能完成目录补授权")
     from jiuwenbox.supervisor import win_acl as _wa, win_constants as _wc
     granted: set[str] = set()
     for p in sorted(paths):
@@ -2095,7 +2063,7 @@ def _grant_write_dac_to_current_user(paths: set[str]) -> None:
             granted.add(p)
             logger.info("grant WRITE_DAC|READ_CONTROL 给当前用户: %s", p)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("grant WRITE_DAC 失败 (非致命): %s=%s", p, exc)
+            raise RuntimeError(f"沙箱目录补授权失败: {p}: {exc}") from exc
     if granted:
         _record_acl_policy_paths(granted)
 
@@ -2122,7 +2090,9 @@ def _grant_owned_preinstall_paths(paths: set[str], recorded: set[str]) -> set[st
         granted.add(p)
         logger.info("当前用户所有的工具目录已授权沙箱用户读执行 (无需 UAC): %s", p)
     if granted:
-        _reg_set_str(const.REG_VALUE_PREINSTALLED_PATHS, json.dumps(sorted(recorded | granted)))
+        cache = Path(_resolve_install_log_dir()) / "preinstalled_paths.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(sorted(recorded | granted)), encoding="utf-8")
     return granted
 
 
@@ -2132,176 +2102,83 @@ def ensure_windows_setup(
     proxy_port_start: int = const.DEFAULT_PROXY_PORT_RANGE_START,
     proxy_port_end: int = const.DEFAULT_PROXY_PORT_RANGE_END,
     policy_path: str | None = None,
+    *,
+    allow_elevation: bool = True,
+    acl_paths: list[str] | None = None,
 ) -> None:
-    """运行时入口: 确保安装已完成 (幂等).
-
-    由 ProcessRuntime.create / app.py lifespan 在 win32 分支调用.
-    一次性准备由安装器 ``--desktop-run-win-setup --install --force --recreate-user`` 完成.
-    尚未安装且非管理员时失败, 不弹 UAC.
-
-    Args:
-        preinstall_paths: 读 ACL 预装路径 (根 policy 的
-            ``windows.filesystem.read_acl_preinstall``). 仅在首次安装时
-            生效; 已安装则忽略.
-        proxy_port_start/end: WFP Permit filter 放行的 loopback 端口范围
-            (根 policy 的 ``windows.proxy.port_range_*``).
-        policy_path: windows-policy.yaml 路径; 已安装时用于增量检测
-            deny/allow 路径变更. 新增路径若当前不是管理员, 只记日志不弹 UAC.
-    """
+    """Prepare before spawning box-server; its lifespan only validates."""
     _require_windows()
-    try:
-        if not force and reg_get_str(const.REG_VALUE_INSTALLED) == "1":
-            # 幂等: 已安装. 但若 preinstall_paths 含已预装集合外的新路径 (用户改 tool_paths 后首次起 sandbox),
-            # 运行时普通用户无权改外部目录 DACL → 新路径读 ACL 没预装 → 后续 _create_windows 改 ACL 会 WinError 5.
-            # 这里检测出新增并提示用户 --force 重装.
-            self_check_paths = {
-                os.path.expandvars(p) for p in (preinstall_paths or []) if p
-            }
-            recorded_raw = reg_get_str(const.REG_VALUE_PREINSTALLED_PATHS)
-            recorded: set[str] = set()
-            if recorded_raw:
-                try:
-                    recorded = set(json.loads(recorded_raw))
-                except (ValueError, TypeError):
-                    recorded = set()
-            new_paths = self_check_paths - recorded
-            if new_paths:
-                new_paths -= _grant_owned_preinstall_paths(new_paths, recorded)
-            # 增量检测: 用户 policy 的 deny/allow 路径变更 (allow_read/deny_read/allow_write/deny_write).
-            # install 阶段给这些路径预授 WRITE_DAC, 运行时 box-server 才能改 DACL 施加 Deny/Allow ACE.
-            # 若 runtime policy 新增了路径但未预授 WRITE_DAC → grant_ace WinError 5 → Deny Read 不生效.
-            new_acl_paths: set[str] = set()
-            if policy_path:
-                try:
-                    acl_recorded = _get_acl_policy_paths_recorded()
-                    new_acl_paths = {
-                        _normalize_acl_path(p)
-                        for p in _load_policy_acl_paths(policy_path)
-                    } - acl_recorded
-                    new_acl_paths = {p for p in new_acl_paths if p}
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("增量检测 deny/allow 路径变更失败 (非致命): %s", exc)
-            # 当前用户已是 owner 的路径 (如 D:/y, D:/n) 启动时记入缓存即可.
-            # 需管理员预授的路径推迟到创建沙箱时再弹 UAC (ensure_acl_policy_paths_authorized),
-            # 避免「保存配置 → 重启 box-server」每次都打断用户.
-            if new_acl_paths:
-                _skip_owned: set[str] = set()
-                _deferred_uac: set[str] = set()
-                for _p in new_acl_paths:
-                    if _path_owned_by_current_user(_p):
-                        _skip_owned.add(_p)
-                    else:
-                        _deferred_uac.add(_p)
-                if _skip_owned:
-                    logger.info(
-                        "deny/allow 路径无需 UAC (当前用户所有): %s",
-                        sorted(_skip_owned),
-                    )
-                    _record_acl_policy_paths(_skip_owned)
-                if _deferred_uac:
-                    logger.info(
-                        "需管理员预授的 deny/allow 路径 %s 推迟至创建沙箱时检查 "
-                        "(运行时不弹 UAC; 无管理员权限则只记日志)",
-                        sorted(_deferred_uac),
-                    )
-                new_acl_paths = set()
-            if new_paths or new_acl_paths:
-                if _is_admin():
-                    logger.info(
-                        "Windows 沙箱已安装, 检测到新增路径: 预装=%s, deny/allow=%s. "
-                        "当前进程已是管理员, 本进程补预装 (不弹 UAC).",
-                        sorted(new_paths), sorted(new_acl_paths),
-                    )
-                    install(
-                        force=True,
-                        preinstall_paths=sorted(new_paths),
-                        proxy_port_start=proxy_port_start,
-                        proxy_port_end=proxy_port_end,
-                        policy_path=policy_path,
-                    )
-                else:
-                    logger.warning(
-                        "Windows 沙箱已安装, 但检测到新增路径需管理员预装: "
-                        "预装=%s, deny/allow=%s. 运行时不再弹 UAC; "
-                        "请重新运行安装包, 或管理员执行 "
-                        "jiuwenswarm.exe --desktop-run-win-setup --install --force.",
-                        sorted(new_paths), sorted(new_acl_paths),
-                    )
-            # installed=1 不能保证账户还在 / 密码还能登录.
-            _verify_or_reset_sandbox_user_password()
-            return
-        # installed != "1" 或 force=True. 非管理员走 install() 内的一次 UAC
-        # (仅首次/损坏态; 已安装且用户存在不会到这里, 不会每次建沙箱弹框).
-        install(
-            force=force,
-            preinstall_paths=preinstall_paths,
-            proxy_port_start=proxy_port_start,
-            proxy_port_end=proxy_port_end,
-            policy_path=policy_path,
+    with _INSTALL_LOCK:
+        needs_install = force or reg_get_str(const.REG_VALUE_INSTALLED) != "1"
+        if not needs_install:
+            try:
+                _verify_or_reset_sandbox_user_password()
+            except RuntimeError:
+                needs_install = True
+        recorded = get_preinstalled_read_paths()
+        requested = {os.path.expandvars(p) for p in (preinstall_paths or []) if p}
+        new_paths = {p for p in requested if p.rstrip("\\/").lower() not in recorded}
+        if not needs_install and new_paths:
+            new_paths -= _grant_owned_preinstall_paths(new_paths, recorded)
+        policy_acl = acl_paths if acl_paths is not None else (
+            _load_policy_acl_paths(policy_path) if policy_path else []
         )
-    except Exception:  # noqa: BLE001
-        logger.error("ensure_windows_setup 失败", exc_info=True)
-        raise
+        required_acl = {_normalize_acl_path(p) for p in policy_acl if p and os.path.exists(p)}
+        missing_acl = {p for p in required_acl if not _can_write_dac(p)}
+        if needs_install or new_paths or missing_acl:
+            if not allow_elevation and not _is_admin():
+                raise RuntimeError("Windows 沙箱尚未准备完成, 需要管理员安装、修复或补授权; 请重新启动以请求 UAC")
+            install(
+                force=needs_install or bool(new_paths or missing_acl),
+                preinstall_paths=sorted(requested | recorded) if needs_install else sorted(new_paths),
+                proxy_port_start=proxy_port_start,
+                proxy_port_end=proxy_port_end,
+                policy_path=policy_path,
+                acl_paths=sorted(required_acl),
+                authorize_only=not needs_install,
+            )
+        if reg_get_str(const.REG_VALUE_INSTALLED) != "1":
+            raise RuntimeError("沙箱初始化失败: 安装进程未写入完成标记")
+        if any(p.rstrip("\\/").lower() not in get_preinstalled_read_paths() for p in requested if os.path.exists(p)):
+            raise RuntimeError("沙箱初始化失败: 必需工具目录的读执行授权未完成")
+        _verify_or_reset_sandbox_user_password()
+        still_missing = [p for p in required_acl if not _can_write_dac(p)]
+        if still_missing:
+            raise RuntimeError(f"沙箱目录补授权未完成: {still_missing}")
+
+
+def _can_write_dac(path: str) -> bool:
+    """Check the caller's actual access, including group ACEs and DENY rules."""
+    kernel32 = get_kernel32()
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        path, const.WRITE_DAC | const.READ_CONTROL, 7, None, 3, 0x02000000, None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        return False
+    kernel32.CloseHandle(handle)
+    return True
 
 
 def ensure_sandbox_user_can_logon() -> None:
-    """创建沙箱前确认 jbx-sandbox 可登录; lifespan 失败时这里再拦一层."""
+    """Runtime validation must not silently repair or elevate inside the box Job."""
     _verify_or_reset_sandbox_user_password()
 
 
 def _verify_or_reset_sandbox_user_password() -> None:
-    """验证 jbx-sandbox 账户存在且密码与注册表一致. 账户缺失时提权重建一次."""
+    """Validate only; the startup preflight owns any privileged repair."""
     if not _sandbox_user_exists():
-        with _INSTALL_LOCK:
-            if not _sandbox_user_exists():
-                logger.warning(
-                    "jbx-sandbox 用户不存在 (注册表可能仍为 installed=1), 尝试重建",
-                )
-                try:
-                    install(force=True, recreate_user=True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("重建 jbx-sandbox 失败. %s: %s", _SANDBOX_USER_REPAIR, exc)
-                    raise RuntimeError(
-                        "Windows sandbox user jbx-sandbox is missing "
-                        "(installed=1 but the SAM account was deleted). "
-                        + _SANDBOX_USER_REPAIR
-                    ) from exc
-                if not _sandbox_user_exists():
-                    raise RuntimeError(
-                        "Windows sandbox user jbx-sandbox is missing "
-                        "(rebuild finished but the SAM account is still absent). "
-                        + _SANDBOX_USER_REPAIR
-                    )
+        raise RuntimeError("沙箱账户 jbx-sandbox 不存在, 需要管理员修复")
     password = get_sandbox_user_password()
     if not password:
-        return
-    if _logon_sandbox_user(password):
-        logger.debug("jbx-sandbox 密码一致性验证通过")
-        return
-    err = ctypes.get_last_error()
-    # WinError 1326 = ERROR_LOGON_FAILURE (密码不一致或账户异常).
-    logger.warning(
-        "jbx-sandbox 密码验证失败 (LogonUserW WinError %d), 重设密码以对齐注册表",
-        err,
-    )
-    try:
-        _set_user_password(const.SANDBOX_USER_NAME, password)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "jbx-sandbox 密码重设失败 (运行时非管理员可能无权). %s: %s",
-            _SANDBOX_USER_REPAIR,
-            exc,
-        )
-        raise RuntimeError(
-            "jbx-sandbox logon failed and the password could not be reset. "
-            + _SANDBOX_USER_REPAIR
-        ) from exc
-    if not _logon_sandbox_user(password):
-        raise RuntimeError(
-            "jbx-sandbox password was reset but LogonUserW still fails. "
-            + _SANDBOX_USER_REPAIR
-        )
-    logger.info("jbx-sandbox 密码已重设, 与注册表一致")
+        raise RuntimeError("无法读取沙箱账户凭据, 需要管理员修复")
+    if not _logon_sandbox_user(password, interactive=True):
+        err = ctypes.get_last_error()
+        raise RuntimeError(f"沙箱账户无法登录 (WinError {err}), 需要管理员修复")
 
 
 def get_sandbox_user_sid() -> str | None:
@@ -2680,46 +2557,47 @@ def _main(argv: list[str]) -> int:
       --proxy-port-end   N     范围终点
       --preinstall-paths JSON  读 ACL 预装路径列表 (JSON 编码字符串)
     """
-    try:
-        # install_force.log 优先用命令行 --install-log-path 指定的路径,
-        # 否则 fallback 到用户数据目录 (~/.office-claw/.jiuwenclaw/jiuwenbox)
-        _install_log_path_arg: str | None = None
-        _strip_indices: list[int] = []
-        for _i, _a in enumerate(argv):
-            if _a == "--install-log-path" and _i + 1 < len(argv):
-                _install_log_path_arg = argv[_i + 1]
-                _strip_indices = [_i, _i + 1]
-                break
-            if _a.startswith("--install-log-path="):
-                _install_log_path_arg = _a[len("--install-log-path="):]
-                _strip_indices = [_i]
-                break
-        if _strip_indices:
-            for _idx in sorted(_strip_indices, reverse=True):
-                del argv[_idx]
-        if _install_log_path_arg:
-            _install_log_path = os.path.normpath(os.path.abspath(_install_log_path_arg))
-        else:
-            _install_log_path = _install_log_path()
+    if not any(arg in ("--ensure", "ensure") for arg in argv):
         try:
-            os.makedirs(os.path.dirname(_install_log_path), exist_ok=True)
-        except OSError:
+            # install_force.log 优先用命令行 --install-log-path 指定的路径,
+            # 否则 fallback 到用户数据目录 (~/.office-claw/.jiuwenclaw/jiuwenbox)
+            _install_log_path_arg: str | None = None
+            _strip_indices: list[int] = []
+            for _i, _a in enumerate(argv):
+                if _a == "--install-log-path" and _i + 1 < len(argv):
+                    _install_log_path_arg = argv[_i + 1]
+                    _strip_indices = [_i, _i + 1]
+                    break
+                if _a.startswith("--install-log-path="):
+                    _install_log_path_arg = _a[len("--install-log-path="):]
+                    _strip_indices = [_i]
+                    break
+            if _strip_indices:
+                for _idx in sorted(_strip_indices, reverse=True):
+                    del argv[_idx]
+            if _install_log_path_arg:
+                log_path = os.path.normpath(os.path.abspath(_install_log_path_arg))
+            else:
+                log_path = _install_log_path()
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            except OSError:
+                pass
+            _fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+            _fh.setLevel(logging.DEBUG)
+            _fh.setFormatter(logging.Formatter(
+                "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+            ))
+            logging.getLogger().addHandler(_fh)
+            logging.getLogger().setLevel(logging.DEBUG)
+            # print(f"[win_setup] install 日志落盘: {_install_log_path}", flush=True)
+        except Exception:  # noqa: BLE001
             pass
-        _fh = logging.FileHandler(_install_log_path, mode="w", encoding="utf-8")
-        _fh.setLevel(logging.DEBUG)
-        _fh.setFormatter(logging.Formatter(
-            "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-        ))
-        logging.getLogger().addHandler(_fh)
-        logging.getLogger().setLevel(logging.DEBUG)
-        # print(f"[win_setup] install 日志落盘: {_install_log_path}", flush=True)
-    except Exception:  # noqa: BLE001
-        pass
     # argparse 子命令不能带 "--" 前缀; 调用方 (UAC 提权) 用的是
     # "--install"/"--uninstall", 这里规整为 "install"/"uninstall".
     normalized = [a.lstrip("-") if a.startswith("--") and a.lstrip("-") in (
         const.INSTALL_SUBCOMMAND.lstrip("-"),
-        const.UNINSTALL_SUBCOMMAND.lstrip("-"),
+        const.UNINSTALL_SUBCOMMAND.lstrip("-"), "ensure",
     ) else a for a in argv]
     parser = argparse.ArgumentParser(
         prog="jiuwenbox.supervisor.win_setup",
@@ -2729,6 +2607,11 @@ def _main(argv: list[str]) -> int:
     p_install = sub.add_parser(
         const.INSTALL_SUBCOMMAND.lstrip("-"), help="执行安装",
     )
+    p_ensure = sub.add_parser("ensure", help="检查环境, 必要时请求 UAC")
+    p_ensure.add_argument("--policy-path", default=None)
+    p_install.add_argument("--host-user-sid", default=None)
+    p_install.add_argument("--acl-paths", default=None)
+    p_install.add_argument("--authorize-only", action="store_true")
     p_install.add_argument("--force", action="store_true", help="强制重装")
     p_install.add_argument(
         "--recreate-user", action="store_true",
@@ -2762,7 +2645,22 @@ def _main(argv: list[str]) -> int:
     )
     args = parser.parse_args(normalized)
 
+    if args.cmd == "ensure":
+        from jiuwenbox.server.policy_reader import PolicyReader
+        reader = PolicyReader(policy_path=Path(args.policy_path)) if args.policy_path else PolicyReader()
+        policy = reader.load_policy()
+        fs = policy.windows.filesystem
+        acl_paths = [*fs.allow_read, *fs.deny_read, *fs.allow_write, *fs.deny_write]
+        ensure_windows_setup(
+            preinstall_paths=collect_preinstall_paths(policy),
+            proxy_port_start=policy.windows.proxy.port_range_start,
+            proxy_port_end=policy.windows.proxy.port_range_end,
+            policy_path=str(reader.policy_path),
+            acl_paths=[os.path.expandvars(p) for p in acl_paths],
+        )
+        return 0
     if args.cmd == const.INSTALL_SUBCOMMAND.lstrip("-"):
+        import base64
         preinstall_paths = None
         if args.preinstall_paths:
             try:
@@ -2787,6 +2685,9 @@ def _main(argv: list[str]) -> int:
                 proxy_port_end=args.proxy_port_end,
                 policy_path=args.policy_path,
                 recreate_user=args.recreate_user,
+                host_user_sid=args.host_user_sid,
+                authorize_only=args.authorize_only,
+                acl_paths=json.loads(base64.b64decode(args.acl_paths).decode("utf-8")) if args.acl_paths else None,
             )
         except BaseException:
             _notify()

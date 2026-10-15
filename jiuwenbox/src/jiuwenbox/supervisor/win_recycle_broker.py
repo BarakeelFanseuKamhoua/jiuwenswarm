@@ -79,6 +79,18 @@ _REPARSE_POINT = 0x400
 _INVALID_ATTR = 0xFFFFFFFF
 
 
+def _filesystem_path(path: str) -> str:
+    """Extend filesystem API inputs without changing policy/IPC path names."""
+    if sys.platform != "win32" or path.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(path)
+    if len(absolute) < 260:
+        return path
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
 def _file_attrs(path: str) -> int | None:
     import ctypes
     from ctypes import wintypes
@@ -86,7 +98,7 @@ def _file_attrs(path: str) -> int | None:
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
     kernel.GetFileAttributesW.restype = wintypes.DWORD
-    value = int(kernel.GetFileAttributesW(path))
+    value = int(kernel.GetFileAttributesW(_filesystem_path(path)))
     if value == _INVALID_ATTR:
         return None
     return value
@@ -133,9 +145,10 @@ def path_allowed(path: str) -> str | None:
     normalized = os.path.normpath(os.path.abspath(path))
     if _is_volume_recycle_bin(normalized) or _under_archive(normalized):
         return None
-    if not os.path.lexists(normalized) or os.path.islink(normalized):
+    api_path = _filesystem_path(normalized)
+    if not os.path.lexists(api_path) or os.path.islink(api_path):
         return None
-    if _path_has_reparse(normalized) or not os.path.exists(normalized):
+    if _path_has_reparse(normalized) or not os.path.exists(api_path):
         return None
     return normalized
 
@@ -380,7 +393,7 @@ def _archive_destination(archive: str, path: str) -> str | None:
     for index in range(1000):
         suffix = f"_{stamp}" if index == 0 else f"_{stamp}_{index}"
         dest = os.path.join(archive, safe + suffix)
-        if not os.path.lexists(dest):
+        if not os.path.lexists(_filesystem_path(dest)):
             return dest
     return None
 
@@ -390,13 +403,13 @@ def _move_to_archive(path: str) -> bool:
     archive = (os.environ.get(ENV_ARCHIVE) or "").strip()
     if not archive:
         return False
-    if os.path.splitdrive(os.path.abspath(path))[0].casefold() != os.path.splitdrive(
-        os.path.abspath(archive),
-    )[0].casefold():
+    if _norm_key(os.path.splitdrive(os.path.abspath(path))[0]) != _norm_key(
+        os.path.splitdrive(os.path.abspath(archive))[0],
+    ):
         logger.warning("archive skipped: different volume path=%s", path)
         return False
     try:
-        os.makedirs(archive, exist_ok=True)
+        os.makedirs(_filesystem_path(archive), exist_ok=True)
     except OSError:
         logger.warning("archive directory could not be created: %s", archive, exc_info=True)
         return False
@@ -404,7 +417,7 @@ def _move_to_archive(path: str) -> bool:
     if dest is None:
         return False
     try:
-        os.rename(path, dest)
+        os.rename(_filesystem_path(path), _filesystem_path(dest))
     except OSError:
         logger.warning("archive move failed %s -> %s", path, dest, exc_info=True)
         return False
@@ -424,7 +437,7 @@ def recycle_with_shell(path: str) -> bool:
     shell_ok = len(path) < 260 and _recycle_bin_ready(path) and _shell_delete(path)
     if shell_ok:
         return True
-    if os.path.lexists(path):
+    if os.path.lexists(_filesystem_path(path)):
         return _move_to_archive(path)
     return False
 
