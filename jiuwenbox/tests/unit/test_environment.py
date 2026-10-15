@@ -2,10 +2,43 @@
 
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from jiuwenbox.server.environment import ENV_ALLOWLIST, inherited_environment
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+@pytest.mark.parametrize("for_runner", [False, True])
+def test_inheritance_matches_platform_key_case(monkeypatch, platform, for_runner):
+    from jiuwenbox.server import environment
+
+    # Use an ordinary mapping so mixed-case source keys survive on every host.
+    source = {
+        ENV_ALLOWLIST: '["TOOL_SETTING", "EMPTY_SETTING"]',
+        "Path": "tool-path", "SystemRoot": "system-root", "windir": "windows-dir",
+        "ComSpec": "command-shell", "tool_setting": "tool-value", "empty_setting": "",
+        "JiuwenBox_Worker_Limit": "16", "OPENAI_API_KEY": "must-not-be-forwarded",
+    }
+    monkeypatch.setattr(environment, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(environment.os, "environ", source)
+    env = inherited_environment(for_runner=for_runner)
+    assert env["SystemRoot"] == "system-root"
+    assert env["windir"] == "windows-dir"
+    assert "OPENAI_API_KEY" not in env
+    if platform == "win32":
+        assert env["PATH"] == "tool-path"
+        assert env["COMSPEC"] == "command-shell"
+        assert env["TOOL_SETTING"] == "tool-value"
+        assert env["EMPTY_SETTING"] == ""
+        assert ("JiuwenBox_Worker_Limit" in env) is for_runner
+    else:
+        assert "PATH" not in env
+        assert "COMSPEC" not in env
+        assert "TOOL_SETTING" not in env
+        assert "EMPTY_SETTING" not in env
+        assert "JiuwenBox_Worker_Limit" not in env
 
 
 def test_inheritance_without_allowlist_excludes_tool_and_secret_keys(monkeypatch):

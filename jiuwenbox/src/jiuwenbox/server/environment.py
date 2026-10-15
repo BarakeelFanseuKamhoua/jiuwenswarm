@@ -50,7 +50,9 @@ def inherited_environment(*, for_runner: bool = False) -> dict[str, str]:
     }
     if sys.platform == "win32":
         key_names.update({key.upper(): key for key in _SYSTEM_KEYS})
-    return {
-        key_names.get(key, key): value for key, value in os.environ.items()
-        if key in key_names or (for_runner and key.startswith("JIUWENBOX_"))
-    }
+    inherited = {}
+    for key, value in os.environ.items():
+        lookup_key = key.upper() if sys.platform == "win32" else key
+        if lookup_key in key_names or (for_runner and lookup_key.startswith("JIUWENBOX_")):
+            inherited[key_names.get(lookup_key, key)] = value
+    return inherited
