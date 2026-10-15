@@ -71,7 +71,7 @@ async def test_explicit_rules_report_without_cloud_wait(level):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('decision,expected', [('allow', PermissionLevel.ALLOW), ('deny', PermissionLevel.DENY),
-    ('clarify', PermissionLevel.ALLOW), ('unavailable', PermissionLevel.ASK)])
+    ('clarify', PermissionLevel.ALLOW), ('unavailable', PermissionLevel.ALLOW)])
 async def test_unknown_one_waited_request_and_no_second_report(decision, expected):
     b, events = bridge(decision=decision)
     event = raw_event(context(), 'tool.before')
@@ -85,7 +85,7 @@ async def test_unknown_one_waited_request_and_no_second_report(decision, expecte
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('fail_closed,expected', [
-    (True, PermissionLevel.DENY), (False, PermissionLevel.ASK),
+    (True, PermissionLevel.DENY), (False, PermissionLevel.ALLOW),
 ])
 async def test_cloud_unavailable_respects_total_fail_closed_switch(fail_closed, expected):
     b, _ = bridge(decision='unavailable')
@@ -93,6 +93,16 @@ async def test_cloud_unavailable_respects_total_fail_closed_switch(fail_closed, 
     b.config['permissions']['permission_mode'] = 'strict'
     result = await b.decide(raw_event(context(), 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
     assert result.permission == expected
+    await b.close()
+
+
+@pytest.mark.asyncio
+async def test_skill_install_stays_ask_when_cloud_unavailable():
+    b, _ = bridge(decision='unavailable')
+    result = await b.decide(
+        raw_event(context(), 'skill.before_install'), PermissionResult(PermissionLevel.UNDETERMINED),
+    )
+    assert result.permission == PermissionLevel.ASK
     await b.close()
 
 
@@ -299,10 +309,9 @@ async def test_actual_builtin_install_checkpoint(tmp_path, monkeypatch, decision
 
 
 @pytest.mark.asyncio
-async def test_desktop_permission_factory_falls_back_to_real_interrupt(monkeypatch):
+async def test_desktop_permission_factory_fail_opens_when_cloud_unavailable(monkeypatch):
     from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
     from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_CHANNEL_ID
-    from openjiuwen.harness.rails.interrupt.interrupt_base import InterruptResult
     monkeypatch.setenv('CLAW_BEHAVIOR_SECURITY', '1')
     monkeypatch.setenv('CLAW_SKILL_TOKEN', 'test-token')
     cfg = {'enabled': True, 'package_builtin_rules': False, 'defaults': {'*': 'allow'}}
@@ -317,7 +326,7 @@ async def test_desktop_permission_factory_falls_back_to_real_interrupt(monkeypat
         permission = build_permission_rail({**b.config, 'permissions': cfg})
         assert permission is not None
         result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
-        assert isinstance(result, InterruptResult)
+        assert isinstance(result, ApproveResult)
         assert len(events) == 1 and events[0]['mode'] == 'authorize'
     finally:
         CURRENT_CHANNEL_ID.reset(channel)
@@ -431,7 +440,7 @@ async def test_permission_factory_uses_defaults_only_when_cloud_is_off(
         assert cfg['enabled'] is permission_enabled
         result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
         if mode == 'authorize':
-            expected = {'allow': 'allow', 'deny': 'deny', 'clarify': 'allow', 'unavailable': 'ask'}[cloud_reply]
+            expected = {'allow': 'allow', 'deny': 'deny', 'clarify': 'allow', 'unavailable': 'allow'}[cloud_reply]
         assert isinstance(result, {'allow': ApproveResult, 'deny': RejectResult, 'ask': InterruptResult}[expected])
         assert ctx.extra['behavior.local_permission'].matched_rule == matched
         await asyncio.gather(*b.tasks)
