@@ -22,6 +22,17 @@ from jiuwenswarm.server.handlers.agents import (
     handle_agents_tools_list,
     handle_agents_update,
 )
+from jiuwenswarm.server.handlers.bootstrap import (
+    handle_initialize,
+    handle_session_create,
+    handle_session_fork,
+)
+from jiuwenswarm.server.handlers.chat import handle_chat_cancel
+from jiuwenswarm.server.handlers.organization import (
+    handle_a4p_request,
+    handle_org_snapshot,
+    handle_team_list,
+)
 from jiuwenswarm.server.handlers.commands import (
     handle_command_add_dir,
     handle_command_btw,
@@ -88,6 +99,19 @@ from jiuwenswarm.server.handlers.session import (
     handle_session_rewind,
     handle_session_rewind_context,
     handle_session_switch,
+)
+from jiuwenswarm.server.handlers.team import (
+    handle_swarmflow_control,
+    handle_team_binding_create,
+    handle_team_binding_generate,
+    handle_team_bindings_list,
+    handle_team_delete,
+    handle_team_history_get,
+    handle_team_members_get,
+    handle_team_mq_publish,
+    handle_team_session_bind,
+    handle_team_snapshot,
+    handle_team_templates_list,
 )
 
 Handler = Callable[[RequestContext], Awaitable[None]]
@@ -168,6 +192,10 @@ HANDLERS: dict[ReqMethod, Handler] = {
     ReqMethod.ISSUE_STATE_LIST: handle_schedule_request,
     ReqMethod.ISSUE_DELETE: handle_schedule_request,
     ReqMethod.ISSUE_MATRIX: handle_schedule_request,
+    ReqMethod.CHAT_CANCEL: handle_chat_cancel,
+    ReqMethod.INITIALIZE: handle_initialize,
+    ReqMethod.SESSION_CREATE: handle_session_create,
+    ReqMethod.SESSION_FORK: handle_session_fork,
     ReqMethod.SESSION_LIST: handle_session_list,
     ReqMethod.SESSION_RENAME: handle_session_rename,
     ReqMethod.SESSION_REBIND_PROJECT: handle_session_rebind_project,
@@ -181,6 +209,23 @@ HANDLERS: dict[ReqMethod, Handler] = {
     ReqMethod.SESSION_REWIND_CONTEXT: handle_session_rewind_context,
     ReqMethod.HISTORY_GET: handle_history_get,
     ReqMethod.HISTORY_APPEND_RECORD: handle_history_append_record,
+    ReqMethod.TEAM_TEMPLATES_LIST: handle_team_templates_list,
+    ReqMethod.TEAM_BINDINGS_LIST: handle_team_bindings_list,
+    ReqMethod.TEAM_BINDING_CREATE: handle_team_binding_create,
+    ReqMethod.TEAM_BINDING_GENERATE: handle_team_binding_generate,
+    ReqMethod.TEAM_SESSION_BIND: handle_team_session_bind,
+    ReqMethod.TEAM_DELETE: handle_team_delete,
+    ReqMethod.TEAM_SNAPSHOT: handle_team_snapshot,
+    ReqMethod.TEAM_LIST: handle_team_list,
+    ReqMethod.ORG_SNAPSHOT: handle_org_snapshot,
+    ReqMethod.A4P_CONFIG_GET: handle_a4p_request,
+    ReqMethod.A4P_CONFIG_UPDATE: handle_a4p_request,
+    ReqMethod.TEAM_MQ_PUBLISH: handle_team_mq_publish,
+    ReqMethod.TEAM_HISTORY_GET: handle_team_history_get,
+    ReqMethod.TEAM_MEMBERS_GET: handle_team_members_get,
+    ReqMethod.SWARMFLOW_PAUSE: handle_swarmflow_control,
+    ReqMethod.SWARMFLOW_RESUME: handle_swarmflow_control,
+    ReqMethod.SWARMFLOW_STOP: handle_swarmflow_control,
 }
 
 
