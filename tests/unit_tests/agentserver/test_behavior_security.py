@@ -213,9 +213,9 @@ async def test_output_inspection_waits_and_rejects_before_model_continues():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('decision,blocked', [
-    ('allow', False), ('deny', True), ('unavailable', True),
+    ('allow', False), ('deny', True), ('unavailable', False),
 ])
-async def test_output_inspection_is_fail_closed(decision, blocked):
+async def test_output_inspection_blocks_only_explicit_reject(decision, blocked):
     b, events = bridge(decision=decision)
     rail = BehaviorSecurityRail(b)
     ctx = context()
@@ -226,6 +226,51 @@ async def test_output_inspection_is_fail_closed(decision, blocked):
     assert events[0]['mode'] == 'inspect'
     assert bool(ctx.force_finish_requests) is blocked
     assert ctx.inputs.tool_result == (OUTPUT_BLOCK_MESSAGE if blocked else {'result': 'ok'})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reply', [
+    {'decision': 'unavailable', 'reason': 'timeout'},
+    {'decision': 'unavailable', 'reason': 'request_failed'},
+    {'decision': 'unavailable', 'reason': 'invalid_security_result'},
+    {'decision': 'unavailable', 'reason': 'queue_unavailable'},
+    {'decision': 'unavailable'},
+])
+async def test_inspect_exceptions_fail_open(reply):
+    b, _ = bridge()
+    calls = []
+
+    async def send(event):
+        calls.append(event)
+        return reply
+
+    b._send = send
+    ctx = context()
+    ctx.inputs.tool_result = {'result': 'ok'}
+    result = await b.inspect(raw_event(ctx, 'tool.after'))
+    assert result.permission == PermissionLevel.ALLOW
+    assert len(calls) == 1
+    await b.close()
+
+
+@pytest.mark.asyncio
+async def test_inspect_reject_on_one_chunk_blocks_whole_output():
+    b, _ = bridge()
+    calls = []
+
+    async def send(event):
+        calls.append(event)
+        if event['tool']['result'].get('chunkIndex') == 0:
+            return {'decision': 'deny', 'reason': 'blocked'}
+        return {'decision': 'unavailable', 'reason': 'timeout'}
+
+    b._send = send
+    ctx = context()
+    ctx.inputs.tool_result = {'content': 'A' * 7000 + 'MIDDLE' + 'B' * 7000}
+    result = await b.inspect(raw_event(ctx, 'tool.after'))
+    assert result.permission == PermissionLevel.DENY
+    assert result.reason == 'blocked'
+    await b.close()
 
 
 @pytest.mark.asyncio
@@ -242,12 +287,12 @@ async def test_large_output_is_fully_chunked_for_inspection():
 
 
 @pytest.mark.asyncio
-async def test_oversized_output_fails_closed_without_partial_scan():
-    b, events = bridge(decision='allow')
+async def test_oversized_output_fails_open_without_partial_scan():
+    b, events = bridge(decision='deny')
     ctx = context()
     ctx.inputs.tool_result = {'content': 'A' * (65 * 1024)}
     result = await b.inspect(raw_event(ctx, 'tool.after'))
-    assert result.permission == PermissionLevel.DENY
+    assert result.permission == PermissionLevel.ALLOW
     assert events == []
 
 
