@@ -3,14 +3,19 @@
  *
  * Windows user-mode soft delete. Loaded once into an agent or sandbox
  * process; the CreateProcessInternalW hook then loads it into children.
- * MSYS/Cygwin images such as Git Bash are not injected: any extra DLL
+ * MSYS/Cygwin shells such as Git Bash are not injected: any extra DLL
  * makes their fork wait forever. They are started under a debug loop
- * that loads this DLL into Windows descendants before main runs.
+ * that loads this DLL into Windows descendants before main runs, and
+ * also into short-lived POSIX delete tools those shells spawn (rm,
+ * rmdir, unlink, shred). Those tools unlink in-process and do not fork
+ * like bash, so the ntdll delete hooks can see Git Bash `rm -rf`.
  * Console hosts (conhost.exe) are left alone: injecting them crashes
  * the host and the parent exits with STATUS_DLL_INIT_FAILED.
  * MinGW images (libwinpthread-1.dll beside the exe, including git.exe)
  * and explorer.exe are not injected either. They live outside the
  * install directory and would keep this file locked across an upgrade.
+ * A Git `rm` that holds this DLL is short-lived; overwrite-install still
+ * finds it with Restart Manager on this file, same as other holders.
  *
  * Delete calls are turned into a recycle-bin move, or a same-volume rename
  * into the archive directory. A sandbox process turns a relative name into a
@@ -2573,6 +2578,15 @@ static int image_leaf_is(const wchar_t *exe, const wchar_t *leaf) {
     return _wcsicmp(name, leaf) == 0;
 }
 
+/* POSIX delete helpers spawned by Git Bash. Do not add bash/sh/find:
+ * those fork, and an extra DLL makes the fork wait forever. */
+static int image_is_posix_delete_tool(const wchar_t *exe) {
+    return image_leaf_is(exe, L"rm.exe")
+        || image_leaf_is(exe, L"rmdir.exe")
+        || image_leaf_is(exe, L"unlink.exe")
+        || image_leaf_is(exe, L"shred.exe");
+}
+
 /* These images are not injected. MinGW keeps the DLL mapped from outside
  * the install tree (git.exe). Explorer must keep running after uninstall. */
 static int image_skip_inject(const wchar_t *exe) {
@@ -2716,7 +2730,9 @@ static void close_create_handles(CREATE_PROCESS_DEBUG_INFO *info) {
      * events. Closing them here lets that later close hit a reused handle. */
 }
 
-/* 1 means do not inject: MSYS/Cygwin, a console host, or an unreadable image. */
+/* 1 means do not inject: MSYS/Cygwin shells, a console host, MinGW, or
+ * an unreadable image. POSIX delete tools are injected so Git Bash rm
+ * still hits the ntdll delete hooks. */
 static int created_image_skip_inject(HANDLE process, HANDLE file) {
     wchar_t path[1024];
     DWORD cap = 1024;
@@ -2742,7 +2758,13 @@ static int created_image_skip_inject(HANDLE process, HANDLE file) {
         log_line(L"softdelete: debug image path unavailable, leaving it unhooked");
         return 1;
     }
-    return image_is_posix(bare) || image_skip_inject(bare);
+    if (image_skip_inject(bare)) {
+        return 1;
+    }
+    if (image_is_posix_delete_tool(bare)) {
+        return 0;
+    }
+    return image_is_posix(bare);
 }
 
 static void on_debug_create(DebugTree *tree, DEBUG_EVENT *ev) {
