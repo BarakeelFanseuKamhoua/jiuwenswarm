@@ -50,6 +50,20 @@ from jiuwenswarm.server.handlers.extensions import (
     handle_harness_packages_scan,
     handle_hooks_list,
 )
+from jiuwenswarm.server.handlers.mcp import handle_command_mcp
+from jiuwenswarm.server.handlers.mcp_hub import (
+    handle_mcp_cancel_connect,
+    handle_mcp_connect,
+    handle_mcp_delete_custom,
+    handle_mcp_disconnect,
+    handle_mcp_install,
+    handle_mcp_list,
+    handle_mcp_register_custom,
+    handle_mcp_save_credentials,
+    handle_mcp_show,
+    handle_mcp_uninstall,
+    handle_mcp_wait_auth,
+)
 from jiuwenswarm.server.handlers.ops import (
     handle_agent_prewarm_sync,
     handle_agent_reload_config,
@@ -61,6 +75,7 @@ from jiuwenswarm.server.handlers.ops import (
 )
 from jiuwenswarm.server.handlers.permissions import handle_permissions_config
 from jiuwenswarm.server.handlers.sandbox import handle_command_sandbox
+from jiuwenswarm.server.handlers.schedule import handle_schedule_request
 
 Handler = Callable[[RequestContext], Awaitable[None]]
 
@@ -115,6 +130,31 @@ HANDLERS: dict[ReqMethod, Handler] = {
     ReqMethod.COMMAND_SESSION: handle_command_session,
     ReqMethod.COMMAND_STATUS: handle_command_status,
     ReqMethod.COMMAND_SANDBOX: handle_command_sandbox,
+    ReqMethod.COMMAND_MCP: handle_command_mcp,
+    ReqMethod.MCP_LIST: handle_mcp_list,
+    ReqMethod.MCP_SHOW: handle_mcp_show,
+    ReqMethod.MCP_INSTALL: handle_mcp_install,
+    ReqMethod.MCP_UNINSTALL: handle_mcp_uninstall,
+    ReqMethod.MCP_CONNECT: handle_mcp_connect,
+    ReqMethod.MCP_WAIT_AUTH: handle_mcp_wait_auth,
+    ReqMethod.MCP_CANCEL_CONNECT: handle_mcp_cancel_connect,
+    ReqMethod.MCP_DISCONNECT: handle_mcp_disconnect,
+    ReqMethod.MCP_REGISTER_CUSTOM: handle_mcp_register_custom,
+    ReqMethod.MCP_DELETE_CUSTOM: handle_mcp_delete_custom,
+    ReqMethod.MCP_SAVE_CREDENTIALS: handle_mcp_save_credentials,
+    ReqMethod.SCHEDULE_CHECK_CONFIG: handle_schedule_request,
+    ReqMethod.SCHEDULE_UPDATE_CONFIG: handle_schedule_request,
+    ReqMethod.SCHEDULE_CREATE: handle_schedule_request,
+    ReqMethod.SCHEDULE_RUN: handle_schedule_request,
+    ReqMethod.SCHEDULE_LIST: handle_schedule_request,
+    ReqMethod.SCHEDULE_STATUS: handle_schedule_request,
+    ReqMethod.SCHEDULE_LOGS: handle_schedule_request,
+    ReqMethod.SCHEDULE_CANCEL: handle_schedule_request,
+    ReqMethod.SCHEDULE_DELETE: handle_schedule_request,
+    ReqMethod.ISSUE_WATCH_ONCE: handle_schedule_request,
+    ReqMethod.ISSUE_STATE_LIST: handle_schedule_request,
+    ReqMethod.ISSUE_DELETE: handle_schedule_request,
+    ReqMethod.ISSUE_MATRIX: handle_schedule_request,
 }
 
 
