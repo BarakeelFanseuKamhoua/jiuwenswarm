@@ -71,7 +71,7 @@ def _web_file_limit_bytes() -> int:
         value = get_sandbox_runtime()["limits"]["max_file_mb"]
         return int(value) * 1024 * 1024
     except (KeyError, TypeError, ValueError):
-        return 100 * 1024 * 1024
+        return 1024 * 1024 * 1024
 
 
 def _dated_user_log_roots(logs_root: Path) -> list[Path]:
