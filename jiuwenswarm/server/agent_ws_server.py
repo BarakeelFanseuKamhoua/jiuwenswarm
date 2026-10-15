@@ -432,7 +432,19 @@ class AgentWebSocketServer:
         # key是``_ws_capabilities_key``返回的str(id(ws))，与RequestContext.connection_id
         self._acp_client_capabilities_by_ws: dict[str, dict[str, Any]] = {}
         # AgentManager 实例（企业多租户入口见 TenantAgentPool，按企业版使用）
-        self._agent_manager = AgentManager()
+        # 企业版无 manager-server 部署时（agent-runtime 可插拔静态模式），chat/heartbeat
+        # 信封不带租户身份、进不了租户池，会落到本裸 manager——须解析默认租户
+        # workspace，否则创建 SkillManager 时抛 SkillWorkspaceUnavailable。
+        # 目录与租户池的 workspace_default 一致，状态共享。
+        if is_enterprise():
+            from jiuwenswarm.common.utils import get_multi_tenant_user_workspace_dir
+
+            self._agent_manager = AgentManager(
+                user_workspace_dir=str(get_multi_tenant_user_workspace_dir()),
+                workspace_key="default",
+            )
+        else:
+            self._agent_manager = AgentManager()
         # skills.* 等无状态 RPC：AgentManager 未缓存 agent 时复用的轻量 JiuWenSwarm，
         # 避免每次 cache miss 都 new 导致 SkillNet 异步安装等实例态断裂。
         self._stateless_fallback_agents: dict[str, Any] = {}
