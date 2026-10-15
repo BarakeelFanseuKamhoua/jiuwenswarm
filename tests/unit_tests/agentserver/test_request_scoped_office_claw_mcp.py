@@ -107,6 +107,7 @@ def _bare_session_adapter() -> JiuWenSwarmDeepAdapter:
     adapter._instance = SimpleNamespace(ability_manager=_AbilityManager())
     adapter._active_office_claw_mcp = None
     adapter._active_office_claw_tool_instances = ()
+    adapter._pending_office_claw_tool_ids = set()
     return adapter
 
 
