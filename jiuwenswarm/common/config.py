@@ -2371,8 +2371,8 @@ _SANDBOX_RUNTIME_DEFAULTS: dict[str, Any] = {
     "idle_check_interval": None,
     "fallback_on_failure": False,
     "limits": {
-        "max_file_mb": 100,
-        "exec_timeout_seconds": 600,
+        "max_file_mb": 1024,
+        "exec_timeout_seconds": 3600,
     },
 }
 

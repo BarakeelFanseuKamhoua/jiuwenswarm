@@ -137,8 +137,8 @@ def test_net_guard_rpc_get_and_set(monkeypatch):
         )
         assert resp.ok and resp.payload["apply_mode"] == "hot_reload"
         assert resp.payload["net_guard"]["enforce_host_exit"] is True
-        assert resp.payload["net_guard"]["max_request_mb"] == 10
-        assert resp.payload["net_guard"]["timeout_seconds"] == 120
+        assert resp.payload["net_guard"]["max_request_mb"] == 1024
+        assert resp.payload["net_guard"]["timeout_seconds"] == 3600
 
         resp = rpc.dispatch_permissions_config_request(
             AgentRequest(
@@ -193,8 +193,8 @@ def test_sandbox_limits_have_simple_defaults_and_strict_validation():
     from jiuwenswarm.common.config import _ensure_sandbox_runtime_shape
 
     assert _ensure_sandbox_runtime_shape({})["limits"] == {
-        "max_file_mb": 100,
-        "exec_timeout_seconds": 600,
+        "max_file_mb": 1024,
+        "exec_timeout_seconds": 3600,
     }
     assert _ensure_sandbox_runtime_shape(
         {"limits": {"max_file_mb": 12, "exec_timeout_seconds": 34}}
