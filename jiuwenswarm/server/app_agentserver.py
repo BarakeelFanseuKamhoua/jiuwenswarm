@@ -195,6 +195,21 @@ from jiuwenswarm.server.runtime.debug_trace.task_tool_patch import (
 register_task_tool_debug_import_hook()
 
 
+def _show_startup_error(message: str) -> None:
+    """The desktop client has no startup-error event; show the Windows error here."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+        user32.MessageBoxW.restype = wintypes.INT
+        user32.MessageBoxW(None, f"沙箱初始化失败, 本地服务未启动。\n\n{message}",
+                           "小艺Work 启动失败", 0x10 | 0x10000 | 0x40000)
+    except OSError:
+        logger.exception("无法显示 Windows 启动失败提示")
+
+
 async def _run(host: str, port: int) -> None:
     from openjiuwen.core.runner import Runner
     from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
@@ -255,11 +270,22 @@ async def _run(host: str, port: int) -> None:
     # 尽早建通道可让握手不被后续初始化（checkpointer 预热等）拖延。
     from jiuwenswarm.server.e2a_desktop import start_desktop_e2a_channels
 
+    server.begin_startup()
     desktop_channels = await start_desktop_e2a_channels(
         server.run_connection,
         on_stdio_closed=stop_event.set,
     )
-    await server.start(listen_tcp=desktop_channels is None)
+    try:
+        await server.start(listen_tcp=desktop_channels is None)
+    except Exception as exc:
+        logger.exception("本地服务启动失败: %s", exc)
+        if sys.platform == "win32" and (desktop_channels is not None or "--desktop-run-agent" in sys.argv):
+            await asyncio.to_thread(_show_startup_error, str(exc))
+        if desktop_channels is not None:
+            await desktop_channels.stop()
+        await server.stop()
+        await server._jiuwenbox_runner.stop()
+        raise
 
     # ---------- ProactiveEngine 初始化 ----------
     # 适配逻辑（建专用 agent + 触发主 agent 回调）封装在 proactive_adapter，

@@ -405,6 +405,43 @@ system_tests:
 
 ---
 
+## 十一、Windows 普通权限启动与 UAC 验证
+
+以下真实系统检查应在专用 Windows 测试环境中执行。单元测试使用 mock，不能替代 UAC 弹窗和沙箱内命令执行的验证。
+
+在普通 PowerShell 中运行开发入口，并在实际使用的配置中启用 `sandbox.enabled: true`、`sandbox.startup_mode: internal`：
+
+```powershell
+Set-Location E:\project\xiaoyi-work
+([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+.\dev-local.ps1
+```
+
+第一条检查应输出 `False`。setup 在 box-server Job 创建前执行，只提升安装或修复子进程；正常服务仍按原普通权限运行。UAC 等待和安装计入启动等待预算，超时会明确失败，需由用户重试。
+
+| 测试状态／操作 | 验收结果 |
+|---|---|
+| 测试机未安装沙箱，批准 UAC | 安装成功后才完成 E2A 握手；沙箱内 `whoami` 显示 `jbx-sandbox` |
+| 同样的准备需求，拒绝 UAC | 原生错误框明确显示授权取消；无成功握手，不执行工具任务 |
+| 已安装但测试账户缺失／凭据不一致 | 请求 UAC 修复；通过登录验证后才启动，不默认删除 profile 重建账户 |
+| policy 新增宿主用户无 `WRITE_DAC` 的目录 | 请求 UAC 补授权；不重建账户或网络规则；随后普通权限可创建沙箱 |
+| 目录属于当前用户且能自行授权 | 普通权限补授权并缓存，不请求 UAC |
+| setup 非零退出、提权被拒绝或超时 | 明确提示失败原因或安装日志位置；box-server 不就绪，agent 不发送成功 ack |
+| 已准备好的环境再次启动 | 不重复请求 UAC；实际 shell、文件操作正常 |
+| 桌面 stdio 读线程已阻塞等待协议帧 | runner 探测、setup 和 box-server 使用独立的空 stdin，不因继承桌面管道而卡在 Python 启动阶段 |
+| 沙箱关闭 | 普通权限停止 runner、清理实例；原有 Job 的退出回收仍生效 |
+
+自动化回归可从 JiuwenSwarm 根目录分别运行（两个项目分开调用）：
+
+```powershell
+Push-Location .\jiuwenbox
+& ..\.venv\Scripts\python.exe -m pytest tests\unit\test_win_setup_startup.py tests\unit\test_win_setup_owned_preinstall.py tests\unit\test_win_setup_group.py tests\unit\test_win_acl_bounded.py tests\unit\test_win_exec_runner_command.py -q
+Pop-Location
+& .\.venv\Scripts\python.exe -m pytest tests\unit_tests\agentserver\test_sandbox_startup_readiness.py tests\unit_tests\agentserver\test_runner_python_selection.py tests\unit_tests\agentserver\test_jiuwenbox_runner_env.py tests\unit_tests\agentserver\test_sandbox_restart_rpc.py -q -o addopts=""
+```
+
 **文档版本**: v1.0  
 **创建日期**: 2026-07-01  
 **适用框架**: pytest + Python 3.10+

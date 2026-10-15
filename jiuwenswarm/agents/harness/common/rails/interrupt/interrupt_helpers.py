@@ -303,6 +303,8 @@ def build_permission_rail(
     from jiuwenswarm.common.behavior_security import (
         ACTIVE_BEHAVIOR, cloud_authorization_enabled, desktop_security_active, runtime_permission_config, skill_confirmation_pending,
     )
+    from jiuwenswarm.common.permission_profile import resolve_permission_profile_rules
+
     behavior_enabled = desktop_security_active()
     defer_unmatched = cloud_authorization_enabled(config)
     permission_config = runtime_permission_config(config)
@@ -583,7 +585,9 @@ def build_permission_rail(
                 get_permissions_with_session_overlay,
             )
 
-            snapshot = get_permissions_with_session_overlay(session_id=session_id)
+            snapshot = resolve_permission_profile_rules(
+                get_permissions_with_session_overlay(session_id=session_id)
+            )
             if behavior_enabled:
                 current_defer = (
                     cloud_authorization_enabled(get_config())

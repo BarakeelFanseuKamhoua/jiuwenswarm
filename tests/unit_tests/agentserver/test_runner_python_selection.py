@@ -91,7 +91,11 @@ async def test_bootstrap_stops_on_probe_failure_and_preserves_frozen_branch(monk
         _allocate_internal_jiuwenbox_port=lambda host, port: port,
     )
 
-    await server.AgentWebSocketServer._bootstrap_internal_jiuwenbox(owner)
+    if mode == "frozen":
+        await server.AgentWebSocketServer._bootstrap_internal_jiuwenbox(owner)
+    else:
+        with pytest.raises(RuntimeError, match="runner Python"):
+            await server.AgentWebSocketServer._bootstrap_internal_jiuwenbox(owner)
 
     if mode == "frozen":
         select.assert_not_called()

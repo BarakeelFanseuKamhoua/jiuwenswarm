@@ -17,6 +17,7 @@ from openjiuwen.harness.security import PermissionLevel, PermissionResult, Skill
 from openjiuwen.harness.security.permission_engine.toolguard.tool_policy import evaluate_tiered_policy
 from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_SESSION_ID
 from jiuwenswarm.common.np_transport import named_pipe_transport_for
+from jiuwenswarm.common.permission_profile import resolve_permission_profile_rules
 from jiuwenswarm.common.utils import logger
 
 ACTIVE_BEHAVIOR: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("active_behavior", default=None)
@@ -42,7 +43,7 @@ def runtime_permission_config(config: dict) -> dict:
     Only the runtime copy is changed; the stored permission mode and other
     hosts retain their existing semantics.
     """
-    permissions = copy.deepcopy(config.get("permissions", {}))
+    permissions = resolve_permission_profile_rules(config.get("permissions", {}))
     if desktop_security_active():
         permissions["enabled"] = True
         permissions["defer_unmatched"] = cloud_authorization_enabled(config)
