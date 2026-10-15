@@ -294,10 +294,9 @@ def build_permission_rail(
     from jiuwenswarm.common.utils import get_config_file, get_workspace_dir
 
     from jiuwenswarm.common.behavior_security import (
-        ACTIVE_BEHAVIOR, cloud_authorization_enabled, desktop_security_active, runtime_permission_config, skill_confirmation_pending,
+        ACTIVE_BEHAVIOR, desktop_security_active, runtime_permission_config, skill_confirmation_pending,
     )
     behavior_enabled = desktop_security_active()
-    defer_unmatched = cloud_authorization_enabled(config)
     permission_config = runtime_permission_config(config)
     tools_config = permission_config.setdefault("tools", {})
     if isinstance(tools_config, dict):
@@ -575,8 +574,17 @@ def build_permission_rail(
             )
 
             snapshot = get_permissions_with_session_overlay(session_id=session_id)
+            snapshot = {**snapshot}
+            snapshot.pop("strict_tool_command_merge", None)
             if behavior_enabled:
-                snapshot = {**snapshot, "enabled": True, "defer_unmatched": defer_unmatched}
+                # Hot reload updates the rail's runtime config in place. Do not
+                # restore a cloud switch captured when this closure was built.
+                runtime_config = permission_rail._engine.config
+                snapshot.update({
+                    "enabled": True,
+                    "defer_unmatched": runtime_config.get("defer_unmatched") is True,
+                    "strict_tool_command_merge": runtime_config.get("strict_tool_command_merge") is True,
+                })
             return build_trusted_dirs_permission_config(
                 snapshot,
                 runtime_trusted_dirs_state,

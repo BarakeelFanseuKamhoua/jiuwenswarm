@@ -5761,8 +5761,14 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def _update_permission_rail(self, config_base: dict[str, Any] | None) -> None:
         """原地更新已有 PermissionRail 配置，或在首次启用时新建。"""
         from jiuwenswarm.common.behavior_security import runtime_permission_config
+        from jiuwenswarm.agents.harness.common.rails.behavior_security_rail import BehaviorSecurityRail
 
         config_base = config_base or {}
+        behavior_rail = getattr(self, "_cspl_sentinel_rail", None)
+        if isinstance(behavior_rail, BehaviorSecurityRail):
+            # Keep the cloud router aligned with the freshly injected policy.
+            # Completed event decisions remain cached for confirmation resume.
+            behavior_rail.bridge.config = config_base
         permission_config = runtime_permission_config(config_base)
         if self._permission_rail is not None:
             self._permission_rail.update_config(permission_config)

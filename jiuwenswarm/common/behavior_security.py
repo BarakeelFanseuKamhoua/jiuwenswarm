@@ -40,9 +40,13 @@ def runtime_permission_config(config: dict) -> dict:
     hosts retain their existing semantics.
     """
     permissions = copy.deepcopy(config.get("permissions", {}))
+    # Host-owned policy: persisted settings and session overlays cannot opt in.
+    permissions.pop("strict_tool_command_merge", None)
     if desktop_security_active():
         permissions["enabled"] = True
-        permissions["defer_unmatched"] = cloud_authorization_enabled(config)
+        cloud_enabled = cloud_authorization_enabled(config)
+        permissions["defer_unmatched"] = cloud_enabled
+        permissions["strict_tool_command_merge"] = cloud_enabled
     return permissions
 
 
