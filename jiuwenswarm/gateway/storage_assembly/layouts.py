@@ -145,6 +145,7 @@ def _db_table(table: str) -> StoreLayout:
 _YAML_AND_DB_SECTIONS: dict[str, _YamlSectionSpec] = {
     "channel_config": ("/channels", ("id",), ""),
     "logging_config": ("/logging", (), ""),
+    "memory_config": ("/memory", (), ""),
 }
 
 _YAML_ONLY_SECTIONS: dict[str, _YamlSectionSpec] = {
