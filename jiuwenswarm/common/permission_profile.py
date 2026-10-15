@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Optional
 
@@ -43,6 +44,29 @@ _PROFILE_ALIASES: dict[str, str] = {
 
 # 网络类工具（与桌面端 patchPermissionsForProfile 对齐）
 _NETWORK_TOOLS = ("mcp_free_search", "mcp_paid_search", "mcp_fetch_webpage")
+
+
+def resolve_permission_profile_rules(permissions: dict[str, Any]) -> dict[str, Any]:
+    """Resolve product rule actions before the desktop enables runtime checks.
+
+    The stored enabled flag distinguishes full access from restricted profiles.
+    Keep the input untouched so switching profiles cannot persist a resolved
+    action. Invalid overrides retain the rule's base action.
+    """
+    resolved = deepcopy(permissions)
+    profile = "full_access" if permissions.get("enabled") is False else "default"
+    rules = resolved.get("rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            actions = rule.pop("profile_actions", None)
+            if rule.get("layer") == "builtin" or not isinstance(actions, dict):
+                continue
+            action = actions.get(profile)
+            if isinstance(action, str) and action in {"allow", "ask", "deny"}:
+                rule["action"] = action
+    return resolved
 
 
 def normalize_permission_profile(raw: Any) -> Optional[str]:
