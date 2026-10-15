@@ -224,10 +224,13 @@ class BehaviorSecurityBridge:
                 result = PermissionResult(PermissionLevel.DENY, reason=str(reply.get("reason") or "云端拒绝本次操作"))
             else:
                 fail_closed = self.config.get("security", {}).get("fail_closed", {}).get("enabled") is True
-                result = PermissionResult(
-                    PermissionLevel.DENY if fail_closed else PermissionLevel.ASK,
-                    reason="云端不可用，拒绝本次操作" if fail_closed else "云端不可用，请授权本次操作",
-                )
+                if fail_closed:
+                    result = PermissionResult(PermissionLevel.DENY, reason="云端不可用，拒绝本次操作")
+                elif event.get("stage") == "skill.before_install":
+                    # Installation still asks; tool authorize fail-opens like inspect.
+                    result = PermissionResult(PermissionLevel.ASK, reason="云端不可用，请授权本次操作")
+                else:
+                    result = PermissionResult(PermissionLevel.ALLOW, reason="cloud:unavailable")
         if revision != self.policy_revision():
             return PermissionResult(PermissionLevel.DENY, reason="安全策略已变更，请重新发起操作")
         self.decisions[key] = result
