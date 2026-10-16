@@ -24,7 +24,7 @@ if _KV_CACHE_MOD not in sys.modules:
 import httpx
 
 from jiuwenswarm.common.log_context import NO_SESSION_ID, current_log_session_id
-from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
+from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server.agent_http_routes import build_http_app
 from jiuwenswarm.server.agent_http_server import resolve_http_server_settings
@@ -240,3 +240,81 @@ async def test_stream_cancel_is_reraised() -> None:
     )
     with pytest.raises(asyncio.CancelledError):
         await invoke_stream(ctx, _cancel)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_the_stream_task() -> None:
+    """网页请求被取消时，后台聊天也要停，不能继续跑完这一轮。"""
+    from jiuwenswarm.server.agent_http_routes import _stop_background_chat
+
+    child_started = asyncio.Event()
+    parent_waiting = asyncio.Event()
+    child_cancelled = asyncio.Event()
+
+    async def _child() -> None:
+        child_started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            raise
+
+    async def _parent() -> None:
+        task = asyncio.create_task(_child())
+        await child_started.wait()
+        try:
+            parent_waiting.set()
+            await asyncio.sleep(30)
+        finally:
+            await _stop_background_chat(task)
+
+    parent = asyncio.create_task(_parent())
+    await parent_waiting.wait()
+    parent.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parent
+    assert child_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_finished_stream_is_not_cancelled() -> None:
+    """正常把流读完时，只等后台聊天结束，不把它取消。"""
+    from jiuwenswarm.server.agent_http_routes import _stop_background_chat
+
+    async def _child() -> None:
+        await asyncio.sleep(0)
+
+    async def _parent() -> None:
+        task = asyncio.create_task(_child())
+        await _stop_background_chat(task)
+        assert task.cancelled() is False
+
+    await _parent()
+
+
+@pytest.mark.asyncio
+async def test_sse_queue_stops_at_the_limit() -> None:
+    sink = SSESink()
+    pending = [
+        asyncio.create_task(
+            sink.send_chunk(
+                AgentResponseChunk(
+                    request_id="req-bound",
+                    channel_id="http",
+                    payload={"n": sequence},
+                    is_complete=False,
+                ),
+                sequence=sequence,
+            )
+        )
+        for sequence in range(40)
+    ]
+    await asyncio.sleep(0)
+    assert sink.pending_frame_count() == 32
+    assert any(not task.done() for task in pending)
+    await sink.close()
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    assert sink.pending_frame_count() <= 32

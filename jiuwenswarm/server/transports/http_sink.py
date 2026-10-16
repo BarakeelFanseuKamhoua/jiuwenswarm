@@ -11,6 +11,8 @@ from typing import Any
 from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 
 _PLAN_MODE_EXITED = "plan.mode_exited"
+# 客户端断开后没人再取帧。队列有上限，满了就等，避免一轮长聊天把内存堆满。
+_SSE_FRAME_QUEUE_LIMIT = 32
 
 
 def response_to_dict(response: AgentResponse) -> dict[str, Any]:
@@ -92,7 +94,7 @@ class SSESink:
     """把每一片放进队列，路由按 SSE 往外推。"""
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=_SSE_FRAME_QUEUE_LIMIT)
         self._closed = False
 
     async def send_response(self, response: AgentResponse) -> None:
@@ -119,13 +121,29 @@ class SSESink:
         if self._closed:
             return
         self._closed = True
-        await self._queue.put(None)
+        self._put_dropping_oldest(None)
+
+    def pending_frame_count(self) -> int:
+        """还没被取走的帧数，含结束标记。"""
+        return self._queue.qsize()
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         if self._closed:
             return
         text = json.dumps(payload, ensure_ascii=False, default=str)
         await self._queue.put(f"data: {text}\n\n")
+
+    def _put_dropping_oldest(self, item: str | None) -> None:
+        """结束标记必须放进去。队列满时丢掉最旧的一帧，避免关流时卡死。"""
+        while True:
+            try:
+                self._queue.put_nowait(item)
+                return
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
 
 
 async def deliver_runtime_event(

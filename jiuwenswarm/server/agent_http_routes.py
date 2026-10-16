@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -90,7 +91,7 @@ def build_http_app(app_services: AppServices) -> FastAPI:
                     async for frame in sink.frames():
                         yield frame
                 finally:
-                    await task
+                    await _stop_background_chat(task)
 
             return StreamingResponse(_frames(), media_type="text/event-stream")
 
@@ -106,6 +107,39 @@ def build_http_app(app_services: AppServices) -> FastAPI:
         return JSONResponse(ctx.sink.body or {}, status_code=ctx.sink.status_code)
 
     return app
+
+
+async def _stop_background_chat(task: asyncio.Task[None]) -> None:
+    """流结束时等后台聊天收尾；客户端断开时先把它停掉。
+
+    Python 3.11 起，当前任务已被取消时，``finally`` 里的 ``await`` 会马上再抛
+    「已取消」，后台任务就没人取消、也没人等待。先把这次取消暂存起来，等后台
+    停稳，再把取消还回去，让这次网页请求仍然按断开结束。
+
+    正常读完时不要取消。取消只发生在请求本身已被取消，或生成器被关掉
+    （客户端中途离开，生成器收到 GeneratorExit）的时候。
+    """
+    current = asyncio.current_task()
+    abandoned = sys.exception() is not None or (
+        current is not None and current.cancelling() > 0
+    )
+    if abandoned and not task.done():
+        task.cancel()
+    parked = 0
+    if abandoned and current is not None:
+        while current.cancelling():
+            current.uncancel()
+            parked += 1
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not abandoned:
+            raise
+    finally:
+        if current is None:
+            return
+        for _ in range(parked):
+            current.cancel()
 
 
 def _chat_method(body: dict[str, Any]) -> ReqMethod:
