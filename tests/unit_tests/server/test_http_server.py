@@ -166,6 +166,39 @@ async def test_chat_route_uses_the_chat_adapter(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_keeps_the_user_id_from_the_body(monkeypatch) -> None:
+    """正文里的 user_id 要进请求，和 WebSocket 解析同一条请求时一样。"""
+    seen: list[str] = []
+
+    async def _chat(ctx: RequestContext) -> None:
+        seen.append(ctx.request.user_id)
+        await ctx.sink.send_response(
+            AgentResponse(
+                request_id=ctx.request.request_id,
+                channel_id=ctx.request.channel_id,
+                ok=True,
+                payload={"echo": True},
+            )
+        )
+
+    monkeypatch.setattr("jiuwenswarm.server.http_chat.handle_http_chat", _chat)
+    app = build_http_app(AppServices())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/chat",
+            json={
+                "request_id": "req-user",
+                "session_id": "sess-user",
+                "user_id": "  alice  ",
+                "params": {"query": "你好"},
+            },
+        )
+    assert response.status_code == 200
+    assert seen == ["alice"]
+
+
+@pytest.mark.asyncio
 async def test_chat_adapter_runs_prelude_before_the_reply(monkeypatch) -> None:
     order: list[str] = []
 

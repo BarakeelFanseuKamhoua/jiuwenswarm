@@ -186,6 +186,7 @@ def _context_from_mapping(
         params=params if isinstance(params, dict) else {},
         is_stream=is_stream,
         metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else None,
+        user_id=str(body.get("user_id") or "").strip(),
     )
     return RequestContext(
         request=agent_request,
