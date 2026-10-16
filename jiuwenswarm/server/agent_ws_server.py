@@ -21,7 +21,10 @@ from gateway_protocol.hooks import AgentServerChatHookContext, AgentServerHookEv
 from openjiuwen.core.common.logging import server_logger
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 
-from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService, reset_harness_packages_state
+from jiuwenswarm.agents.harness.common.auto_harness import (
+    AutoHarnessService,
+    reset_harness_packages_state,
+)
 from jiuwenswarm.agents.harness.code.rails.heartbeat.runtime import HeartbeatRailRuntime
 from jiuwenswarm.server.gateway_push.wire import build_server_push_wire
 from jiuwenswarm.server.ws_send import send_wire_payload
@@ -60,8 +63,19 @@ from jiuwenswarm.common.ws_diagnostics import (
 from jiuwenswarm.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
 from jiuwenswarm.server.runtime.agent_manager import AgentManager
 from jiuwenswarm.runtime import AgentRuntime
+from jiuwenswarm.server.app_services import (
+    AppServices,
+    parse_sandbox_host_port,
+    resolve_adapter,
+)
 from jiuwenswarm.server.context import build_ws_request_context
 from jiuwenswarm.server.dispatch import try_dispatch
+from jiuwenswarm.server.middleware.chat import (
+    ensure_auto_team_binding,
+    request_query_text,
+    trigger_before_chat_request,
+    try_record_implicit_feedback,
+)
 from jiuwenswarm.server.runtime.tokenizer_service import TokenizerService
 from jiuwenswarm.server.runtime.session.session_metadata import (
     build_server_push_message,
@@ -89,7 +103,6 @@ from jiuwenswarm.agents.harness.common.a4p_rpc import get_a4p_req_methods
 from jiuwenswarm.common.config import (
     DEFAULT_SANDBOX_POLICY_FILE,
     get_config,
-    get_available_models,
     get_default_models,
     get_sandbox_endpoint,
     get_sandbox_startup_mode_explicit,
@@ -584,17 +597,6 @@ class _StreamKeepalive:
             )
 
 
-def _request_query_text(request: AgentRequest) -> str:
-    """Return text chat query only; structured events are handled downstream."""
-    if not isinstance(request.params, dict):
-        return ""
-    query = request.params.get("query")
-    if not isinstance(query, str):
-        return ""
-    return query.strip()
-
-
-
 
 
 
@@ -672,6 +674,20 @@ def _inject_plan_mode_activation_reminder(request: AgentRequest) -> None:
 # Key substrings whose presence marks a payload field as credential-like.
 
 
+class _AppField:
+    """把原来放在 WebSocket 服务器上的字段，转到进程工具箱里的同名数据。"""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        return getattr(obj._ensure_app_services(), self.name)
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        setattr(obj._ensure_app_services(), self.name, value)
+
 
 class AgentWebSocketServer:
     """Gateway 与 AgentServer 之间的 WebSocket 服务端（单例）.
@@ -686,6 +702,40 @@ class AgentWebSocketServer:
     """
 
     _instance: ClassVar[AgentWebSocketServer | None] = None
+
+    # 这些名字还在，好让原来的代码和测试继续写 server._agent_manager。
+    # 真正的数据在进程工具箱里，全进程这一份服务器只用一份。
+    _runtime = _AppField("runtime")
+    _agent_manager = _AppField("agent_manager")
+    _session_message_service = _AppField("session_message_service")
+    _proactive_engine = _AppField("proactive_engine")
+    _scheduler_service = _AppField("scheduler_service")
+    _scheduler_agent = _AppField("scheduler_agent")
+    _jiuwenbox_runner = _AppField("jiuwenbox_runner")
+    _session_stream_tasks = _AppField("session_stream_tasks")
+    _model_cache = _AppField("model_cache")
+    _default_model = _AppField("default_model")
+    _tokenizer_service = _AppField("tokenizer_service")
+    _tokenizer_warmup_tasks = _AppField("tokenizer_warmup_tasks")
+    _image_modality_refresh_task = _AppField("image_modality_refresh_task")
+
+    def _ensure_app_services(self) -> AppServices:
+        """拿出这一份服务器共用的工具箱。还没有就现造一个。"""
+
+        app = self.__dict__.get("_app_services")
+        if app is None:
+            app = AppServices()
+            self.__dict__["_app_services"] = app
+        if app.build_runtime is None:
+            app.build_runtime = self._build_runtime
+            app.plan_controller = _SERVER_PLAN_CONTROLLER
+        return app
+
+    @property
+    def app_services(self) -> AppServices:
+        """进程级工具箱。以后的 HTTP 应拿这一份，不要再新造一份。"""
+
+        return self._ensure_app_services()
 
     def __init__(
             self,
@@ -712,7 +762,7 @@ class AgentWebSocketServer:
         self._agent_manager = self._runtime.agent_manager
         self._runtime_push_handler = None
         self._previous_runtime_push_handler = None
-        self._runtime_services_started = False
+        self._websocket_enabled = True
         # RSI 服务域分发句柄（懒加载，见 _get_rsi_handlers）
         self._rsi_handlers = None
         # Optional production Provider injection point.  The concrete class is
@@ -906,42 +956,9 @@ class AgentWebSocketServer:
         *,
         reason: str,
     ) -> None:
-        """Schedule a non-blocking tokenizer warm-up task.
+        """后台预热分词器。具体工作在进程工具箱里。"""
 
-        The service-level lock deduplicates overlapping resolutions. Keeping
-        each task until completion lets a reload submit its newest config
-        without cancelling an in-flight worker-thread download.
-        """
-
-        async def _run() -> None:
-            try:
-                result = await self._tokenizer_service.warm(config, reason=reason)
-                logger.info(
-                    "[AgentWebSocketServer] tokenizer warm-up finished: "
-                    "reason=%s warmed=%d degraded=%d failed=%d",
-                    reason,
-                    result.get("warmed", 0),
-                    result.get("degraded", 0),
-                    result.get("failed", 0),
-                )
-            except (
-                AttributeError,
-                ImportError,
-                KeyError,
-                OSError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                logger.warning(
-                    "[AgentWebSocketServer] tokenizer warm-up failed: reason=%s error=%s",
-                    reason,
-                    exc,
-                )
-
-        task = asyncio.create_task(_run(), name=f"tokenizer-warmup:{reason}")
-        self._tokenizer_warmup_tasks.add(task)
-        task.add_done_callback(self._tokenizer_warmup_tasks.discard)
+        self._ensure_app_services().schedule_tokenizer_warmup(config, reason=reason)
 
     @staticmethod
     async def _start_symphony_recovery() -> None:
@@ -992,168 +1009,136 @@ class AgentWebSocketServer:
             logger.exception("[AgentWebSocketServer] team stream cancel failed")
         self._session_stream_tasks.clear()
 
-    async def start(self, *, bind_transport: bool = False) -> None:
-        """Start Runtime services. Production Front owns the listen socket.
+    async def activate_configured_kv_cache(self) -> None:
+        """按配置接上缓存。"""
+        await self._kv_cache_application_owner.activate_from_config()
 
-        ``bind_transport=True`` is the test/compat entry only. AgentServer
-        main always calls ``bind_transport=False`` so there is a single
-        Gateway-facing port.
-        """
-        if bind_transport:
-            logger.warning(
-                "[AgentWebSocketServer] bind_transport=True is a test/compat "
-                "entry; production listens through AgentServer Front"
-            )
-        if bind_transport and self._server is not None:
-            logger.warning("[AgentWebSocketServer] 服务端已在运行")
-            return
-        if not bind_transport and self._runtime_services_started:
-            logger.warning("[AgentWebSocketServer] Runtime 服务已在运行")
-            return
-
-        owner = self._kv_cache_application_owner
-        await owner.activate_from_config()
-
+    def start_archive_recovery(self) -> None:
+        """开始把上次没归档完的会话补上。"""
         from jiuwenswarm.server.runtime.session.session_archive import SessionArchiveService
+
         self._archive_service = SessionArchiveService(self._execution_runtime())
         self._archive_service.start_recovery()
 
-        # Reset harness package state to native on service startup
+    def reset_harness_package_state(self) -> None:
+        """启动时把技能包状态收回默认。"""
         reset_harness_packages_state()
 
-        if bind_transport:
-            try:
-                from websockets.legacy.server import serve as legacy_serve
-                self._server = await legacy_serve(
-                    self._connection_handler,
-                    self._host,
-                    self._port,
-                    process_request=self._process_request,
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
-                    max_size=AGENT_WS_MAX_MESSAGE_BYTES,
-                )
-            except ImportError:
-                import websockets
-                self._server = await websockets.serve(
-                    self._connection_handler,
-                    self._host,
-                    self._port,
-                    process_request=self._process_request,
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
-                    max_size=AGENT_WS_MAX_MESSAGE_BYTES,
-                )
-        else:
-            self._server = None
-        self._runtime_services_started = True
+    def attach_runtime_push_handler(self) -> None:
+        """让运行环境往外推消息时，走这台服务器的推送。"""
         self._runtime_push_handler = self.send_push
         self._previous_runtime_push_handler = install_runtime_push_handler(
             self._runtime_push_handler
         )
-        logger.info(
-            "[AgentWebSocketServer] 已启动: ws://%s:%s", self._host, self._port
-        )
 
+    def launch_asset_services(self) -> None:
+        """后台拉起素材服务。"""
         self._asset_start_task = asyncio.create_task(self._start_asset_services())
 
-        # The port is already listening. Remote tokenizer downloads must not
-        # delay startup; ContextEngine is local-only and uses string fallback
-        # if this task has not completed when the first context is created.
+    def launch_tokenizer_warmup(self) -> None:
+        """后台预热分词器，不挡住启动。"""
         self._schedule_tokenizer_warmup(get_config(), reason="startup")
 
-        # 端口已 listen, 后台预热 checkpointer, 不阻塞启动与握手.
-        # _checkpointer_warmup_task 供 shutdown 时 cancel, 避免任务悬挂.
-        async def _start_runtime() -> None:
-            retry_delay = 1.0
-            while True:
-                try:
-                    await self._runtime.start()
-                    await self._heartbeat_runtime.start()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[AgentWebSocketServer] Runtime warmup failed; "
-                        "retrying in %.1fs: %s",
-                        retry_delay,
-                        exc,
-                    )
-                    retry = self._on_runtime_warmup_retry
-                    if callable(retry):
-                        retry(str(exc))
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(30.0, retry_delay * 2)
-                    continue
-                ready = self._on_runtime_ready
-                if callable(ready):
-                    ready()
-                await self._start_symphony_recovery()
-                return
-
+    def launch_runtime_warmup(self, starter) -> None:
+        """后台启动运行环境。关闭时会取消这个任务。"""
         self._checkpointer_warmup_task = asyncio.create_task(
-            _start_runtime(), name="runtime-start"
+            starter(), name="runtime-start"
         )
 
-        async def _warmup_mcp_connections() -> None:
-            try:
-                from jiuwenswarm.common.mcp_config import prewarm_connected_mcps
-                await prewarm_connected_mcps()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[AgentWebSocketServer] MCP prewarm failed "
-                    "(will lazy-connect on first chat): %s", exc,
-                )
+    def launch_mcp_prewarm(self, starter) -> None:
+        """后台预热已连接的外部工具。"""
+        self._mcp_prewarm_task = asyncio.create_task(starter(), name="mcp-prewarm")
 
-        # 端口已 listen, 后台预热 connected MCP 的进程级连接缓存, 不阻塞启动与握手.
-        self._mcp_prewarm_task = asyncio.create_task(
-            _warmup_mcp_connections(), name="mcp-prewarm"
-        )
+    def launch_personal_context(self) -> None:
+        """后台启动个人上下文。失败不影响整机启动。"""
         self._personal_context_start_task = asyncio.create_task(
             self._start_personal_context_best_effort(),
             name="personal-context-host-start",
         )
-        # 登录模型的 id_token 一小时过期：在用且快过期的，请Gateway续期后推回来
-        from jiuwenswarm.common.auth.login_credentials import run_refresh_requests
-        from jiuwenswarm.common.auth.remote_config import warm_up_in_background
 
-        # 官网配置在后台先拉一次：AgentServer 读它的地方都在逐请求的热路径上，
-        # 不预热的话第一个请求拿到的是空配置（认不出免费模型）
-        warm_up_in_background()
+    def launch_login_credential_refresh(self, runner) -> None:
+        """登录凭证快过期时，请网关续期。"""
         self._login_credential_refresh_task = asyncio.create_task(
-            run_refresh_requests(self.send_push), name="login-credential-refresh"
+            runner(self.send_push), name="login-credential-refresh"
         )
-        # WS 监听已经开放, 现在按 config.yaml::sandbox 的 runtime.enabled +
-        # startup_mode 决定要不要自动把 jiuwenbox 子进程也拉起来。失败不阻塞
-        # 启动 (用户依然可以在 TUI 里跑 /sandbox enable 重试)。
+
+    async def bootstrap_internal_jiuwenbox(self) -> None:
+        """按配置决定要不要拉起内部沙箱。"""
         await self._bootstrap_internal_jiuwenbox()
+
+    async def start_agent_runtime(self) -> None:
+        """启动对话运行环境。"""
+        await self._runtime.start()
+
+    async def start_heartbeat_scheduler(self) -> None:
+        """启动到点回到原会话的心跳任务。和有没有人连着无关。"""
+        await self._heartbeat_runtime.start()
+
+    def notify_runtime_warmup_retry(self, message: str) -> None:
+        """运行环境暂时没起来时，告诉外面正在重试。"""
+        retry = self._on_runtime_warmup_retry
+        if callable(retry):
+            retry(message)
+
+    def notify_runtime_ready(self) -> None:
+        """运行环境就绪后通知外面。"""
+        ready = self._on_runtime_ready
+        if callable(ready):
+            ready()
+
+    async def recover_symphony(self) -> None:
+        """恢复流程编排。失败不影响服务器本身。"""
+        await self._start_symphony_recovery()
+
+    async def start(self, *, bind_transport: bool = False) -> None:
+        """只听 WebSocket 端口。进程服务由 ProcessServices 启动。
+
+        ``bind_transport=True`` 只给测试和旧入口用。正式启动的端口在 Front。
+        """
+        if not bind_transport:
+            logger.info("[AgentWebSocketServer] 不在此听端口")
+            return
+        if self._server is not None:
+            logger.warning("[AgentWebSocketServer] 服务端已在运行")
+            return
+        logger.warning(
+            "[AgentWebSocketServer] bind_transport=True is a test/compat "
+            "entry; production listens through AgentServer Front"
+        )
+        try:
+            from websockets.legacy.server import serve as legacy_serve
+            self._server = await legacy_serve(
+                self._connection_handler,
+                self._host,
+                self._port,
+                process_request=self._process_request,
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                max_size=AGENT_WS_MAX_MESSAGE_BYTES,
+            )
+        except ImportError:
+            import websockets
+            self._server = await websockets.serve(
+                self._connection_handler,
+                self._host,
+                self._port,
+                process_request=self._process_request,
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                max_size=AGENT_WS_MAX_MESSAGE_BYTES,
+            )
+        logger.info(
+            "[AgentWebSocketServer] 已启动: ws://%s:%s", self._host, self._port
+        )
 
     def schedule_image_modality_warmup(
         self, *, reason: str, reset_cache: bool = False
     ) -> None:
-        """把图像模态探针任务放进统一槽位调度。
+        """后台重探模型能不能看图。具体工作在进程工具箱里。"""
 
-        启动预热与模型配置变更重探共用 ``_image_modality_refresh_task`` 这一个
-        任务槽位：新任务启动前取消上一轮未完成的任务，避免启动预热在配置变化
-        后继续跑完并写回过期结论（新配置先 reset 缓存、旧任务随后覆盖）。
-        任务由 ``_stop_main_services`` 在 shutdown 时统一 cancel 回收。
-
-        Args:
-            reason: 传给 warm/refresh 的日志标签（"startup" / "model config change"）。
-            reset_cache: True 时先清空旧结论再探（配置变更场景），False 仅补探。
-        """
-        from jiuwenswarm.server.runtime.image_modality_warmup import (
-            refresh_image_modality_cache,
-            warm_image_modality_cache,
-        )
-
-        previous_task = self._image_modality_refresh_task
-        if previous_task is not None and not previous_task.done():
-            previous_task.cancel()
-        if reset_cache:
-            coro = refresh_image_modality_cache(get_config(), reason=reason)
-        else:
-            coro = warm_image_modality_cache(get_config(), reason=reason)
-        self._image_modality_refresh_task = asyncio.create_task(
-            coro, name=f"image-modality-warmup-{reason}"
+        self._ensure_app_services().schedule_image_modality_warmup(
+            reason=reason,
+            reset_cache=reset_cache,
         )
 
     async def _start_personal_context_best_effort(self) -> None:
@@ -1382,18 +1367,9 @@ class AgentWebSocketServer:
             self._scheduler_agent = None
 
     def _set_scheduler_agent(self, agent: Any) -> None:
-        """Pin the facade whose DeepAgent is retained by the scheduler."""
-        previous = getattr(self, "_scheduler_agent", None)
-        if previous is agent:
-            return
-        pin = getattr(self._agent_manager, "pin_agent", None)
-        if callable(pin):
-            pin(agent)
-        self._scheduler_agent = agent
-        if previous is not None:
-            unpin = getattr(self._agent_manager, "unpin_agent", None)
-            if callable(unpin):
-                unpin(previous)
+        """记住定时任务正在用的那个 Agent。数据在进程工具箱里。"""
+
+        self._ensure_app_services().set_scheduler_agent(agent)
 
     async def _process_request(self, *args: Any) -> Any:
         """在握手阶段执行 Origin 校验，兼容 legacy/new websockets APIs。"""
@@ -1543,8 +1519,10 @@ class AgentWebSocketServer:
                 logger.warning(
                     "[AgentWebSocketServer] image modality refresh cancel failed: %s", exc
                 )
+        from jiuwenswarm.server.process_services import ProcessServices
+
         had_server = self._server is not None
-        runtime_only = self._runtime_services_started and not had_server
+        runtime_only = ProcessServices.started() and not had_server
         if had_server:
             self._server.close()
             await self._server.wait_closed()
@@ -1644,7 +1622,7 @@ class AgentWebSocketServer:
             or not closing_runtime.closed
         ):
             raise runtime_close_error
-        self._runtime_services_started = False
+        ProcessServices.note_stopped()
         logger.info("[AgentWebSocketServer] 已停止")
 
     async def _suspend_kv_cache(self) -> None:
@@ -1973,7 +1951,7 @@ class AgentWebSocketServer:
                 request.request_id,
                 request.session_id,
                 request.channel_id,
-                preview_text(_request_query_text(request)),
+                preview_text(request_query_text(request)),
             )
 
         pending_chat_request: tuple[AgentRuntime, str, str] | None = None
@@ -2171,65 +2149,8 @@ class AgentWebSocketServer:
                 runtime, session_id, request_id = pending_chat_request
                 runtime.end_chat_request(session_id, request_id)
 
-    @staticmethod
-    def _should_trigger_before_chat_request_hook(request: AgentRequest) -> bool:
-        return request.req_method in (
-            ReqMethod.CHAT_SEND,
-            ReqMethod.CHAT_RESUME,
-            ReqMethod.CHAT_ANSWER,
-        )
-
     async def _try_record_implicit_feedback(self, request: AgentRequest) -> None:
-        """Best-effort 采集隐式反馈：用户在收到推荐后的文本回复。
-
-        主动推荐送达后，用户若直接用文本回复（"简洁点""不需要"…）而不是点卡片
-        上的赞/踩按钮，这条回复就是隐式反馈。把它关联到该会话最近一条推荐，
-        交由 ``record_implicit_feedback`` 做情感分类后入 buffer，供下次 tick 梯度更新。
-
-        与 Runtime activity participant 同款 best-effort：任何异常只 log debug，
-        绝不阻断主 chat 流。只在 ``chat.send`` 且来源不是 proactive 自己触发的
-        推荐指令时才介入（``source=proactive_recommendation`` 是系统主动塞给主
-        agent 的指令，不是用户说的话，见 proactive_adapter 触发处）。
-        """
-        try:
-            params = request.params if isinstance(request.params, dict) else {}
-            # proactive 自己触发主 agent 的指令带 source=proactive_recommendation，
-            # 那不是用户输入，跳过
-            if str(params.get("source") or "").strip() == "proactive_recommendation":
-                return
-            session_id = str(request.session_id or params.get("session_id") or "").strip()
-            if not session_id:
-                return
-            query = _request_query_text(request)
-            if not query:
-                return
-
-            from jiuwenswarm.agents.harness.common.recommendation.feedback_collector import (
-                find_latest_recommendation,
-                record_implicit_feedback,
-            )
-
-            # max_age_seconds=0 砍掉时间窗：不靠时间硬挡"无关反馈"——是否相关、是否
-            # 产生梯度交给梯度更新器的模型判断（看 rec_content + user_reply 语义）。
-            # 配合 record_feedback 的"同 rec_id 只采紧跟第一条、后续不覆盖"逻辑，
-            # 每条推荐只关联它之后紧跟的第一条用户回复。
-            latest = find_latest_recommendation(session_id, max_age_seconds=0)
-            if latest is None:
-                return
-            rec_id = latest.get("id")
-            if not rec_id:
-                return
-
-            # 已对该 rec_id 给过显式反馈（赞/踩）的话，record_feedback 的去重逻辑
-            # 会自动丢弃隐式补充——无需在此预判。
-            record_implicit_feedback(rec_id, query)
-        except Exception as exc:
-            logger.debug(
-                "[AgentWebSocketServer] implicit feedback hook failed; preserving chat: "
-                "session_id=%s error=%s",
-                request.session_id,
-                exc,
-            )
+        await try_record_implicit_feedback(request)
 
 
     async def _cleanup_client_disconnect_session_runtime(self, request: AgentRequest) -> bool:
@@ -2271,23 +2192,7 @@ class AgentWebSocketServer:
             _plan_active_sessions.discard(session_id)
 
     async def _trigger_before_chat_request_hook(self, request: AgentRequest) -> None:
-        if not self._should_trigger_before_chat_request_hook(request):
-            return
-        from jiuwenswarm.extensions.registry import ExtensionRegistry
-
-        params = request.params if isinstance(request.params, dict) else {}
-        if not isinstance(request.params, dict):
-            request.params = params
-
-        ctx = AgentServerChatHookContext(
-            request_id=request.request_id,
-            channel_id=request.channel_id,
-            session_id=request.session_id,
-            req_method=request.req_method.value if request.req_method is not None else None,
-            params=params,
-        )
-
-        await ExtensionRegistry.get_instance().trigger(AgentServerHookEvents.BEFORE_CHAT_REQUEST, ctx)
+        await trigger_before_chat_request(request)
 
 
     @staticmethod
@@ -3227,19 +3132,7 @@ class AgentWebSocketServer:
         )
 
     def _execution_runtime(self) -> AgentRuntime:
-        runtime = getattr(self, "_runtime", None)
-        manager = getattr(self, "_agent_manager", None)
-        if runtime is None or runtime.agent_manager is not manager:
-            runtime = self._build_runtime(
-                agent_manager=manager,
-                plan_controller=_SERVER_PLAN_CONTROLLER,
-                reuse_dependencies=True,
-            )
-            self._runtime = runtime
-            runtime.set_session_message_service(
-                getattr(self, "_session_message_service", None)
-            )
-        return runtime
+        return self._ensure_app_services().execution_runtime()
 
     async def _send_runtime_event(
         self,
@@ -3356,34 +3249,6 @@ class AgentWebSocketServer:
 
         return sorted(set(matched_session_ids))
 
-    async def _ensure_persistent_checkpointer_response(
-        self,
-        request: AgentRequest,
-    ) -> AgentResponse | None:
-        """Return an error response when persistent checkpoint storage is unavailable."""
-        try:
-            from jiuwenswarm.server.runtime.agent_adapter.interface_deep import ensure_persistent_checkpointer
-
-            await ensure_persistent_checkpointer()
-            await self._try_start_heartbeat_runtime()
-            return None
-        except Exception as exc:
-            logger.exception(
-                "[AgentWebSocketServer] persistent checkpointer unavailable: request_id=%s error=%s",
-                request.request_id,
-                exc,
-            )
-            return AgentResponse(
-                request_id=request.request_id,
-                channel_id=request.channel_id,
-                ok=False,
-                payload={
-                    "error": "persistent checkpointer is unavailable",
-                    "code": "CHECKPOINT_UNAVAILABLE",
-                },
-                metadata=request.metadata,
-            )
-
     async def _try_start_heartbeat_runtime(self) -> bool:
         """Best-effort idempotent recovery after checkpointer readiness."""
         if self._heartbeat_runtime.is_available:
@@ -3400,35 +3265,7 @@ class AgentWebSocketServer:
 
     async def _ensure_auto_team_binding_for_chat(self, request: AgentRequest) -> Any | None:
         """Forward an existing team binding without creating one from the query."""
-        if request.req_method != ReqMethod.CHAT_SEND:
-            return None
-
-        params = request.params if isinstance(request.params, dict) else {}
-        if not isinstance(request.params, dict):
-            request.params = params
-        session_id = str(request.session_id or params.get("session_id") or "").strip()
-        if not session_id:
-            return None
-
-        metadata = get_session_metadata(session_id, cache_bust=True)
-        raw_mode = params.get("mode")
-        effective_mode = (
-            raw_mode
-            if isinstance(raw_mode, str) and raw_mode.strip()
-            else metadata.get("mode")
-        )
-        _, _, canonical_mode = resolve_agent_request_mode(effective_mode)
-        if not self._is_team_metadata_mode({"mode": canonical_mode}):
-            return None
-
-        existing_team_name = str(metadata.get("team_name") or "").strip()
-        if existing_team_name:
-            params.setdefault("team_name", existing_team_name)
-            template_id = str(metadata.get("team_template_id") or "").strip()
-            if template_id:
-                params.setdefault("team_template_id", template_id)
-            return existing_team_name
-        return None
+        return await ensure_auto_team_binding(request)
 
     @staticmethod
     def _is_team_metadata_mode(metadata: dict[str, Any]) -> bool:
@@ -4215,16 +4052,7 @@ class AgentWebSocketServer:
     @staticmethod
     def _resolve_adapter(agent: Any) -> Any:
         """从 JiuwenSwarm 中提取底层 Deep/Code Adapter (持 _sys_operation_card 的实例)."""
-        if agent is None:
-            return None
-        for attr in ("_adapter", "adapter", "_active_adapter"):
-            inner = getattr(agent, attr, None)
-            if inner is not None and hasattr(inner, "apply_sandbox_runtime_patch"):
-                return inner
-        # 兜底: agent 本身有相关方法
-        if hasattr(agent, "apply_sandbox_runtime_patch"):
-            return agent
-        return None
+        return resolve_adapter(agent)
 
     @staticmethod
     def resolve_adapter(agent: Any) -> Any:
@@ -4234,67 +4062,18 @@ class AgentWebSocketServer:
     @staticmethod
     def _parse_sandbox_host_port(url: str) -> tuple[str, int]:
         """从 sandbox url 解析 host:port; 默认 127.0.0.1:8321."""
-        from jiuwenswarm.server.sandbox.host_port import parse_sandbox_host_port
-
         return parse_sandbox_host_port(url)
-
-    @staticmethod
-    def _is_tcp_port_bindable(host: str, port: int) -> bool:
-        """``True`` 表示当前能在 ``host:port`` 上 ``bind`` 成功 (即没有被占用)。
-
-        不去探测 ``/health`` 之类应用层信息——只看四层占用情况, 谁占着、占着的
-        是不是 jiuwenbox 都不关心。
-        """
-        import socket
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            try:
-                sock.bind((host, port))
-            except OSError:
-                return False
-            return True
-        finally:
-            sock.close()
-
-    @staticmethod
-    def _pick_free_tcp_port(host: str) -> int:
-        """让内核挑一个空闲端口 (``bind`` 到 0); 仅用于绑定测试, 不会真正监听。
-
-        存在 TOCTOU 风险 (返回后端口可能立即被别人抢), 但接下来 uvicorn 起来
-        通常足够快; 即便撞上, uvicorn 自己会因 EADDRINUSE 失败, 上游再报错。
-        """
-        import socket
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((host, 0))
-            return int(sock.getsockname()[1])
 
     def _allocate_internal_jiuwenbox_port(
         self,
         host: str,
         preferred_port: int,
     ) -> int:
-        """internal 模式下确定 jiuwenbox 实际监听端口。
-
-        - 若本 runner 已经在 ``host:preferred_port`` 上拥有一个仍在跑的 jiuwenbox,
-          直接复用 (避免重复 spawn);
-        - 否则若 ``preferred_port`` 当前无人占用, 用之;
-        - 再否则让内核挑一个空闲端口返回。
-        """
-        if self._jiuwenbox_runner.is_owned_listener(host, preferred_port):
-            return preferred_port
-        if self._is_tcp_port_bindable(host, preferred_port):
-            return preferred_port
-        new_port = self._pick_free_tcp_port(host)
-        logger.warning(
-            "[command.sandbox] preferred port %s:%d is busy; "
-            "allocating fresh port %d for new jiuwenbox instance",
+        """internal 模式下确定 jiuwenbox 实际监听端口。"""
+        return self._ensure_app_services().allocate_internal_jiuwenbox_port(
             host,
             preferred_port,
-            new_port,
         )
-        return new_port
 
     async def _reload_after_config_save(
         self,
@@ -4651,33 +4430,8 @@ class AgentWebSocketServer:
             payload["upstream"] = True
 
     def _resolve_model(self, model_name: Optional[str] = None) -> Optional[Any]:
-        """Resolve model from jiuwenswarm config.
-
-        Args:
-            model_name: Requested model name, falls back to default if None or not found
-
-        Returns:
-            Model instance or None if config cannot be loaded
-        """
-        # Build model cache if not already done
-        if not self._model_cache:
-            self._build_model_cache()
-
-        # Resolve by name or use default
-        if model_name and model_name in self._model_cache:
-            return self._model_cache[model_name]
-        if model_name:
-            # 缓存是启动时的一次性快照，登录后新拿到的模型不在里面；静默回退到默认模型会让
-            # 用户"选了 A 却跑了 B"。所以未命中时重建一次再查，仍然没有才回退。
-            self._build_model_cache()
-            if model_name in self._model_cache:
-                return self._model_cache[model_name]
-            logger.warning(
-                "[_resolve_model] 模型 %r 不在可用列表里，回退到默认模型；可用模型: %s",
-                model_name,
-                sorted(self._model_cache),
-            )
-        return self._default_model
+        """按名字找模型。找不到就用默认的那个。"""
+        return self._ensure_app_services().resolve_model(model_name)
 
     def reset_model_cache(self) -> None:
         """清空模型缓存,下次 _resolve_model 触发懒重建。
@@ -4689,101 +4443,3 @@ class AgentWebSocketServer:
         if self._model_cache:
             self._model_cache.clear()
         self._default_model = None
-
-    def _build_model_cache(self) -> None:
-        """Build model cache from jiuwenswarm config.yaml (reuse interface_deep logic)."""
-        # Use the same model building function as interface_deep
-        from jiuwenswarm.server.runtime.agent_adapter.interface_deep import build_model_from_entry
-
-        config = get_config()
-
-        # Build from models.defaults list
-        # 用 get_available_models：配置的模型 + 登录后自动获得的模型都要能选中
-        for entry in get_available_models(config):
-            mcc = entry.get("model_client_config") or {}
-            model_name = mcc.get("model_name")
-            if not model_name:
-                continue
-            mco = entry.get("model_config_obj") or {}
-            self._model_cache[model_name] = build_model_from_entry(mcc, mco)
-
-        # Fallback to legacy format if needed (same as interface_deep._build_model_cache_legacy)
-        if not self._model_cache:
-            default_model_config = config.get("models", {}).get("default", {})
-            react_config = config.get("react", {})
-            mcc = dict(
-                default_model_config.get("model_client_config")
-                or react_config.get("model_client_config")
-                or {}
-            )
-            model_name = mcc.get("model_name") or react_config.get("model_name") or "gpt-4"
-            if "model_name" not in mcc:
-                mcc["model_name"] = model_name
-            mco = (
-                default_model_config.get("model_config_obj")
-                or react_config.get("model_config_obj")
-                or {}
-            )
-            self._model_cache[model_name] = build_model_from_entry(mcc, mco)
-
-        # Set default model (first one)
-        if self._model_cache:
-            first_name = next(iter(self._model_cache))
-            self._default_model = self._model_cache[first_name]
-            logger.info(
-                "[AgentServer] Built model cache with %d models, default=%s",
-                len(self._model_cache), first_name
-            )
-
-        # 追加 Opencode Zen 免费模型（内存态，不入 config.yaml）。
-        # 这些模型可被 _resolve_model 按名解析，但 _default_model 保持上面的用户自配模型。
-        try:
-            from jiuwenswarm.server.runtime.opencode_zen import (
-                get_zen_free_model_entries,
-            )
-            for zent in get_zen_free_model_entries():
-                zmcc = zent.get("model_client_config") or {}
-                zname = zmcc.get("model_name", "")
-                if zname and zname not in self._model_cache:
-                    self._model_cache[zname] = build_model_from_entry(
-                        zmcc, zent.get("model_config_obj") or {}
-                    )
-        except Exception:
-            logger.debug(
-                "[AgentServer] append zen free models to cache failed",
-                exc_info=True,
-            )
-
-        # 首次启动兜底：默认模型仍为 .env 占位符时，改选 Zen 免费模型（如
-        # DeepSeek V4 Flash）作为默认，避免把占位模型发往厂商。仅内存态生效。
-        if self._default_model is not None:
-            try:
-                from jiuwenswarm.common.model_config_validation import (
-                    is_placeholder_model_entry,
-                    model_client_config_view,
-                )
-                from jiuwenswarm.server.runtime.opencode_zen import (
-                    get_zen_default_free_model_entry,
-                )
-                if is_placeholder_model_entry(
-                    model_client_config_view(self._default_model.model_client_config)
-                ):
-                    zen_default = get_zen_default_free_model_entry()
-                    if zen_default is not None:
-                        zmcc = zen_default["model_client_config"]
-                        zname = zmcc["model_name"]
-                        self._model_cache[zname] = build_model_from_entry(
-                            zmcc, zen_default.get("model_config_obj") or {}
-                        )
-                        self._default_model = self._model_cache[zname]
-                        logger.info(
-                            "[AgentServer] default model is placeholder; "
-                            "fallback to zen free model=%s",
-                            zname,
-                        )
-            except Exception:
-                logger.debug(
-                    "[AgentServer] fallback default to zen free model failed",
-                    exc_info=True,
-                )
-

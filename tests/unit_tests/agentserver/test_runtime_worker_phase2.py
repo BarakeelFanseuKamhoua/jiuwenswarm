@@ -903,5 +903,5 @@ if hits:
 def test_worker_lifecycle_owns_runtime_construct() -> None:
     root = Path(__file__).resolve().parents[3]
     text = (root / "jiuwenswarm/server/worker/lifecycle.py").read_text(encoding="utf-8")
-    assert "bind_transport=False" in text
+    assert "ProcessServices(server).start()" in text
     assert "AgentWebSocketServer.get_instance" in text

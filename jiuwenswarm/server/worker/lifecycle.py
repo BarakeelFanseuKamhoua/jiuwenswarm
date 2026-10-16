@@ -235,6 +235,12 @@ class WorkerRuntime:
             await trajectory_gateway_hint_bridge.unbind()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Worker] trajectory hint bridge unbind failed: %s", exc)
+        try:
+            from jiuwenswarm.server.agent_http_server import stop_http_server
+
+            await stop_http_server()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[AgentHTTPServer] stop failed: %s", exc)
         stop = getattr(self.server, "stop", None)
         if callable(stop):
             await stop()
@@ -313,7 +319,20 @@ async def start_worker_runtime(
             on_warmup_retry=signals.warmup_retry,
             on_failed=signals.failed,
         )
-    await server.start(bind_transport=False)
+    from jiuwenswarm.server.startup_switches import resolve_websocket_enabled
+
+    def _ws_config() -> dict:
+        try:
+            from jiuwenswarm.common.config import get_config
+            section = get_config().get("ws_server")
+        except Exception:
+            return {}
+        return section if isinstance(section, dict) else {}
+
+    server._websocket_enabled = resolve_websocket_enabled(config_section=_ws_config())
+    from jiuwenswarm.server.process_services import ProcessServices
+
+    await ProcessServices(server).start()
     log_startup_stage("runtime_started")
 
     from openjiuwen.harness.observability import install_subagent_observability_hook
@@ -381,6 +400,14 @@ async def start_worker_runtime(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Worker] teammate bootstrap daemon start failed: %s", exc)
     log_startup_stage("ready")
+    from jiuwenswarm.server.agent_http_server import start_http_if_enabled
+
+    try:
+        app_services = getattr(server, "app_services", None)
+        if app_services is not None:
+            await start_http_if_enabled(app_services)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[AgentHTTPServer] start failed: %s", exc)
     return WorkerRuntime(
         server=server,
         stop_event=stop_event,
