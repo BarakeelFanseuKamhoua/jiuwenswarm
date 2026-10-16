@@ -70,6 +70,21 @@ def test_websocket_door_off_skips_listen_but_starts_heartbeat() -> None:
     assert "_websocket_enabled" not in warmup
 
 
+@pytest.mark.asyncio
+async def test_second_door_does_not_start_the_process_again() -> None:
+    """进程只启动一次。后调用的那扇门看到已经启动，就不会再拉起运行环境。"""
+    from jiuwenswarm.server.process_services import ProcessServices
+
+    ProcessServices.note_stopped()
+    ProcessServices._started = True
+    try:
+        await ProcessServices(object()).start()
+        assert ProcessServices.started() is True
+    finally:
+        ProcessServices.note_stopped()
+    assert ProcessServices.started() is False
+
+
 def test_http_is_off_unless_asked() -> None:
     assert resolve_http_server_settings(env={}, config_section={}) == (
         False,

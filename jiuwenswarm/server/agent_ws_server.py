@@ -762,7 +762,6 @@ class AgentWebSocketServer:
         self._agent_manager = self._runtime.agent_manager
         self._runtime_push_handler = None
         self._previous_runtime_push_handler = None
-        self._runtime_services_started = False
         self._websocket_enabled = True
         # RSI 服务域分发句柄（懒加载，见 _get_rsi_handlers）
         self._rsi_handlers = None
@@ -1009,14 +1008,6 @@ class AgentWebSocketServer:
         except Exception:
             logger.exception("[AgentWebSocketServer] team stream cancel failed")
         self._session_stream_tasks.clear()
-
-    def runtime_services_started(self) -> bool:
-        """进程服务是否已经启动过。"""
-        return bool(self._runtime_services_started)
-
-    def mark_runtime_services_started(self) -> None:
-        """记下进程服务已经启动，避免重复拉起。"""
-        self._runtime_services_started = True
 
     async def activate_configured_kv_cache(self) -> None:
         """按配置接上缓存。"""
@@ -1528,8 +1519,10 @@ class AgentWebSocketServer:
                 logger.warning(
                     "[AgentWebSocketServer] image modality refresh cancel failed: %s", exc
                 )
+        from jiuwenswarm.server.process_services import ProcessServices
+
         had_server = self._server is not None
-        runtime_only = self._runtime_services_started and not had_server
+        runtime_only = ProcessServices.started() and not had_server
         if had_server:
             self._server.close()
             await self._server.wait_closed()
@@ -1629,7 +1622,7 @@ class AgentWebSocketServer:
             or not closing_runtime.closed
         ):
             raise runtime_close_error
-        self._runtime_services_started = False
+        ProcessServices.note_stopped()
         logger.info("[AgentWebSocketServer] 已停止")
 
     async def _suspend_kv_cache(self) -> None:

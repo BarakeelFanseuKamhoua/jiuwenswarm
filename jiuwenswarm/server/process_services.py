@@ -21,20 +21,32 @@ logger = logging.getLogger(__name__)
 class ProcessServices:
     """启动进程级服务。调用方传入现有的服务器对象，本类不另造一套运行环境。"""
 
+    _started = False
+
     def __init__(self, server: Any) -> None:
         self._server = server
 
+    @classmethod
+    def started(cls) -> bool:
+        """整个进程里的运行环境是否已经拉起来过。WebSocket 和 HTTP 共用这一份。"""
+        return cls._started
+
+    @classmethod
+    def note_stopped(cls) -> None:
+        """进程服务收尾后清掉标记，下次才能再启动。"""
+        cls._started = False
+
     async def start(self) -> None:
-        """把运行环境和心跳调度器拉起来。已经启动过就直接返回。"""
-        server = self._server
-        if server.runtime_services_started():
+        """把运行环境和心跳调度器拉起来。整个进程只启动一次。"""
+        if ProcessServices.started():
             logger.warning("[ProcessServices] 进程服务已在运行")
             return
 
+        server = self._server
         await server.activate_configured_kv_cache()
         server.start_archive_recovery()
         server.reset_harness_package_state()
-        server.mark_runtime_services_started()
+        ProcessServices._started = True
         server.attach_runtime_push_handler()
         logger.info("[ProcessServices] 进程服务已启动")
 
