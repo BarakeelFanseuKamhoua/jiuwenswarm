@@ -114,7 +114,11 @@ def register_http_routes(app: FastAPI, channel: WebChannel) -> None:
 
     Container file APIs are mounted when ``channel.container_file_client`` is an
     ``AgentOSRouterClient`` (wired during web handler registration).
+
+    企业版（``is_enterprise()``）额外增量挂载 ``/api/v1`` 核心 chat/SSE + mapped；
+    个人版不挂，继续主用 WS。
     """
+    from jiuwenswarm.edition import is_enterprise
     from jiuwenswarm.gateway.channel_manager.web.container_file_http import (
         attach_container_file_routes,
     )
@@ -134,6 +138,21 @@ def register_http_routes(app: FastAPI, channel: WebChannel) -> None:
         register_manager_config_routes(app)
     except Exception:  # noqa: BLE001 — 管理面注册失败不应阻断用户 Web
         logger.exception("failed to register Manager config routes")
+
+    if is_enterprise():
+        from jiuwenswarm.gateway.channel_manager.web.web_http_routes import (
+            register_web_http_api_routes,
+        )
+
+        register_web_http_api_routes(
+            app,
+            channel,
+            enterprise=True,
+        )
+        logger.info(
+            "WebChannel enterprise HTTP/SSE mounted on same port "
+            "(/api/v1 health·sessions·chat/completions + mapped, no A2A)",
+        )
 
 
 async def _serve_channel_websocket(channel: WebChannel, websocket: WebSocket) -> None:
