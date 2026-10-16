@@ -216,6 +216,12 @@ class WebChannel(BaseWsChannel):
         self.container_file_client: Any = None
         self._trajectory_pending_updates: dict[tuple[str, str], Any] = {}
         self._trajectory_send_task: asyncio.Task[None] | None = None
+        # 企业北向 HTTP/SSE 的请求级 Outbound 注册表。
+        from jiuwenswarm.gateway.channel_manager.web.web_delivery_registry import (
+            WebDeliveryRegistry,
+        )
+
+        self.delivery = WebDeliveryRegistry()
 
     @staticmethod
     def _coalescible_stream_frame(
@@ -360,7 +366,49 @@ class WebChannel(BaseWsChannel):
             )
 
             data = project_agentos_web_frame(data)
+        # HTTP/SSE Outbound：不入 WS writer 队列，直接投递到请求级队列。
+        if getattr(ws, "is_http_outbound", False):
+            from jiuwenswarm.gateway.channel_manager.web.outbound import _normalize_frame
+
+            frame = _normalize_frame(data)
+            if frame is None:
+                return
+            accept = getattr(ws, "accept_frame", None)
+            if callable(accept):
+                accept(frame)
+            return
         super()._enqueue_send(ws, data)
+
+    def register_request_outbound(self, outbound: Any) -> str:
+        """Register a request-scoped HTTP Outbound for Agent reply routing."""
+        return self.delivery.register(outbound)
+
+    async def unregister_request_outbound(self, outbound: Any) -> None:
+        await self.delivery.unregister(outbound)
+
+    def _lookup_peer(self, peer_id: str) -> Any | None:
+        """Resolve WS peer or HTTP outbound by id (metadata.ws_id / delivery.ws_id)."""
+        oid = str(peer_id or "").strip()
+        if not oid:
+            return None
+        ws = self._ws_by_id.get(oid)
+        if ws is not None and not getattr(ws, "closed", False):
+            return ws
+        return self.delivery.lookup(oid)
+
+    def _peers_for_session(self, session_id: str) -> set[Any]:
+        """WS clients + HTTP outbounds bound to ``session_id``."""
+        peers: set[Any] = set()
+        sid = str(session_id or "").strip()
+        if not sid:
+            return peers
+        for rk, ws_list in self._clients_by_key.items():
+            if rk.session_id == sid:
+                for w in ws_list:
+                    if not getattr(w, "closed", False):
+                        peers.add(w)
+        peers.update(self.delivery.peers_for_session(sid))
+        return peers
 
     # ── 帧发送 API（公开给处理器使用）─────────────────────
 
@@ -714,6 +762,7 @@ class WebChannel(BaseWsChannel):
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         self._clients_by_key.clear()
+        await self.delivery.clear()
 
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
@@ -1056,8 +1105,8 @@ class WebChannel(BaseWsChannel):
             metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
             request_ws_id = str(metadata.get("ws_id") or "").strip()
             if request_ws_id:
-                ws = self._ws_by_id.get(request_ws_id)
-                if ws is not None and not getattr(ws, "closed", False):
+                ws = self._lookup_peer(request_ws_id)
+                if ws is not None:
                     ws_set.add(ws)
 
             if not ws_set and routing_target is not None:
@@ -1065,8 +1114,8 @@ class WebChannel(BaseWsChannel):
                 if delivery is not None:
                     ws_id = getattr(delivery, "ws_id", "")
                     if ws_id:
-                        ws = self._ws_by_id.get(ws_id)
-                        if ws is not None and not getattr(ws, "closed", False):
+                        ws = self._lookup_peer(str(ws_id))
+                        if ws is not None:
                             ws_set.add(ws)
                 if not ws_set:
                     for rk in routing_target.routing_keys:
@@ -1076,11 +1125,7 @@ class WebChannel(BaseWsChannel):
                                 ws_set.add(w)
 
             if not ws_set and msg.session_id:
-                for rk, ws_list in self._clients_by_key.items():
-                    if rk.session_id == msg.session_id:
-                        for w in ws_list:
-                            if not getattr(w, "closed", False):
-                                ws_set.add(w)
+                ws_set |= self._peers_for_session(msg.session_id)
 
             if not ws_set:
                 logger.debug(
@@ -1104,8 +1149,8 @@ class WebChannel(BaseWsChannel):
             if delivery is not None:
                 ws_id = getattr(delivery, "ws_id", "")
                 if ws_id:
-                    ws = self._ws_by_id.get(ws_id)
-                    if ws is not None and not getattr(ws, "closed", False):
+                    ws = self._lookup_peer(str(ws_id))
+                    if ws is not None:
                         ws_set.add(ws)
 
             # ── 兜底：按 routing_keys 5 维逻辑查 _clients_by_key ──
@@ -1141,8 +1186,8 @@ class WebChannel(BaseWsChannel):
         metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
         request_ws_id = str(metadata.get("ws_id") or "").strip()
         if request_ws_id:
-            ws = self._ws_by_id.get(request_ws_id)
-            if ws is not None and not getattr(ws, "closed", False):
+            ws = self._lookup_peer(request_ws_id)
+            if ws is not None:
                 ws_set.add(ws)
 
         if not ws_set and not msg.session_id:
@@ -1153,11 +1198,7 @@ class WebChannel(BaseWsChannel):
             )
             return
         if not ws_set:
-            for rk, ws_list in self._clients_by_key.items():
-                if rk.session_id == msg.session_id:
-                    for w in ws_list:
-                        if not getattr(w, "closed", False):
-                            ws_set.add(w)
+            ws_set |= self._peers_for_session(msg.session_id)
         if not ws_set:
             logger.debug(
                 "[WebChannel] session_id=%s has no connected ws, dropping msg id=%s ws_id=%s",
