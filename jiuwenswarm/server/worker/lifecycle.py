@@ -330,7 +330,9 @@ async def start_worker_runtime(
         return section if isinstance(section, dict) else {}
 
     server._websocket_enabled = resolve_websocket_enabled(config_section=_ws_config())
-    await server.start(bind_transport=False)
+    from jiuwenswarm.server.process_services import ProcessServices
+
+    await ProcessServices(server).start()
     log_startup_stage("runtime_started")
 
     from openjiuwen.harness.observability import install_subagent_observability_hook

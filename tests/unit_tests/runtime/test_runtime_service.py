@@ -3472,6 +3472,9 @@ async def test_agent_server_start_restores_remote_service_after_stop(
     first_runtime.start = AsyncMock()
     first_runtime.close = AsyncMock(wraps=first_runtime.close)
 
+    from jiuwenswarm.server.process_services import ProcessServices
+
+    await ProcessServices(server).start()
     await server.start(bind_transport=True)
     await server._checkpointer_warmup_task
     await server.stop()
@@ -3481,6 +3484,7 @@ async def test_agent_server_start_restores_remote_service_after_stop(
     recovered_runtime.start = AsyncMock()
     recovered_runtime.close = AsyncMock(wraps=recovered_runtime.close)
 
+    await ProcessServices(server).start()
     await server.start(bind_transport=True)
     await server._checkpointer_warmup_task
 

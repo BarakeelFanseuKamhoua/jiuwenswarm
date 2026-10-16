@@ -21,7 +21,10 @@ from gateway_protocol.hooks import AgentServerChatHookContext, AgentServerHookEv
 from openjiuwen.core.common.logging import server_logger
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 
-from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService, reset_harness_packages_state
+from jiuwenswarm.agents.harness.common.auto_harness import (
+    AutoHarnessService,
+    reset_harness_packages_state,
+)
 from jiuwenswarm.agents.harness.code.rails.heartbeat.runtime import HeartbeatRailRuntime
 from jiuwenswarm.server.gateway_push.wire import build_server_push_wire
 from jiuwenswarm.server.ws_send import send_wire_payload
@@ -1007,143 +1010,135 @@ class AgentWebSocketServer:
             logger.exception("[AgentWebSocketServer] team stream cancel failed")
         self._session_stream_tasks.clear()
 
-    async def start(self, *, bind_transport: bool = False) -> None:
-        """Start Runtime services. Production Front owns the listen socket.
+    def runtime_services_started(self) -> bool:
+        """进程服务是否已经启动过。"""
+        return bool(self._runtime_services_started)
 
-        ``bind_transport=True`` is the test/compat entry only. AgentServer
-        main always calls ``bind_transport=False`` so there is a single
-        Gateway-facing port.
-        """
-        if bind_transport:
-            logger.warning(
-                "[AgentWebSocketServer] bind_transport=True is a test/compat "
-                "entry; production listens through AgentServer Front"
-            )
-        if bind_transport and self._server is not None:
-            logger.warning("[AgentWebSocketServer] 服务端已在运行")
-            return
-        if not bind_transport and self._runtime_services_started:
-            logger.warning("[AgentWebSocketServer] Runtime 服务已在运行")
-            return
+    def mark_runtime_services_started(self) -> None:
+        """记下进程服务已经启动，避免重复拉起。"""
+        self._runtime_services_started = True
 
-        owner = self._kv_cache_application_owner
-        await owner.activate_from_config()
+    async def activate_configured_kv_cache(self) -> None:
+        """按配置接上缓存。"""
+        await self._kv_cache_application_owner.activate_from_config()
 
+    def start_archive_recovery(self) -> None:
+        """开始把上次没归档完的会话补上。"""
         from jiuwenswarm.server.runtime.session.session_archive import SessionArchiveService
+
         self._archive_service = SessionArchiveService(self._execution_runtime())
         self._archive_service.start_recovery()
 
-        # Reset harness package state to native on service startup
+    def reset_harness_package_state(self) -> None:
+        """启动时把技能包状态收回默认。"""
         reset_harness_packages_state()
 
-        if bind_transport:
-            try:
-                from websockets.legacy.server import serve as legacy_serve
-                self._server = await legacy_serve(
-                    self._connection_handler,
-                    self._host,
-                    self._port,
-                    process_request=self._process_request,
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
-                    max_size=AGENT_WS_MAX_MESSAGE_BYTES,
-                )
-            except ImportError:
-                import websockets
-                self._server = await websockets.serve(
-                    self._connection_handler,
-                    self._host,
-                    self._port,
-                    process_request=self._process_request,
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
-                    max_size=AGENT_WS_MAX_MESSAGE_BYTES,
-                )
-        else:
-            self._server = None
-        self._runtime_services_started = True
+    def attach_runtime_push_handler(self) -> None:
+        """让运行环境往外推消息时，走这台服务器的推送。"""
         self._runtime_push_handler = self.send_push
         self._previous_runtime_push_handler = install_runtime_push_handler(
             self._runtime_push_handler
         )
-        if self._websocket_enabled:
-            logger.info(
-                "[AgentWebSocketServer] 已启动: ws://%s:%s", self._host, self._port
-            )
-        else:
-            logger.info("[AgentWebSocketServer] 运行时已启动，WebSocket 门关闭")
 
+    def launch_asset_services(self) -> None:
+        """后台拉起素材服务。"""
         self._asset_start_task = asyncio.create_task(self._start_asset_services())
 
-        # The port is already listening. Remote tokenizer downloads must not
-        # delay startup; ContextEngine is local-only and uses string fallback
-        # if this task has not completed when the first context is created.
+    def launch_tokenizer_warmup(self) -> None:
+        """后台预热分词器，不挡住启动。"""
         self._schedule_tokenizer_warmup(get_config(), reason="startup")
 
-        # 端口已 listen, 后台预热 checkpointer, 不阻塞启动与握手.
-        # _checkpointer_warmup_task 供 shutdown 时 cancel, 避免任务悬挂.
-        async def _start_runtime() -> None:
-            retry_delay = 1.0
-            while True:
-                try:
-                    await self._runtime.start()
-                    if self._websocket_enabled:
-                        await self._heartbeat_runtime.start()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[AgentWebSocketServer] Runtime warmup failed; "
-                        "retrying in %.1fs: %s",
-                        retry_delay,
-                        exc,
-                    )
-                    retry = self._on_runtime_warmup_retry
-                    if callable(retry):
-                        retry(str(exc))
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(30.0, retry_delay * 2)
-                    continue
-                ready = self._on_runtime_ready
-                if callable(ready):
-                    ready()
-                await self._start_symphony_recovery()
-                return
-
+    def launch_runtime_warmup(self, starter) -> None:
+        """后台启动运行环境。关闭时会取消这个任务。"""
         self._checkpointer_warmup_task = asyncio.create_task(
-            _start_runtime(), name="runtime-start"
+            starter(), name="runtime-start"
         )
 
-        async def _warmup_mcp_connections() -> None:
-            try:
-                from jiuwenswarm.common.mcp_config import prewarm_connected_mcps
-                await prewarm_connected_mcps()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[AgentWebSocketServer] MCP prewarm failed "
-                    "(will lazy-connect on first chat): %s", exc,
-                )
+    def launch_mcp_prewarm(self, starter) -> None:
+        """后台预热已连接的外部工具。"""
+        self._mcp_prewarm_task = asyncio.create_task(starter(), name="mcp-prewarm")
 
-        # 端口已 listen, 后台预热 connected MCP 的进程级连接缓存, 不阻塞启动与握手.
-        self._mcp_prewarm_task = asyncio.create_task(
-            _warmup_mcp_connections(), name="mcp-prewarm"
-        )
+    def launch_personal_context(self) -> None:
+        """后台启动个人上下文。失败不影响整机启动。"""
         self._personal_context_start_task = asyncio.create_task(
             self._start_personal_context_best_effort(),
             name="personal-context-host-start",
         )
-        # 登录模型的 id_token 一小时过期：在用且快过期的，请Gateway续期后推回来
-        from jiuwenswarm.common.auth.login_credentials import run_refresh_requests
-        from jiuwenswarm.common.auth.remote_config import warm_up_in_background
 
-        # 官网配置在后台先拉一次：AgentServer 读它的地方都在逐请求的热路径上，
-        # 不预热的话第一个请求拿到的是空配置（认不出免费模型）
-        warm_up_in_background()
+    def launch_login_credential_refresh(self, runner) -> None:
+        """登录凭证快过期时，请网关续期。"""
         self._login_credential_refresh_task = asyncio.create_task(
-            run_refresh_requests(self.send_push), name="login-credential-refresh"
+            runner(self.send_push), name="login-credential-refresh"
         )
-        # WS 监听已经开放, 现在按 config.yaml::sandbox 的 runtime.enabled +
-        # startup_mode 决定要不要自动把 jiuwenbox 子进程也拉起来。失败不阻塞
-        # 启动 (用户依然可以在 TUI 里跑 /sandbox enable 重试)。
+
+    async def bootstrap_internal_jiuwenbox(self) -> None:
+        """按配置决定要不要拉起内部沙箱。"""
         await self._bootstrap_internal_jiuwenbox()
+
+    async def start_agent_runtime(self) -> None:
+        """启动对话运行环境。"""
+        await self._runtime.start()
+
+    async def start_heartbeat_scheduler(self) -> None:
+        """启动到点回到原会话的心跳任务。和有没有人连着无关。"""
+        await self._heartbeat_runtime.start()
+
+    def notify_runtime_warmup_retry(self, message: str) -> None:
+        """运行环境暂时没起来时，告诉外面正在重试。"""
+        retry = self._on_runtime_warmup_retry
+        if callable(retry):
+            retry(message)
+
+    def notify_runtime_ready(self) -> None:
+        """运行环境就绪后通知外面。"""
+        ready = self._on_runtime_ready
+        if callable(ready):
+            ready()
+
+    async def recover_symphony(self) -> None:
+        """恢复流程编排。失败不影响服务器本身。"""
+        await self._start_symphony_recovery()
+
+    async def start(self, *, bind_transport: bool = False) -> None:
+        """只听 WebSocket 端口。进程服务由 ProcessServices 启动。
+
+        ``bind_transport=True`` 只给测试和旧入口用。正式启动的端口在 Front。
+        """
+        if not bind_transport:
+            logger.info("[AgentWebSocketServer] 不在此听端口")
+            return
+        if self._server is not None:
+            logger.warning("[AgentWebSocketServer] 服务端已在运行")
+            return
+        logger.warning(
+            "[AgentWebSocketServer] bind_transport=True is a test/compat "
+            "entry; production listens through AgentServer Front"
+        )
+        try:
+            from websockets.legacy.server import serve as legacy_serve
+            self._server = await legacy_serve(
+                self._connection_handler,
+                self._host,
+                self._port,
+                process_request=self._process_request,
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                max_size=AGENT_WS_MAX_MESSAGE_BYTES,
+            )
+        except ImportError:
+            import websockets
+            self._server = await websockets.serve(
+                self._connection_handler,
+                self._host,
+                self._port,
+                process_request=self._process_request,
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                max_size=AGENT_WS_MAX_MESSAGE_BYTES,
+            )
+        logger.info(
+            "[AgentWebSocketServer] 已启动: ws://%s:%s", self._host, self._port
+        )
 
     def schedule_image_modality_warmup(
         self, *, reason: str, reset_cache: bool = False
@@ -3260,34 +3255,6 @@ class AgentWebSocketServer:
                 matched_session_ids.append(session_id)
 
         return sorted(set(matched_session_ids))
-
-    async def _ensure_persistent_checkpointer_response(
-        self,
-        request: AgentRequest,
-    ) -> AgentResponse | None:
-        """Return an error response when persistent checkpoint storage is unavailable."""
-        try:
-            from jiuwenswarm.server.runtime.agent_adapter.interface_deep import ensure_persistent_checkpointer
-
-            await ensure_persistent_checkpointer()
-            await self._try_start_heartbeat_runtime()
-            return None
-        except Exception as exc:
-            logger.exception(
-                "[AgentWebSocketServer] persistent checkpointer unavailable: request_id=%s error=%s",
-                request.request_id,
-                exc,
-            )
-            return AgentResponse(
-                request_id=request.request_id,
-                channel_id=request.channel_id,
-                ok=False,
-                payload={
-                    "error": "persistent checkpointer is unavailable",
-                    "code": "CHECKPOINT_UNAVAILABLE",
-                },
-                metadata=request.metadata,
-            )
 
     async def _try_start_heartbeat_runtime(self) -> bool:
         """Best-effort idempotent recovery after checkpointer readiness."""

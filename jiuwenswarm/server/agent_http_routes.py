@@ -15,7 +15,9 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from jiuwenswarm.common.log_context import (
     bind_log_session,
@@ -24,6 +26,7 @@ from jiuwenswarm.common.log_context import (
 )
 from jiuwenswarm.common.schema.agent import AgentRequest
 from jiuwenswarm.common.schema.message import ReqMethod
+from jiuwenswarm.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
 from jiuwenswarm.server import http_chat
 from jiuwenswarm.server.app_services import AppServices
 from jiuwenswarm.server.context import AgentServerServices, RequestContext
@@ -35,6 +38,34 @@ logger = logging.getLogger(__name__)
 
 HTTP_CONNECTION_ID = "http"
 API_PREFIX = "/api/v1"
+
+
+class _RequestBodyTooLarge(Exception):
+    """请求体超过和 WebSocket 相同的单条上限。"""
+
+
+class RequestBodyLimitMiddleware:
+    """请求体超过 WebSocket 单条上限时直接拒绝，避免整段读进内存。"""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = _content_length(scope)
+        if declared is not None and declared > AGENT_WS_MAX_MESSAGE_BYTES:
+            await _payload_too_large()(scope, receive, send)
+            return
+        try:
+            body = await _read_bounded_body(receive)
+        except _RequestBodyTooLarge:
+            await _payload_too_large()(scope, receive, send)
+            return
+        if body is None:
+            return
+        await self.app(scope, _replay_body(body), send)
 
 
 class SessionLogMiddleware(BaseHTTPMiddleware):
@@ -59,6 +90,8 @@ def build_http_app(app_services: AppServices) -> FastAPI:
     """造出 HTTP 应用。业务函数通过工具箱拿服务，不接触 WebSocket 服务器。"""
     app = FastAPI(title="JiuwenSwarm HTTP", docs_url=None, redoc_url=None)
     app.add_middleware(SessionLogMiddleware)
+    # 后加的包在最外层，先拦超大请求体，再记日志。
+    app.add_middleware(RequestBodyLimitMiddleware)
 
     @app.post(f"{API_PREFIX}/agents/list")
     async def agents_list(request: Request) -> JSONResponse:
@@ -194,6 +227,65 @@ def _context_from_mapping(
         connection_id=HTTP_CONNECTION_ID,
         services=AgentServerServices(app_services),
     )
+
+
+def _content_length(scope: Scope) -> int | None:
+    raw = Headers(scope=scope).get("content-length")
+    if raw is None:
+        return None
+    try:
+        size = int(raw)
+    except ValueError:
+        return None
+    if size < 0:
+        return None
+    return size
+
+
+def _payload_too_large() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PAYLOAD_TOO_LARGE",
+                "error": "request body exceeds the size limit",
+            },
+        },
+        status_code=413,
+    )
+
+
+async def _read_bounded_body(receive: Receive) -> bytes | None:
+    """按块读取。超过上限就停，不再把剩下的收进来。客户端先断开时返回 None。"""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None
+        if message["type"] != "http.request":
+            continue
+        piece = message.get("body", b"")
+        total += len(piece)
+        if total > AGENT_WS_MAX_MESSAGE_BYTES:
+            raise _RequestBodyTooLarge
+        if piece:
+            chunks.append(piece)
+        if not message.get("more_body", False):
+            return b"".join(chunks)
+
+
+def _replay_body(body: bytes) -> Receive:
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
 
 
 async def _read_json(request: Request) -> dict[str, Any]:

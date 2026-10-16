@@ -2,12 +2,13 @@
 
 """HTTP 聊天路由上的薄适配。
 
-只在聊天请求上调用：先让扩展看输入，再抄已有团队名字，再记隐式反馈，
-然后调用和 WebSocket 同一份一次性回包或流式回包。
+只在聊天请求上调用：先确认会话还能收新聊天，再让扩展看输入，再抄已有团队名字，
+再记隐式反馈，然后调用和 WebSocket 同一份一次性回包或流式回包。
 """
 
 from __future__ import annotations
 
+from jiuwenswarm.common.schema.agent import AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server.context import RequestContext
 from jiuwenswarm.server.handlers import _default as chat_default
@@ -16,6 +17,7 @@ from jiuwenswarm.server.middleware.chat import (
     trigger_before_chat_request,
     try_record_implicit_feedback,
 )
+from jiuwenswarm.server.runtime.session.lifecycle import LifecycleError, guard
 
 _CHAT_BOOKKEEPING = (
     ReqMethod.CHAT_SEND,
@@ -25,8 +27,10 @@ _CHAT_BOOKKEEPING = (
 
 
 async def handle_http_chat(ctx: RequestContext) -> None:
-    """跑完聊天前的三步，再进入真正的回包。"""
+    """先拦住归档或删除中的会话，再跑聊天前的三步，然后回包。"""
     request = ctx.request
+    if await _reject_closed_session(ctx):
+        return
     pending: tuple[object, str, str] | None = None
     try:
         if request.req_method in _CHAT_BOOKKEEPING and request.session_id:
@@ -45,3 +49,30 @@ async def handle_http_chat(ctx: RequestContext) -> None:
         if pending is not None:
             runtime, session_id, request_id = pending
             runtime.end_chat_request(session_id, request_id)
+
+
+async def _reject_closed_session(ctx: RequestContext) -> bool:
+    """会话正在归档、已经归档或正在删除时，拒绝这轮聊天。
+
+    错误码与 WebSocket 入口的会话守卫相同。检查放在登记聊天和聊天前步骤之前，
+    避免归档过程中又写下新内容。
+    """
+    request = ctx.request
+    params = request.params if isinstance(request.params, dict) else {}
+    try:
+        guard(
+            str(params.get("session_id") or request.session_id or ""),
+            str(params.get("project_id") or ""),
+        )
+    except LifecycleError as exc:
+        await ctx.sink.send_response(
+            AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"code": exc.code, "error": str(exc)},
+                metadata=request.metadata,
+            )
+        )
+        return True
+    return False
