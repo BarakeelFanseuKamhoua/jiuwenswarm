@@ -1952,6 +1952,10 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                 self._build_subagent_rail,
                 {"config_base": config_base},
             ),
+            _RailBuildInfo(
+                "_cua_delegation_approval_rail",
+                self._build_cua_delegation_approval_rail,
+            ),
         ]
 
         # 动态 Rails — 从 config.yaml::modes.code.rails 读取
