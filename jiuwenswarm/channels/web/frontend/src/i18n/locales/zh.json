@@ -101,6 +101,7 @@
       "bootstrapError": "搭建工作流失败，请稍后重试。",
       "notImplemented": "未实现",
       "send": "发送",
+      "running": "设计团长正在执行…",
       "attach": "添加参考素材",
       "removeAttachment": "移除参考素材",
       "attachHint": "支持图片、视频、音频。最多 5 张图、1 个视频、1 段音频。",
@@ -111,6 +112,7 @@
       "unsupported": "仅支持图片、视频或音频作为参考素材。"
     },
     "run": {
+      "moderationBlocked": "生成内容被模型的内容安全审核拦截。请把该节点提示词中的暴力、血腥等描写改为含蓄、象征性的画面后重新生成。",
       "controlLabel": "执行控制",
       "execute": "执行",
       "continue": "继续",
