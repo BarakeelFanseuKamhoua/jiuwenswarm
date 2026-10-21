@@ -21,7 +21,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Mapping
-from contextlib import aclosing, asynccontextmanager, contextmanager
+from contextlib import ExitStack, aclosing, asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16602,6 +16602,7 @@ class JiuWenSwarmDeepAdapter:
         """Bind Host request identity for streaming and non-streaming execution."""
         request_params = request.params if isinstance(request.params, dict) else {}
         from jiuwenswarm.runtime.run_permissions import RUN_PERMISSIONS
+        from jiuwenswarm.runtime.run_context import CURRENT_RUN_CONTEXT, RunContext
         run_permissions = (
             request_params.get("run_permissions")
             if request.channel_id == "process_cli" else None
@@ -16610,48 +16611,62 @@ class JiuWenSwarmDeepAdapter:
         if (tool_levels is not None and self._permission_rail is None
                 and self._is_session_scoped_adapter):
             raise ValueError("run permissions require an enabled Runtime permission rail")
+        context = RunContext(
+            supports_permission_approval=(
+                request_params.get("supports_permission_approval",
+                                   request_params.get("supports_user_interaction", True)) is True
+            ),
+        )
         permission_rail = self._permission_rail
+        approval_rail = (
+            getattr(permission_rail, "base_rail", permission_rail)
+            if request.channel_id == "process_cli" else None
+        )
+        previous_approval_support = getattr(approval_rail, "supports_permission_approval", None)
         previous_rail_levels = (
             getattr(permission_rail, "run_permission_levels", None)
             if permission_rail is not None else None
         )
-        if permission_rail is not None:
-            permission_rail.run_permission_levels = tool_levels
-        run_permissions_token = RUN_PERMISSIONS.set(tool_levels)
-        runtime_mode = str(request_params.get("mode") or "agent").strip().lower()
-        root_invocation_token = bind_root_permission_request(
-            root_session_id=self._resolve_interrupt_session_id(request.session_id),
-            request_id=str(request.request_id or "").strip(),
-            enabled=self._enable_auto_permission and not is_team_params(request_params)
-            and runtime_mode != "auto_harness",
-            queue=self._root_permission_queue,
-        )
-        channel_token = TOOL_PERMISSION_CHANNEL_ID.set(
-            (request.channel_id or "").strip()
-        )
-        request_token = TOOL_PERMISSION_REQUEST_ID.set(
-            (request.request_id or "").strip()
-        )
-        command_token = None
-        if self._is_session_scoped_adapter and self._sys_operation is not None:
-            command_token = bind_command_execution(
-                self._sys_operation,
-                sandboxed=(
-                    getattr(self._sys_operation_card, "mode", None)
-                    == OperationMode.SANDBOX
-                ),
-            )
-        try:
-            yield
-        finally:
+        with ExitStack() as cleanup:
+            if approval_rail is not None:
+                # SDK tool callbacks can run in tasks created before this request's
+                # ContextVars. Bind this restriction to the session's rail as well.
+                cleanup.callback(setattr, approval_rail, "supports_permission_approval", previous_approval_support)
+                approval_rail.supports_permission_approval = context.supports_permission_approval
             if permission_rail is not None:
-                permission_rail.run_permission_levels = previous_rail_levels
-            RUN_PERMISSIONS.reset(run_permissions_token)
-            reset_root_permission_request(root_invocation_token)
-            if command_token is not None:
-                reset_command_execution(command_token)
-            TOOL_PERMISSION_REQUEST_ID.reset(request_token)
-            TOOL_PERMISSION_CHANNEL_ID.reset(channel_token)
+                cleanup.callback(setattr, permission_rail, "run_permission_levels", previous_rail_levels)
+                permission_rail.run_permission_levels = tool_levels
+            context_token = CURRENT_RUN_CONTEXT.set(context)
+            cleanup.callback(CURRENT_RUN_CONTEXT.reset, context_token)
+            run_permissions_token = RUN_PERMISSIONS.set(tool_levels)
+            cleanup.callback(RUN_PERMISSIONS.reset, run_permissions_token)
+            runtime_mode = str(request_params.get("mode") or "agent").strip().lower()
+            root_invocation_token = bind_root_permission_request(
+                root_session_id=self._resolve_interrupt_session_id(request.session_id),
+                request_id=str(request.request_id or "").strip(),
+                enabled=self._enable_auto_permission and not is_team_params(request_params)
+                and runtime_mode != "auto_harness",
+                queue=self._root_permission_queue,
+            )
+            cleanup.callback(reset_root_permission_request, root_invocation_token)
+            channel_token = TOOL_PERMISSION_CHANNEL_ID.set(
+                (request.channel_id or "").strip()
+            )
+            cleanup.callback(TOOL_PERMISSION_CHANNEL_ID.reset, channel_token)
+            request_token = TOOL_PERMISSION_REQUEST_ID.set(
+                (request.request_id or "").strip()
+            )
+            cleanup.callback(TOOL_PERMISSION_REQUEST_ID.reset, request_token)
+            if self._is_session_scoped_adapter and self._sys_operation is not None:
+                command_token = bind_command_execution(
+                    self._sys_operation,
+                    sandboxed=(
+                        getattr(self._sys_operation_card, "mode", None)
+                        == OperationMode.SANDBOX
+                    ),
+                )
+                cleanup.callback(reset_command_execution, command_token)
+            yield
 
     async def process_message_impl(
         self, request: AgentRequest, inputs: dict[str, Any]
