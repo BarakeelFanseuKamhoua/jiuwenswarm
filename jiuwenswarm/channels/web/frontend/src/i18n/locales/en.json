@@ -1552,7 +1552,7 @@
     "videoGeneration": "Video generation",
     "modeAutoHarness": "Auto-Harness Mode",
     "modeAutoHarnessDesc": "Automatically analyze and optimize target repository",
-    "recording": "Recording... (click the microphone again to finish)",
+    "recording": "Recording... (click the stop button to finish)",
     "transcribing": "Transcribing speech...",
     "startRecording": "Voice input",
     "stopRecording": "Stop recording and transcribe",
@@ -3570,7 +3570,8 @@
       "updating": "Saving…"
     },
     "confirm": {
-      "deleteMessage": "Delete the Expert “{{name}}”? This cannot be undone."
+      "deleteMessage": "Delete the Expert “{{name}}”? This cannot be undone.",
+      "uninstallGroupMessage": "Uninstall the Expert Team “{{name}}”?"
     },
     "card": {
       "open": "Open {{name}} details",
