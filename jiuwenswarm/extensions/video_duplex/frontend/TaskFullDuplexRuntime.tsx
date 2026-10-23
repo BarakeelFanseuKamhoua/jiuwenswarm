@@ -18,6 +18,7 @@ import type {
 import { TaskFullDuplexControls } from "./TaskFullDuplexAction";
 import { TaskDuplexJobs } from "./taskDuplexJobs";
 import { describeDuplexError } from "./duplexErrorMessage";
+import { applyDuplexSubagentEvent } from "./duplexSubagentEvents";
 import {
   registerTaskFullDuplexController,
   setTaskFullDuplexRuntimeError,
@@ -327,6 +328,10 @@ export function TaskFullDuplexRuntime({
 
           if (entry.stage === "reasoning" && entry.content) {
             emitReasoning(targetSessionId, entry.content, atMs);
+            return;
+          }
+          if (entry.stage === "subagent") {
+            applyDuplexSubagentEvent(targetSessionId, entry.subagent_event);
             return;
           }
           if (entry.stage === "tool_call") {
