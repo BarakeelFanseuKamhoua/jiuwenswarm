@@ -511,6 +511,7 @@
       "customModels": "Custom models",
       "tabsLabel": "Model settings categories",
       "modelsTab": "Models",
+      "jevTab": "Jev",
       "modelGroups": "Model groups",
       "modelGroupsManagement": "Model group management",
       "empty": "No models configured",
@@ -738,6 +739,8 @@
       "providerTypesafe": "TypeSafe",
       "providerCustom": "Custom",
       "jevConfig": "Jev Model Configuration",
+      "jevKeyMissing": "Jev API key is not configured. Configure it under Models > Jev first.",
+      "clearSharedJevConfirm": "Clear this provider's Jev key? Browser decisions will return to LLM only, and JEV decision for multi-model collaboration will be disabled.",
       "jevBaseInvalid": "Enter an HTTPS API base URL without credentials, query parameters or fragments",
       "jevModelInvalid": "Enter a valid OpenRouter Jev model, such as typesafe/jev-1.13"
     },
@@ -816,7 +819,7 @@
       },
       "decision_mode": {
         "title": "Browser decisions",
-        "description": "Choose who decides each browser step. Jev modes need the Jev API key below."
+        "description": "Choose who decides each browser step. Jev modes use the shared configuration under Models > Jev."
       },
       "decision_provider": {
         "title": "Jev provider",
@@ -1005,7 +1008,7 @@
       },
       "moa_jev_enabled": {
         "title": "JEV decision",
-        "description": "Use JEV to verify execution progress. When off, use the selected model group’s default model."
+        "description": "Use JEV configured under Models > Jev to verify execution progress. When off, use the selected model group’s default model."
       },
       "moa_verifier_interval": {
         "title": "Verification interval (rounds)",
