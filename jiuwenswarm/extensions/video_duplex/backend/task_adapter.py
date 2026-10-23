@@ -10,7 +10,9 @@ from jiuwenswarm.extensions.video_duplex.backend.tasks import TaskService, TaskS
 from jiuwenswarm.extensions.video_duplex.backend.tasks.service import TaskModification
 from jiuwenswarm.extensions.video_duplex.backend.tasks.store import task_database
 from .tasks.errors import QueueVersionConflict, TaskRevisionConflict
+from .tasks.interactions import approval_cards
 from .tasks.prompts import (
+    APPROVAL_REQUIRES_CLICK_INSTRUCTIONS,
     EMPTY_QUERY_INSTRUCTIONS,
     QUEUE_CONFLICT_INSTRUCTIONS,
     REORDER_INSTRUCTIONS,
@@ -473,6 +475,10 @@ class VideoSearchManager:
             result["interaction_requires_ui"] = True
         else:
             result["interaction"] = interaction
+        # Approval cards are click-only; voice may still answer information questions.
+        cards = approval_cards(interaction)
+        approval = dict(requires_click=cards is not None, **({"approval_cards": cards} if cards else {}))
+        result.update(approval)
         if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 12000:
             # Five jobs remain well below the provider's 256 KiB frame limit,
             # including the second JSON encoding of function_call_output.
@@ -481,6 +487,7 @@ class VideoSearchManager:
                 question=str(job.get("question") or "")[:1000],
                 details_omitted=True,
                 artifact_status="not_in_response",
+                **approval,
             )
         return result
 
@@ -703,6 +710,14 @@ class VideoSearchManager:
             if receipt.get("state") == "rejected":
                 result.update(receipt, message=QUEUE_CONFLICT_INSTRUCTIONS)
         elif call.name == "jiuwen_task_answer":
+            cards = approval_cards(self.service.get(owner, scope, args["job_id"]).get("interaction"))
+            if cards is not None:
+                # Explicit receipt so the model cannot mistake a refusal for consent.
+                return dict(
+                    task_id=args["job_id"], state="rejected", applied=False,
+                    code="APPROVAL_REQUIRES_CLICK", requires_click=True,
+                    approval_cards=cards, message=APPROVAL_REQUIRES_CLICK_INSTRUCTIONS,
+                )
             result = await self.service.answer(
                 owner,
                 scope,

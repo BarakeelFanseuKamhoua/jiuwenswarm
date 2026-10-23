@@ -33,6 +33,11 @@ QUEUE_CONFLICT_INSTRUCTIONS = (
     "queue_version and jobs describe the latest waiting order near the target; query for other tasks if needed. "
     "Review the latest order before deciding whether to submit a new operation."
 )
+APPROVAL_REQUIRES_CLICK_INSTRUCTIONS = (
+    "This approval was NOT approved or rejected; the task is still waiting. Voice cannot answer approval cards. "
+    "Do not claim it was allowed, approved or resumed. Tell the user what approval_cards asks for and ask them to "
+    "click 允许 or 拒绝 on the on-screen card. Query later to confirm whether the task resumed."
+)
 REVISION_CONFLICT_INSTRUCTIONS = (
     "This modification was not applied. Check the latest requirement and revision before retrying once with a new "
     "call. If a linked revision exists, locate it first. Do not claim the modification succeeded."
@@ -44,7 +49,9 @@ def task_query_instructions(total, counts, unfinished, page_size, matched):
         f"This query covers {total} tasks, with status counts {json.dumps(counts)} and {unfinished} unfinished. "
         f"This page contains {page_size} of {matched} matching tasks. "
         "Use this receipt, not historical status. Cancellation is not successful completion; queued means waiting "
-        "for capacity, and waiting_user means awaiting an answer. File lists confirm "
+        "for capacity, and waiting_user means awaiting an answer. requires_click=true means an approval card "
+        "(approval_cards) that only the user can click on screen; ask them to click it and never answer it by "
+        "voice or claim it was approved. File lists confirm "
         "paths, not that file contents were read."
     )
 

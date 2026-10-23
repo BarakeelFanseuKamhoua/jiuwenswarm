@@ -70,7 +70,8 @@ await build({
               setSpeakerMuted(value) { globalThis.__duplexHarness.speaker.push(value); },
               stopScreenSharing() { props.onScreenSharingChange(false); },
               stop() { globalThis.__duplexHarness.stops += 1; props.onRuntimeState('idle'); },
-              deliverToolResult(payload) { globalThis.__duplexHarness.mediaResults.push(payload); }
+              deliverToolResult(payload) { globalThis.__duplexHarness.mediaResults.push(payload); },
+              deliverQuestion(payload) { globalThis.__duplexHarness.mediaQuestions.push(payload); }
             }));
             return null;
           });`
@@ -141,6 +142,7 @@ beforeEach(async () => {
     mic: [],
     speaker: [],
     mediaResults: [],
+    mediaQuestions: [],
     requests: [],
     messages: [],
     tools: [],
@@ -235,6 +237,25 @@ test('media restart keeps the Core Agent scope, while a different conversation g
   assert.equal(await start(), first);
   await act(async () => root.render(createElement(TaskFullDuplexRuntime, { ...props, sessionId: 'conversation-b' })));
   assert.notEqual(await start('conversation-b'), first);
+});
+
+test('a pending approval card reaches the live voice session, but not from replays or after stop', async () => {
+  // In task mode the panel is headless; without this the voice model never
+  // learns a card is waiting and cannot tell the user to click it (#8941).
+  const scope = await start();
+  const card = {
+    id: 'interaction-a', request_id: 'call-a', source: 'confirm_interrupt', state: 'pending',
+    questions: [{ question: 'cua_agent 将操作你的桌面', header: '操作确认: cua_agent', options: [] }],
+  };
+  await event('started', job(scope));
+  await event('progress', job(scope, { status: 'waiting_user', interaction: card }));
+  await event('progress', job(scope, { status: 'waiting_user', interaction: card, replay: true }));
+  assert.equal(harness.mediaQuestions.length, 1);
+  assert.equal(harness.mediaQuestions[0].interaction.source, 'confirm_interrupt');
+
+  await act(async () => stopTaskFullDuplex());
+  await event('progress', job(scope, { status: 'waiting_user', interaction: { ...card, id: 'interaction-b' } }));
+  assert.equal(harness.mediaQuestions.length, 1);
 });
 
 test('a stopped conversation receives and persists a completed result exactly once without audio', async () => {

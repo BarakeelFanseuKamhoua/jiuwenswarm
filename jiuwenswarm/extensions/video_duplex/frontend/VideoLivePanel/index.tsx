@@ -86,6 +86,7 @@ export interface VideoLivePanelHandle {
   setSpeakerMuted: (muted: boolean) => void;
   stopScreenSharing: () => void;
   deliverToolResult: (payload: SearchJobPayload) => void;
+  deliverQuestion: (payload: SearchJobPayload) => void;
 }
 
 interface VideoLivePanelProps {
@@ -1244,6 +1245,12 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
       }
       if (payload.status === 'failed') acceptFailedSearch(payload);
       else acceptCompletedSearch(payload);
+    },
+    deliverQuestion: (payload) => {
+      // Headless panels have no task subscriptions, so the runtime forwards
+      // pending questions and approval cards for the model to raise.
+      if (!searchSessionRef.current || payload.search_session_id !== searchSessionRef.current) return;
+      if (payload.job_id && payload.interaction) duplexRef.current?.enqueueQuestion(payload.job_id, payload.interaction);
     },
   }));
 

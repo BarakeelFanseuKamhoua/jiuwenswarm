@@ -120,6 +120,81 @@ test('pending information questions are announced once without completing their 
   assert.deepEqual(dispatchedToolResults, []);
 });
 
+test('pending approval cards ask the user to click instead of answering by voice', () => {
+  // Voice must never approve cards, so it must not invite a spoken "允许" either.
+  const { session, sent } = createSession();
+  session.enqueueQuestion('cua', { id: 'card-a', request_id: 'core-approval', state: 'pending',
+    source: 'confirm_interrupt', questions: [{ header: '操作确认: cua_agent', question: '打开计算器' }] });
+  const text = sent.find(e => e.type === 'conversation.item.create').item.content[0].text;
+  assert.match(text, /操作确认: cua_agent/);
+  assert.match(text, /click/);
+  assert.match(text, /Do not call jiuwen_task_answer/);
+  assert.doesNotMatch(text, /then call jiuwen_task_answer/);
+});
+
+test('an open approval card stays in the session instructions until it closes', () => {
+  // A one-off notice is forgotten by the next turn, so a spoken "允许" was
+  // answered as consent (#8941). Every reply must see the open card.
+  const { session, sent } = createSession();
+  const card = { id: 'card-a', request_id: 'core-approval', state: 'pending',
+    source: 'confirm_interrupt', questions: [{ header: '操作确认: cua_agent', question: '打开计算器' }] };
+  session.enqueueQuestion('cua', card);
+  const updates = () => sent.filter(e => e.type === 'session.update');
+  assert.equal(updates().length, 1);
+  assert.match(updates()[0].session.instructions, /\[Pending approval cards\].*操作确认: cua_agent/);
+  assert.match(updates()[0].session.instructions, /Never say a pending card was allowed/);
+
+  session.enqueueQuestion('cua', card); // A repeated progress event must not resend.
+  assert.equal(updates().length, 1);
+
+  session.enqueueQuestion('cua', { ...card, state: 'accepted' });
+  assert.equal(updates().length, 2);
+  assert.doesNotMatch(updates()[1].session.instructions, /Pending approval cards/);
+});
+
+const openCard = (session) => session.enqueueQuestion('cua', { id: 'card-a', request_id: 'core-approval', state: 'pending',
+  source: 'confirm_interrupt', questions: [{ header: '操作确认: cua_agent', question: '打开计算器' }] });
+
+test('every reply to speech while a card is open reads the card status last', () => {
+  // The model hears audio, not the transcript ("允许" was transcribed as "人是"), and it
+  // answered a spoken "允许" with "你已经在屏幕上点击了允许" despite the instructions (#8941).
+  const { session, sent } = createSession();
+  openCard(session);
+  session.handleEvent({ type: 'response.done', response: { id: 'notice', status: 'completed' } });
+  sent.length = 0;
+
+  session.handleEvent({ type: 'input_audio_buffer.speech_stopped', item_id: 'u1' });
+  session.handleEvent({ type: 'response.created', response: { id: 'auto' } });
+  assert.deepEqual(sent.map(e => e.type), ['response.cancel'], 'the automatic reply is cancelled');
+
+  session.handleEvent({ type: 'response.done', response: { id: 'auto', status: 'cancelled' } });
+  assert.deepEqual(sent.slice(1).map(e => e.type), ['conversation.item.create', 'response.create']);
+  const status = sent[1].item.content[0].text;
+  assert.match(status, /操作确认: cua_agent/);
+  assert.match(status, /has NOT clicked/);
+  assert.match(status, /Never say the card was allowed/);
+
+  session.handleEvent({ type: 'response.created', response: { id: 'replacement' } });
+  assert.equal(sent.filter(e => e.type === 'response.cancel').length, 1, 'the re-requested reply plays');
+});
+
+test('without an open card, and for the assistant notices, replies are left alone', () => {
+  const { session, sent } = createSession();
+  session.handleEvent({ type: 'input_audio_buffer.speech_stopped', item_id: 'u1' });
+  session.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  session.handleEvent({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  openCard(session); // its notice reply is not a user turn
+  session.handleEvent({ type: 'response.created', response: { id: 'notice' } });
+  assert.equal(sent.filter(e => e.type === 'response.cancel').length, 0);
+});
+
+test('information questions do not add approval instructions', () => {
+  const { session, sent } = createSession();
+  session.enqueueQuestion('ask', { id: 'q-a', request_id: 'ask-1', state: 'pending',
+    source: 'ask_user_interrupt', questions: [{ question: '预算多少？' }] });
+  assert.equal(sent.filter(e => e.type === 'session.update').length, 0);
+});
+
 test('delegation retains valid scheduling arguments and dispatches only once', () => {
   const errors = [];
   const { session, functionCalls } = createSession(null, { onError: (message) => errors.push(message) });
