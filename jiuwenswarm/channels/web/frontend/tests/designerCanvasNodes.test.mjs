@@ -541,8 +541,10 @@ test('portAddTemplatesFor limits port menus to the allowed node types', () => {
     assert.deepEqual(types(docType, 'predecessor'), []);
     assert.deepEqual(types(docType, 'successor'), ['image', 'video']);
   }
-  assert.deepEqual(types('image', 'predecessor'), []);
-  assert.deepEqual(types('image', 'successor'), ['video']);
+  // An image may also feed another image: `ImageNodeHandler` passes incoming
+  // image edges to the model as references (style-reference generation).
+  assert.deepEqual(types('image', 'predecessor'), ['image']);
+  assert.deepEqual(types('image', 'successor'), ['image', 'video']);
   assert.deepEqual(types('video', 'predecessor'), ['image', 'video', 'audio']);
   assert.deepEqual(types('video', 'successor'), ['video']);
   assert.deepEqual(types('audio', 'predecessor'), []);
