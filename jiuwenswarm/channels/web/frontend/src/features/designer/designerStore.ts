@@ -646,6 +646,12 @@ export const useDesignerStore = create<DesignerStore>((set, get) => ({
     const name = String(modelName || '').trim();
     if (!graph || !name || get().bootstrapInProgress || isDesignerPreviewGraph(graph)) return;
     if (String((graph.metadata ?? {}).model_name || '').trim() === name) return;
+    // A full-graph save already in flight carries the previous model name and
+    // its response would clobber this pick. Drop that response and save again
+    // once the new name is live, so the server does not keep the stale
+    // snapshot either (same guard as `patchMediaSettings`).
+    const saveInFlight = get().saveStatus === 'saving';
+    saveSeq += 1;
     set({
       domainGraph: {
         ...graph,
@@ -653,7 +659,11 @@ export const useDesignerStore = create<DesignerStore>((set, get) => ({
         metadata: { ...(graph.metadata ?? {}), model_name: name },
       },
     });
-    get().scheduleSave();
+    if (saveInFlight) {
+      void get().flushSave();
+    } else {
+      get().scheduleSave();
+    }
   },
 
   flushSave: async () => {
