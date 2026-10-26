@@ -203,11 +203,6 @@ import {
   trajectoryComposerClearance,
 } from './features/trajectory/trajectoryLayout';
 import {
-  normalizeTrajectoryUiEnabled,
-  setTrajectoryUiEnabled,
-  useTrajectoryUiEnabled,
-} from './features/trajectory/featureConfig';
-import {
   normalizeTrajectoryDiagnosisEnabled,
   setTrajectoryDiagnosisEnabled,
   useTrajectoryDiagnosisEnabled,
@@ -220,10 +215,6 @@ import {
   setTeamScheduledDispatchEnabled,
 } from './features/teamDispatch/featureConfig';
 
-const LazyTrajectoryPanel = lazy(async () => {
-  const module = await import('./features/trajectory/TrajectoryPanel');
-  return { default: module.TrajectoryPanel };
-});
 const LazyTrajectoryAnalysisPage = lazy(async () => {
   const module = await import('./features/trajectory/TrajectoryAnalysisPage');
   return { default: module.TrajectoryAnalysisPage };
@@ -481,7 +472,6 @@ function AppContent({
   const [trajectoryComposerCollapsed, setTrajectoryComposerCollapsed] = useState<Record<string, boolean>>({});
   const [trajectoryComposerHeight, setTrajectoryComposerHeight] = useState(0);
   const [chatWelcomeVariant, setChatWelcomeVariant] = useState<'group-create' | null>(null);
-  const [trajectoryUiRequested, setTrajectoryUiRequested] = useState(false);
   const [diagnosisUiRequested, setDiagnosisUiRequested] = useState(false);
 
   const [activeNav, setActiveNav] = useState<MainNavKey>('chat');
@@ -492,7 +482,6 @@ function AppContent({
   );
   const loadPersonalContextConfig = usePersonalContextStore((s) => s.loadConfig);
   const [serverConfig, setServerConfig] = useState<Record<string, unknown> | null>(null);
-  const trajectoryUiEnabled = useTrajectoryUiEnabled();
   const trajectoryDiagnosisEnabled = useTrajectoryDiagnosisEnabled();
   const [configError, setConfigError] = useState<string | null>(null);
   const [initialDataLoaded, setInitialDataLoaded] = useState(false);
@@ -823,12 +812,15 @@ function AppContent({
   const requestedChatSurfaceView: ChatSurfaceView = surfaceModeSupported
     ? (chatSurfaceViews[sessionId] ?? 'chat')
     : 'chat';
-  const chatSurfaceView: ChatSurfaceView = (requestedChatSurfaceView === 'trajectory' && !trajectoryUiEnabled)
+  // The standalone chat/trajectory tabs were removed; only the diagnosis entry remains.
+  const chatSurfaceView: ChatSurfaceView = (
+    requestedChatSurfaceView === 'trajectory'
     || (requestedChatSurfaceView === 'diagnosis' && !diagnosisEntryAvailable)
+  )
     ? 'chat'
     : requestedChatSurfaceView;
   const selectChatSurfaceView = useCallback((nextView: ChatSurfaceView) => {
-    if (nextView === 'trajectory') setTrajectoryUiRequested(true);
+    if (nextView === 'trajectory') return;
     if (nextView === 'diagnosis') setDiagnosisUiRequested(true);
     setChatSurfaceViews((current) => (
       current[sessionId] === nextView
@@ -843,7 +835,7 @@ function AppContent({
   const leaveDiagnosisView = useCallback(() => {
     selectChatSurfaceView('chat');
   }, [selectChatSurfaceView]);
-  const composerDocked = chatSurfaceView === 'trajectory' || chatSurfaceView === 'diagnosis';
+  const composerDocked = chatSurfaceView === 'diagnosis';
   const composerCollapsed = trajectoryComposerCollapsed[sessionId] ?? false;
   const toggleTrajectoryComposer = useCallback(() => {
     setTrajectoryComposerCollapsed((current) => ({
@@ -1951,8 +1943,9 @@ function AppContent({
       const config = await request<Record<string, unknown>>('config.get');
       setA2UIFeatureEnabled(normalizeA2UIEnabled(config.a2ui_enabled));
       setRSIFeatureEnabled(normalizeRSIEnabled(config.rsi_enabled));
-      setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(config.trajectory_ui_enabled));
-      setTrajectoryDiagnosisEnabled(normalizeTrajectoryDiagnosisEnabled(config.trajectory_ui_diagnosis_enabled));
+      setTrajectoryDiagnosisEnabled(
+        normalizeTrajectoryDiagnosisEnabled(config.trajectory_ui_diagnosis_enabled),
+      );
       setTeamOrganizationUiEnabled(config.team_organization_ui_enabled);
       setTeamScheduledDispatchEnabled(config.team_scheduled_dispatch_enabled);
       const collaborationSnapshotApplied = applyMultiModelCollaborationSnapshot(
@@ -4469,25 +4462,11 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                     mode={mode}
                     onViewChange={selectChatSurfaceView}
                     tabListLabel={t('trajectory.tabs.aria')}
-                    trajectory={(
-                      <Suspense
-                        fallback={(
-                          <div className="trajectory-view-loading">
-                            {t('trajectory.loading')}
-                          </div>
-                        )}
-                      >
-                        <LazyTrajectoryPanel
-                          active={chatSurfaceView === 'trajectory'}
-                          mode={mode}
-                          sessionId={sessionId}
-                        />
-                      </Suspense>
-                    )}
-                    trajectoryEnabled={trajectoryUiEnabled}
+                    trajectory={null}
+                    trajectoryEnabled={false}
                     trajectoryLabel={t('trajectory.tabs.trajectory')}
                     showNavigation={sessionId !== NEW_CONVERSATION_ID}
-                    trajectoryRequested={trajectoryUiRequested}
+                    trajectoryRequested={false}
                   />
                 </div>
 
