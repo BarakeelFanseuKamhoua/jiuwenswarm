@@ -321,7 +321,12 @@ def apply_cron_team_round_event(state: dict[str, Any], event: dict[str, Any]) ->
         call_id = _leader_tool_call_id(event)
         if call_id:
             open_calls.pop(call_id, None)
-        else:
+        elif len(open_calls) == 1:
+            # An unattributable result for the only in-flight call can only be
+            # that call, so closing it keeps the round movable. With several
+            # calls in flight we cannot tell which one finished: clearing the
+            # whole set used to let the round end while parallel tools still
+            # ran (#5410), so leave them open.
             open_calls.clear()
     elif event_type == "team.task":
         nested = event.get("event")
@@ -333,6 +338,12 @@ def apply_cron_team_round_event(state: dict[str, Any], event: dict[str, Any]) ->
             _apply_team_member_event(state, nested)
     elif event_type == "team.completed":
         state["team_round_completed"] = True
+        # A completed team round is authoritative: a call or task that never
+        # reported back must not keep the round open forever (#5410). The
+        # open-call guard is evaluated before every other completion signal,
+        # so a leaked entry here would otherwise block the round indefinitely.
+        state["open_leader_tool_calls"] = {}
+        state["open_team_tasks"] = {}
     elif event_type in ("chat.error", "team.error"):
         # team.error 由团队运行时直接抛出，不保证经 gateway 归一化成 chat.error，
         # 与 chat.error 同为「本轮终端失败」信号，必须一并识别：否则轮次状态里
