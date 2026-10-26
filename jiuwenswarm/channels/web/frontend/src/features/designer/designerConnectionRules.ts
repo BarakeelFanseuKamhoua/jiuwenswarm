@@ -16,13 +16,18 @@ import {
  * Outgoing node types each source type may be wired to.
  *
  * - text  → text, table, image, video
- * - image → video
+ * - image → image, video
  * - video → video
  * - audio → video
  *
  * `table` is treated as text in both directions: a table is a text-shaped
  * brief the pipeline reads like a text node, and the standard
  * brief → storyboard wire (text → table) must stay authorable.
+ *
+ * `image → image` is supported on purpose: `ImageNodeHandler` feeds every
+ * incoming image edge to the image model as a reference, so a wire between two
+ * image nodes is the style-reference flow (generate a new still from another
+ * still's look) rather than a meaningless edge.
  */
 export const DESIGNER_CONNECTION_TARGETS: Record<DesignerNodeType, readonly DesignerNodeType[]> = {
   [DESIGNER_NODE_TYPE_TEXT]: [
@@ -37,7 +42,7 @@ export const DESIGNER_CONNECTION_TARGETS: Record<DesignerNodeType, readonly Desi
     DESIGNER_NODE_TYPE_IMAGE,
     DESIGNER_NODE_TYPE_VIDEO,
   ],
-  [DESIGNER_NODE_TYPE_IMAGE]: [DESIGNER_NODE_TYPE_VIDEO],
+  [DESIGNER_NODE_TYPE_IMAGE]: [DESIGNER_NODE_TYPE_IMAGE, DESIGNER_NODE_TYPE_VIDEO],
   [DESIGNER_NODE_TYPE_VIDEO]: [DESIGNER_NODE_TYPE_VIDEO],
   [DESIGNER_NODE_TYPE_AUDIO]: [DESIGNER_NODE_TYPE_VIDEO],
 };
