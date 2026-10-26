@@ -39,7 +39,9 @@ def _is_leader_tool_event(event: dict[str, Any]) -> bool:
 
 
 def _leader_tool_payload(event: dict[str, Any]) -> dict[str, Any]:
-    for key in ("tool_call", "tool_result"):
+    # ``tool_update`` mirrors the same nesting web clients normalize, so its
+    # id and status must be resolved from the nested payload as well.
+    for key in ("tool_call", "tool_result", "tool_update"):
         nested = event.get(key)
         if isinstance(nested, dict):
             return nested
