@@ -18,6 +18,14 @@ import {
   type DesignerNodeState,
 } from './executionGraphTypes';
 
+/** Session that owns the graph; run triggers must name it so run pushes land
+ * in the same session as the canvas (regenerate issue #5326). */
+function graphSessionId(graph: DesignerExecutionGraph | null | undefined): string | undefined {
+  const raw = graph?.metadata?.session_id;
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id || undefined;
+}
+
 type DesignerRunStore = {
   run: DesignerExecutionRun | null;
   nodeStates: Record<string, DesignerNodeState>;
@@ -38,7 +46,6 @@ type DesignerRunStore = {
   restart: (graph: DesignerExecutionGraph) => Promise<void>;
   cancel: (graph: DesignerExecutionGraph | null) => Promise<void>;
   patchNodeOutput: (nodeId: string, outputRef: AssetRef) => void;
-  chooseOutput: (nodeId: string, choice: 'original' | 'new') => Promise<void>;
   /** Local upload preview: mark node completed with the uploaded asset. */
   applyUploadedOutput: (nodeId: string, outputRef: AssetRef) => void;
   /** Clear upload-produced preview on a node. */
@@ -242,12 +249,22 @@ export const useDesignerRunStore = create<DesignerRunStore>((set, get) => ({
               graphId: graph.graph_id,
               runId: run?.run_id,
               nodeId: failedId,
+              sessionId: graphSessionId(graph),
             })
-          : await designerGraphClient.startRun({ graphId: graph.graph_id });
+          : await designerGraphClient.startRun({
+              graphId: graph.graph_id,
+              sessionId: graphSessionId(graph),
+            });
       } else if (run?.run_id && primary === 'continue') {
-        result = await designerGraphClient.startRun({ runId: run.run_id });
+        result = await designerGraphClient.startRun({
+          runId: run.run_id,
+          sessionId: graphSessionId(graph),
+        });
       } else {
-        result = await designerGraphClient.startRun({ graphId: graph.graph_id });
+        result = await designerGraphClient.startRun({
+          graphId: graph.graph_id,
+          sessionId: graphSessionId(graph),
+        });
       }
       const warning = String(result.warning || result.run?.warning || result.warnings?.[0] || '').trim() || null;
       get().applyRun(result.run);
@@ -269,6 +286,7 @@ export const useDesignerRunStore = create<DesignerRunStore>((set, get) => ({
         graphId: graph.graph_id,
         runId: run?.run_id,
         nodeId,
+        sessionId: graphSessionId(graph),
       });
       const warning = String(result.warning || result.run?.warning || result.warnings?.[0] || '').trim() || null;
       get().applyRun(result.run);
@@ -285,7 +303,10 @@ export const useDesignerRunStore = create<DesignerRunStore>((set, get) => ({
     await persistBeforeRun();
     set({ runError: null, runWarning: null });
     try {
-      const result = await designerGraphClient.startRun({ graphId: graph.graph_id });
+      const result = await designerGraphClient.startRun({
+        graphId: graph.graph_id,
+        sessionId: graphSessionId(graph),
+      });
       const warning = String(result.warning || result.run?.warning || result.warnings?.[0] || '').trim() || null;
       get().applyRun(result.run);
       if (warning) {
@@ -364,18 +385,6 @@ export const useDesignerRunStore = create<DesignerRunStore>((set, get) => ({
       run,
       nodeStates,
     });
-  },
-
-  chooseOutput: async (nodeId, choice) => {
-    const runId = get().run?.run_id;
-    if (!runId) return;
-    try {
-      const result = await designerGraphClient.chooseOutput({ runId, nodeId, choice });
-      get().applyRun(result.run);
-    } catch (error) {
-      set({ runError: error instanceof Error ? error.message : String(error) });
-      throw error;
-    }
   },
 }));
 

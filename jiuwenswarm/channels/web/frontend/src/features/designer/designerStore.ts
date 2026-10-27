@@ -539,9 +539,6 @@ export const useDesignerStore = create<DesignerStore>((set, get) => ({
     ) {
       ui.closeViewer();
     }
-    if (removed.has(ui.chooserNodeId)) {
-      ui.closeRevision();
-    }
     void get().flushSave();
   },
 
