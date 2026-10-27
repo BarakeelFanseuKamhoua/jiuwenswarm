@@ -125,6 +125,71 @@ def analysis_prompt_with_references(prompt: str, refs: list[dict[str, Any]] | No
     )
 
 
+def _reference_node_uploads(graph: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """File each reference *currently* points at, read from its canvas node.
+
+    ``metadata.user_references`` is written once, when the uploads first seed the
+    graph. Replacing the material later rewrites the reference node instead
+    (``config.user_reference_path`` / ``output_ref`` / ``materials``), so a
+    resolver that only reads metadata keeps handing the original file to every
+    node regenerated afterwards. The node is the live authority.
+    """
+    uploads: dict[str, dict[str, Any]] = {}
+    for node in (graph or {}).get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+        ref_id = str(cfg.get("user_reference_id") or "").strip()
+        if not ref_id:
+            continue
+        path = _existing_file(str(cfg.get("user_reference_path") or ""))
+        if path is None:
+            output_ref = node.get("output_ref") if isinstance(node.get("output_ref"), dict) else {}
+            path = _existing_file(str(output_ref.get("uri") or ""))
+        if path is None:
+            continue
+        upload = cfg.get("upload") if isinstance(cfg.get("upload"), dict) else {}
+        materials = cfg.get("materials") if isinstance(cfg.get("materials"), list) else []
+        first = materials[0] if materials and isinstance(materials[0], dict) else {}
+        resolved = path.resolve()
+        uploads[ref_id] = {
+            "path": resolved,
+            "uri": resolved.as_uri(),
+            "filename": str(upload.get("filename") or first.get("filename") or resolved.name),
+            "mime_type": str(upload.get("mime_type") or first.get("mime_type") or ""),
+        }
+    return uploads
+
+
+def _record_file(item: dict[str, Any], uploads: dict[str, dict[str, Any]]) -> Path | None:
+    """Resolve one reference record, letting a replaced upload win."""
+    live = uploads.get(str(item.get("id") or ""))
+    if live is not None:
+        return live["path"]
+    return _existing_file(str(item.get("path") or item.get("uri") or ""))
+
+
+def live_user_references(graph: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Reference records with any replaced upload already applied.
+
+    Records that still describe their original file are returned untouched, so
+    callers that mutate them keep writing through to ``metadata``.
+    """
+    uploads = _reference_node_uploads(graph)
+    records: list[dict[str, Any]] = []
+    for item in graph_user_references(graph):
+        live = uploads.get(str(item.get("id") or ""))
+        if live is None:
+            records.append(item)
+            continue
+        merged = dict(item)
+        merged.update(live)
+        merged["path"] = str(live["path"])
+        merged["uri"] = str(live["uri"])
+        records.append(merged)
+    return records
+
+
 def user_reference_paths(graph: dict[str, Any] | None, *, kind: str) -> list[Path]:
     wanted = str(kind or "").strip().lower()
     suffixes = {
@@ -132,12 +197,13 @@ def user_reference_paths(graph: dict[str, Any] | None, *, kind: str) -> list[Pat
         KIND_VIDEO: _VIDEO_SUFFIXES,
         KIND_AUDIO: _AUDIO_SUFFIXES,
     }.get(wanted, set())
+    uploads = _reference_node_uploads(graph)
     paths: list[Path] = []
     seen: set[str] = set()
     for item in graph_user_references(graph):
         if str(item.get("kind") or "").strip().lower() != wanted:
             continue
-        path = _existing_file(str(item.get("path") or item.get("uri") or ""))
+        path = _record_file(item, uploads)
         if path is None or path.suffix.lower() not in suffixes:
             continue
         key = str(path.resolve())
@@ -177,13 +243,14 @@ def wired_user_reference_images(ctx: Any, node: dict[str, Any] | None) -> list[P
 
 def identity_reference_image_paths(graph: dict[str, Any] | None) -> list[Path]:
     """Uploads that may depict a subject, so cast cards must not redesign them."""
+    uploads = _reference_node_uploads(graph)
     style_only: set[str] = set()
     for item in graph_user_references(graph):
         if str(item.get("kind") or "").strip().lower() != KIND_IMAGE:
             continue
         if str(item.get("role") or DEFAULT_ROLE).strip().lower() not in STYLE_ONLY_ROLES:
             continue
-        candidate = _existing_file(str(item.get("path") or item.get("uri") or ""))
+        candidate = _record_file(item, uploads)
         if candidate is not None:
             style_only.add(str(candidate.resolve()))
     return [p for p in user_reference_image_paths(graph) if str(p) not in style_only]
@@ -191,9 +258,10 @@ def identity_reference_image_paths(graph: dict[str, Any] | None) -> list[Path]:
 
 def _reference_records_by_path(graph: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     """Upload record behind each existing file, keyed by resolved path."""
+    uploads = _reference_node_uploads(graph)
     records: dict[str, dict[str, Any]] = {}
     for item in graph_user_references(graph):
-        candidate = _existing_file(str(item.get("path") or item.get("uri") or ""))
+        candidate = _record_file(item, uploads)
         if candidate is None:
             continue
         records[str(candidate.resolve())] = item

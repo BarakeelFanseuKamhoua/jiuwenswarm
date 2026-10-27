@@ -19,7 +19,7 @@ from jiuwenswarm.server.runtime.designer.handlers.common import (
     role_output_text,
 )
 from jiuwenswarm.server.runtime.designer.user_references import (
-    graph_user_references,
+    live_user_references,
     identity_reference_images_for_node,
     prompt_slot_roster,
     wired_user_reference_images,
@@ -179,7 +179,7 @@ def _references_for_paths(graph: object, paths: list[str]) -> list[dict]:
     if not wanted or not isinstance(graph, dict):
         return []
     kept: list[dict] = []
-    for item in graph_user_references(graph):
+    for item in live_user_references(graph):
         candidate = Path(str(item.get("path") or item.get("uri") or ""))
         if candidate.is_file() and str(candidate.resolve()) in wanted:
             kept.append(item)
@@ -214,7 +214,7 @@ def _note_unused_references(
     if used or ctx is None:
         return
     graph = ctx.graph if isinstance(ctx.graph, dict) else {}
-    if not graph_user_references(graph):
+    if not live_user_references(graph):
         return
     label = str(node.get("label") or ctx.node_id or "still").strip()
     text = (

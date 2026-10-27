@@ -844,13 +844,13 @@ def build_clip_prompt(
         except Exception:  # noqa: BLE001
             pass
     from jiuwenswarm.server.runtime.designer.user_references import (
-        graph_user_references,
+        live_user_references,
         prompt_slot_roster,
         user_reference_video_path,
         user_reference_audio_path,
     )
 
-    roster = prompt_slot_roster(graph_user_references(graph))
+    roster = prompt_slot_roster(live_user_references(graph))
     if roster:
         parts.append(
             "User reference slots (original files are visual/audio authority). "
