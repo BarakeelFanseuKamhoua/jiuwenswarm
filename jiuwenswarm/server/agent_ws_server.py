@@ -2496,7 +2496,12 @@ class AgentWebSocketServer:
                 "project.get_cron_sessions", "project.pinned_sessions", "chat.cancel",
                 "session.stop", "voice.task.checkpoint.ack",
             }
-            if guarded_method not in unguarded_methods:
+            # 仅广场/目录只读 RPC 跳过会话存活校验（#5886）。不要复用
+            # _is_stateless_method_request：其前缀含 skills.toggle / rebuild 等写操作。
+            if (
+                guarded_method not in unguarded_methods
+                and not self._skips_session_lifecycle_guard(request)
+            ):
                 try:
                     guard(
                         str(guarded_params.get("session_id") or request.session_id or ""),
@@ -3242,6 +3247,34 @@ class AgentWebSocketServer:
                  "agent_groups.", "agent_templates.", "plugin_packages.")
             )
         )
+
+    # Skill plaza / catalog reads that must work even when the chat session
+    # attached by the UI has been permanently deleted (#5886). Write RPCs such
+    # as skills.toggle / skills.rebuild keep going through lifecycle.guard.
+    _SESSION_LIFECYCLE_GUARD_SKIP_METHODS = frozenset({
+        "skills.list",
+        "plugins.list",
+    })
+    _SESSION_LIFECYCLE_GUARD_SKIP_PREFIXES = (
+        "skills.swarmskillshub.",
+        "skills.online_search.",
+    )
+
+    @classmethod
+    def _skips_session_lifecycle_guard(cls, request: AgentRequest) -> bool:
+        """Return True when the RPC must not be blocked by a deleted session.
+
+        Narrower than ``_is_stateless_method_request``: that predicate only
+        means "skip adapter rebuild", and includes write methods under
+        ``skills.*`` / ``plugins.*``. This one is the session-lifecycle
+        bypass for plaza/catalog reads only.
+        """
+        if request.req_method is None:
+            return False
+        method = request.req_method.value
+        if method in cls._SESSION_LIFECYCLE_GUARD_SKIP_METHODS:
+            return True
+        return method.startswith(cls._SESSION_LIFECYCLE_GUARD_SKIP_PREFIXES)
 
     @staticmethod
     def _is_readonly_goal_get_request(request: AgentRequest) -> bool:
