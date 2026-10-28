@@ -14,6 +14,7 @@ import {
   isTeamLeaderContextUsageSnapshot,
   parseContextUsageSnapshot,
 } from '../features/contextUsage/contextUsageModel';
+import { parseSessionTokenUsageSnapshot } from '../types/sessionTokenUsage';
 import {
   Session,
   AgentMode,
@@ -24,6 +25,7 @@ import {
   ContextCompressionRuntime,
   ContextCompressionSummary,
   ContextUsageSnapshot,
+  SessionTokenUsageSnapshot,
   TeamMemberContextCompressionState,
 } from '../types';
 import {
@@ -647,6 +649,7 @@ export interface SessionRuntime {
   /** 新会话草稿值；真实 Session 创建后由后端 metadata 的权威值覆盖。 */
   persistSession: boolean;
   contextUsageSnapshot: ContextUsageSnapshot | null;
+  tokenUsageSnapshot: SessionTokenUsageSnapshot | null;
   teamTaskEvents: TeamTaskEvent[];
   teamTasks: TeamTask[];
   teamTaskProgressBaseline: TaskProgressBaseline;
@@ -713,6 +716,7 @@ function createEmptyRuntime(
     projectDirectory: null,
     persistSession: false,
     contextUsageSnapshot: null,
+    tokenUsageSnapshot: null,
     teamTaskEvents: [],
     teamTasks: [],
     teamTaskProgressBaseline: createTaskProgressBaseline(),
@@ -775,6 +779,7 @@ interface SessionState {
   setConnected: (connected: boolean) => void;
   setAvailableTools: (tools: string[]) => void;
   receiveContextUsage: (payload: unknown) => void;
+  receiveSessionTokenUsage: (payload: unknown) => void;
   setMemoryUsage: (memoryUsage: Partial<MemoryUsage> | null) => void;
   setAvailableModels: (models: ModelEntry[], activeModel?: string) => void;
   setAvailableModelGroups: (groups: ModelGroup[]) => void;
@@ -1164,6 +1169,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         runtimes: {
           ...state.runtimes,
           [sessionId]: { ...runtime, contextUsageSnapshot: snapshot },
+        },
+      };
+    });
+  },
+
+  receiveSessionTokenUsage: (payload) => {
+    const snapshot = parseSessionTokenUsageSnapshot(payload);
+    if (!snapshot) return;
+    set((state) => {
+      const runtime = state.runtimes[snapshot.session_id];
+      if (!runtime) return state;
+      if (
+        runtime.tokenUsageSnapshot
+        && runtime.tokenUsageSnapshot.revision >= snapshot.revision
+      ) {
+        return state;
+      }
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [snapshot.session_id]: { ...runtime, tokenUsageSnapshot: snapshot },
         },
       };
     });
