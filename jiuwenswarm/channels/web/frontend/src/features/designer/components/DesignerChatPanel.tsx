@@ -2,12 +2,13 @@ import { PanelRight, Square, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import SendPlaneIcon from '../../../assets/send_plane.svg?react';
-import ChatModelSelector from '../../../components/ChatPanel/ChatModelSelector';
 import { MessageList } from '../../../components/ChatPanel/MessageList';
 import { InlineQuestionCard } from '../../../components/ChatPanel/InlineQuestionCard';
 import { InteractionSlot } from '../../../components/InteractionSlot';
 import { webClient } from '../../../services/webClient';
 import { ApplicationPluginTaskInputActions } from '../../../applicationPlugins/ApplicationPluginOutlet';
+import { requestSettingsModule } from '../../settings/settingsNavigation';
+import { toast } from '../../../components/ui';
 import { useChatStore } from '../../../stores/chatStore';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { buildConversationModelPayload } from '../../../multi-session/state/conversationModelSelection';
@@ -18,10 +19,12 @@ import {
   composeDesignerSession,
   sendDesignerLeaderMessage,
 } from '../designerEntry';
+import { findDesignModelsProblem } from '../designModelsReadiness';
 import { isDesignerPreviewGraph } from '../designerBootstrapGraph';
 import { useDesignerRunStore } from '../designerRunStore';
 import { useDesignerStore } from '../designerStore';
 import { useDesignerUiStore } from '../designerUiStore';
+import DesignerModelBadge from './DesignerModelBadge';
 import {
   DESIGNER_REF_LIMITS,
   designerReferenceKindFromMime,
@@ -128,6 +131,7 @@ export function DesignerChatPanel() {
     sessionId ? state.runtimes[sessionId]?.selectedModelSelection ?? null : null,
   );
   const setChatModel = useDesignerStore((state) => state.setChatModel);
+  const availableModelCount = useSessionStore((state) => state.chatAvailableModels.length);
   // The director chain resolves its preferred model from graph.metadata.model_name,
   // and leader rounds run on the session selection: keep both in sync so a pick
   // made here takes effect on the next round instead of only relabelling the UI.
@@ -149,6 +153,25 @@ export function DesignerChatPanel() {
       return null;
     }
   }, [sessionId, domainGraph, t]);
+
+  // Design has no model switch: a missing chat model means no leader round can
+  // run at all, so warn here instead of failing only after the user sends
+  // (#5266). Re-checked whenever the catalog size changes, e.g. after the user
+  // fixes Settings in another tab.
+  const [blockedProblem, setBlockedProblem] = useState('');
+  useEffect(() => {
+    if (!sessionId) {
+      setBlockedProblem('');
+      return;
+    }
+    let cancelled = false;
+    void findDesignModelsProblem().then((problem) => {
+      if (!cancelled) setBlockedProblem(problem ?? '');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, availableModelCount]);
 
   useEffect(() => {
     const el = bodyRef.current;
@@ -220,6 +243,12 @@ export function DesignerChatPanel() {
   const handleSend = useCallback(() => {
     const content = draft.trim();
     if ((!content && attachments.length === 0) || chatBusy) return;
+    // Same gate as the landing page: a round needs the chat model and both
+    // generation slots, so refuse loudly instead of failing mid-run (#5266).
+    if (blockedProblem) {
+      toast.open({ content: blockedProblem, variant: 'error' });
+      return;
+    }
     setSending(true);
     const files = attachments.map((item) => item.file);
     void filesToBootstrapReferences(files)
@@ -264,7 +293,7 @@ export function DesignerChatPanel() {
       .finally(() => {
         setSending(false);
       });
-  }, [attachments, chatBusy, domainGraph, draft, sessionId, t]);
+  }, [attachments, blockedProblem, chatBusy, domainGraph, draft, sessionId, t]);
 
   const handleStop = useCallback(() => {
     if (!sessionId) return;
@@ -391,6 +420,25 @@ export function DesignerChatPanel() {
             event.target.value = '';
           }}
         />
+        {/* The leader cannot run without a chat model: warn before the user
+            types, and point straight at the Settings page (#5266). */}
+        {blockedProblem ? (
+          <div
+            className="designer-chat-panel__model-warning"
+            role="status"
+            data-testid="designer-chat-model-warning"
+          >
+            <span className="designer-chat-panel__model-warning-text">{blockedProblem}</span>
+            <button
+              type="button"
+              className="designer-chat-panel__model-warning-action"
+              onClick={() => requestSettingsModule('models')}
+              data-testid="designer-chat-model-warning-action"
+            >
+              {t('designer.models.openModelSettings')}
+            </button>
+          </div>
+        ) : null}
         {/* Canvas chat sidebar: hide attach control; landing prompt keeps its own attach UI. */}
         <div className="designer-chat-panel__composer-box">
           <textarea
@@ -404,7 +452,8 @@ export function DesignerChatPanel() {
           />
           <div className="designer-chat-panel__composer-actions">
             {sessionId ? (
-              <ChatModelSelector sessionId={sessionId} disabled={chatBusy} />
+              /* No model switch on the canvas: show the model Design runs on (#5266). */
+              <DesignerModelBadge sessionId={sessionId} />
             ) : null}
             <ApplicationPluginTaskInputActions
               eligible={
@@ -438,6 +487,7 @@ export function DesignerChatPanel() {
                     disabled={chatBusy || !canSend}
                     onClick={handleSend}
                     aria-label={t('designer.chat.send')}
+                    title={blockedProblem || undefined}
                     data-testid="designer-chat-panel-send"
                   >
                     <SendPlaneIcon className="designer-chat-panel__send-icon" aria-hidden />
