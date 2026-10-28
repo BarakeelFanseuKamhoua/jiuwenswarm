@@ -9,10 +9,36 @@ import i18n from '../../i18n';
 import { webRequest } from '../../services/webClient';
 import { useSessionStore } from '../../stores/sessionStore';
 import { isGenerationSlotConfigured } from '../settings/modules/agent/generationModels';
+import { designChatModelReady } from './designChatModelState';
 import type { ModelEntry } from '../../types';
 
 function asConfigBoolean(value: unknown): boolean {
   return value === true || String(value ?? '').trim().toLowerCase() === 'true';
+}
+
+/**
+ * The design chat model problem, or null when a chat model is available.
+ *
+ * Design has no model switch: every leader round runs on the chat model from
+ * Settings > Agent, so a missing one blocks both the landing prompt and the
+ * canvas chat dock. The startup models fetch can time out while the runtime is
+ * still warming up — re-verify with a fresh `models.list` before claiming the
+ * chat model is missing, and fail open when the re-check cannot complete.
+ */
+export async function findDesignChatModelProblem(): Promise<string | null> {
+  if (designChatModelReady(useSessionStore.getState().chatAvailableModels)) return null;
+  try {
+    const resp = await webRequest<{ models?: ModelEntry[]; active_model?: string }>('models.list');
+    const models = Array.isArray(resp?.models) ? resp.models : [];
+    if (designChatModelReady(models)) {
+      useSessionStore.getState().setAvailableModels(models, resp?.active_model ?? '');
+      return null;
+    }
+  } catch {
+    // Cannot verify right now: do not claim the chat model is missing.
+    return null;
+  }
+  return i18n.t('designer.models.chatMissing');
 }
 
 /**
@@ -21,29 +47,18 @@ function asConfigBoolean(value: unknown): boolean {
  * Never throws: a failed config read must not block entry.
  */
 export async function findDesignModelsProblem(): Promise<string | null> {
-  let config: Record<string, unknown> = {};
+  const problems: string[] = [];
+  // Chat readiness needs no config read, so it must not be skipped when
+  // `config.get` times out while the runtime is warming up.
+  const chatProblem = await findDesignChatModelProblem();
+  if (chatProblem) problems.push(chatProblem);
+  let config: Record<string, unknown> | null = null;
   try {
     config = (await webRequest<Record<string, unknown>>('config.get')) ?? {};
   } catch {
-    return null;
+    config = null;
   }
-  const problems: string[] = [];
-  if (useSessionStore.getState().chatAvailableModels.length === 0) {
-    // The startup models fetch can time out while the runtime is still warming
-    // up — re-verify with a fresh `models.list` before claiming the chat model
-    // is missing, and fail open when the re-check itself cannot complete.
-    try {
-      const resp = await webRequest<{ models?: ModelEntry[]; active_model?: string }>('models.list');
-      const models = Array.isArray(resp?.models) ? resp.models : [];
-      if (models.length > 0) {
-        useSessionStore.getState().setAvailableModels(models, resp?.active_model ?? '');
-      } else {
-        problems.push(i18n.t('designer.models.chatMissing'));
-      }
-    } catch {
-      // Cannot verify right now: do not claim the chat model is missing.
-    }
-  }
+  if (!config) return problems.length > 0 ? problems.join(' ') : null;
   if (!asConfigBoolean(config.video_gen_enabled)) {
     problems.push(i18n.t('designer.models.videoOff'));
   } else if (!isGenerationSlotConfigured(config, 'video_gen')) {
