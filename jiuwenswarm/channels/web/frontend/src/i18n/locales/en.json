@@ -101,6 +101,8 @@
       "bootstrapError": "Failed to build the workflow. Please try again later.",
       "notImplemented": "Not implemented",
       "send": "Send",
+      "stop": "Stop",
+      "stopError": "Could not stop. Please try again.",
       "attach": "Add reference media",
       "removeAttachment": "Remove reference",
       "attachHint": "Images, video, or audio. Up to 5 images, 1 video, and 1 audio file.",
@@ -145,7 +147,7 @@
       "editPlaceholder": "Edit text content…",
       "aspectRatio": "Aspect ratio",
       "resolution": "Resolution",
-      "duration": "Duration",
+      "duration": "Video duration",
       "count": "Count",
       "browseFiles": "Browse files",
       "dropHint": "Or drag into this area",
@@ -163,6 +165,7 @@
       "videoTitle": "Video settings",
       "imageTitle": "Image settings",
       "durationValue": "{{seconds}}s",
+      "durationUnit": "s",
       "loading": "Loading generation settings…",
       "loadError": "Could not load generation settings: {{message}}",
       "saveError": "Settings not saved: {{message}}"
@@ -245,16 +248,6 @@
     },
     "edge": {
       "delete": "Delete connection"
-    },
-    "revision": {
-      "title": "Choose which version to keep",
-      "hint": "{{label}} was regenerated. The original is still here — pick which one to keep.",
-      "original": "Original",
-      "incoming": "New version",
-      "keepOriginal": "Keep original",
-      "keepIncoming": "Use new version",
-      "pending": "Needs choice",
-      "compare": "Compare versions"
     },
     "materials": {
       "title": "Outputs",
@@ -518,7 +511,15 @@
       "customModels": "Custom models",
       "tabsLabel": "Model settings categories",
       "modelsTab": "Models",
-      "jevTab": "Jev",
+      "jevTab": "Decision models",
+      "jevTabHelp": "Optional. Enhances decision-making for browser subagents and multi-model collaboration in single-agent conversations.",
+      "jevModels": "Jev models",
+      "jevDeleteFailed": "Failed to clear the Jev configuration. Please try again.",
+      "jevEmpty": "No Jev model configured",
+      "jevEmptyDescription": "Add one Jev model to share between browser decisions and multi-model collaboration.",
+      "jevDisplayNamePlaceholder": "Enter a model display name",
+      "jevApiBasePlaceholder": "e.g. https://jev.example.com/v1",
+      "jevModelHint": "Enter a Jev model name supported by the provider, such as typesafe/jev-1.13 or jev-1.13.0.",
       "modelGroups": "Model groups",
       "modelGroupsManagement": "Model group management",
       "empty": "No models configured",
@@ -692,7 +693,6 @@
         "contextWindowInvalid": "Enter a valid positive context window, such as 256K, 1M, or 1310720",
         "aliasRequired": "Model display name is required",
         "aliasConflict": "Model display name must be globally unique and cannot match another model's display name",
-        "modelNameConflict": "Model ID cannot match another configuration's model display name",
         "modelGroupNameConflict": "Model group name must be globally unique and cannot match another model group name"
       },
       "testConnection": "Test connection",
@@ -746,8 +746,8 @@
       "providerTypesafe": "TypeSafe",
       "providerCustom": "Custom",
       "jevConfig": "Jev Model Configuration",
-      "jevKeyMissing": "Jev API key is not configured. Configure it under Models > Jev first.",
-      "clearSharedJevConfirm": "Clear this provider's Jev key? Browser decisions will return to LLM only, and JEV decision for multi-model collaboration will be disabled.",
+      "jevKeyMissing": "Jev API key is not configured. Add a Jev model under Models > Decision models first.",
+      "clearSharedJevConfirm": "Clear the current Jev model's API key and display name? Connection settings will be retained. Browser decisions will return to LLM only, and JEV decision for multi-model collaboration will be disabled.",
       "jevBaseInvalid": "Enter an HTTPS API base URL without credentials, query parameters or fragments",
       "jevModelInvalid": "Enter a valid OpenRouter Jev model, such as typesafe/jev-1.13"
     },
@@ -828,7 +828,7 @@
       },
       "decision_mode": {
         "title": "Browser decisions",
-        "description": "Choose who decides each browser step. Jev modes use the shared configuration under Models > Jev."
+        "description": "Choose who decides each browser step. Jev modes use the shared configuration under Models > Decision models."
       },
       "decision_provider": {
         "title": "Jev provider",
@@ -1017,7 +1017,7 @@
       },
       "moa_jev_enabled": {
         "title": "JEV decision",
-        "description": "Use JEV configured under Models > Jev to verify execution progress. When off, use the selected model group’s default model."
+        "description": "Use Jev configured under Models > Decision models to decide whether to consult reference models. When off, use the selected model group’s default model to verify execution progress."
       },
       "moa_verifier_interval": {
         "title": "Verification interval (rounds)",
@@ -1077,14 +1077,15 @@
         "cancel": "Cancel",
         "start": "Start",
         "starting": "Starting…",
-        "summary": "{{count}} Agent(s) selected · {{nodes}} node(s)",
-        "emptyNodes": "The selection has no complete step to diagnose. Steps that are not fully covered were left out.",
+        "summary": "{{count}} Agent(s) selected · {{spans}} OTel span(s)",
+        "emptyNodes": "The selection has no complete OTel span to diagnose. Spans that are not fully covered (start and end) were left out.",
         "lastTurn": "The selection includes the main agent's last response. Artifact evaluation and process-anomaly diagnosis will be attempted.",
-        "nodeLimit": "The selection contains {{count}} nodes, over the limit of {{limit}}. Narrow the range.",
+        "nodeLimit": "The selection contains {{count}} OTel spans, over the limit of {{limit}}. Narrow the range.",
         "running": "A diagnosis is already in progress",
-        "noData": "There is no trajectory to diagnose yet"
+        "noData": "There is no trajectory to diagnose yet",
+        "replay": "Read-only replay cannot be diagnosed; exit replay first"
       },
-      "summary": "{{agents}} Agents · {{nodes}} nodes",
+      "summary": "{{agents}} Agents · {{spans}} OTel spans",
       "toolbar": {
         "scale": "Trajectory scale",
         "time": "Time",
@@ -1180,6 +1181,7 @@
         "cancelDelete": "Cancel",
         "deleteRunning": "A diagnosis in progress cannot be deleted"
       },
+      "rewardResult": "Artifact evaluation",
       "rewardDimensions": "{{count}} scored dimensions, {{perfect}} of them need no improvement; select a category to see its dimensions, the rest are broken down in the findings",
       "rewardTotal": "Total {{score}}",
       "artifactFix": "Artifact fix",
@@ -1201,7 +1203,11 @@
         "user": "User note"
       },
       "signalSourceLabel": "Source: {{source}}",
-      "attributionLabel": "Attribution: {{kind}}",
+      "attributionLabel": "{{kind}}",
+      "causeTopic": "{{category}}: {{dimension}}",
+      "findingDimension": "Dimension",
+      "findingProblem": "Problem",
+      "findingReason": "Cause",
       "attributionKind": {
         "artifact": "Artifact",
         "skill": "Skill",
@@ -1236,10 +1242,12 @@
         "partial": "Task partly completed"
       },
       "ttseHint": "Extract reusable experience from this trajectory; TTSE generates and saves it in the background",
+      "ttseTriggeredNotice": "TTSE has been triggered and will finish generating and saving the experience in the background",
       "ttseReady": "Experience available",
       "skillFillPrefix": "Evolve the relevant skill according to the following suggestions:",
+      "artifactFillPrefix": "Optimize according to the following suggestions:",
       "ttseResult": {
-        "triggered": "Triggered; TTSE is generating and saving the experience in the background",
+        "triggered": "Triggered",
         "failed": "Trigger failed"
       },
       "blocked": "Unavailable: {{reason}}",
@@ -1259,7 +1267,8 @@
     },
     "composer": {
       "collapse": "Collapse composer",
-      "expand": "Expand composer"
+      "expand": "Expand composer",
+      "unavailable": "The composer is unavailable during diagnosis"
     },
     "layout": {
       "hideSessions": "Collapse sessions",
@@ -1535,7 +1544,6 @@
       "chooseSource": "Choose what to share",
       "muteMic": "Mute microphone",
       "unmuteMic": "Unmute microphone",
-      "cardHold": "Voice is paused until you click the confirmation card above",
       "muteSpeaker": "Mute model audio",
       "unmuteSpeaker": "Unmute model audio",
       "stopSharing": "Stop screen sharing",
@@ -2027,6 +2035,9 @@
       "slack": "Enable the Slack channel. Disabling preserves existing settings.",
       "whatsapp": "Enable the WhatsApp channel. Disabling preserves existing settings."
     },
+    "availability": {
+      "xiaoyi": "Xiaoyi does not currently support scheduled tasks or file delivery."
+    },
     "configurationGuide": "Configuration guide",
     "addConfiguration": "Add configuration",
     "enable": "Enable",
@@ -2508,6 +2519,7 @@
       "web": "Web (web)",
       "tui": "Terminal (tui)",
       "xiaoyi": "Xiaoyi (xiaoyi)",
+      "xiaoyiUnsupported": "Xiaoyi (unsupported)",
       "feishu": "Lark (feishu)",
       "dingtalk": "DingTalk (dingtalk)",
       "whatsapp": "WhatsApp (whatsapp)",
@@ -3950,6 +3962,7 @@
     "messageQueue": "Message Queue",
     "crossSessionMessageQueue": "Cross-session messages",
     "localMessageQueue": "Local messages",
+    "turnStarting": "Starting…",
     "turnRunning": "Running",
     "turnElapsed": "Took",
     "workCompleted": "Completed {{duration}}",

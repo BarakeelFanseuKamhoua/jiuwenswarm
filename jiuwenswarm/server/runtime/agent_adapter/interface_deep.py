@@ -142,7 +142,7 @@ from jiuwenswarm.server.runtime.agent_adapter.permission_rail_group import (
 )
 from jiuwenswarm.server.runtime.agent_adapter.permission_continuation import (
     discard_pending_permission_interrupt_for_target,
-    discard_permission_continuation, validate_manual_resume,
+    discard_permission_continuation, has_live_pending_interrupt, validate_manual_resume,
 )
 from jiuwenswarm.server.runtime.agent_adapter.permission_dispatch import (
     ROOT_PERMISSION_ANSWER_KEY as _ROOT_PERMISSION_ANSWER_KEY,
@@ -507,6 +507,7 @@ from jiuwenswarm.agents.harness.common.tools.multimodal_config import (
 from jiuwenswarm.agents.harness.common.tools.video_tools import video_understanding
 from jiuwenswarm.agents.harness.common.tools.file_delivery_policy import is_send_file_enabled
 from jiuwenswarm.agents.harness.common.tools.heartbeat_policy import is_heartbeat_supported
+from jiuwenswarm.common.scheduled_task_policy import is_scheduled_task_supported
 from jiuwenswarm.agents.harness.common.tools.image_tools import generate_image
 from jiuwenswarm.agents.harness.common.tools.video_gen_tools import (
     generate_video,
@@ -1098,6 +1099,7 @@ _CRON_TOOL_NAMES = frozenset(
         "cron_delete_job",
         "cron_toggle_job",
         "cron_preview_job",
+        "cron_run_now",
     }
 )
 
@@ -2306,6 +2308,23 @@ class JiuWenSwarmDeepAdapter:
         ]
         return any(
             not is_heartbeat_supported(candidate)
+            for candidate in candidates
+            if candidate
+        )
+
+    def _scheduled_task_unsupported_for_current_request(
+        self, session_id: str | None = None
+    ) -> bool:
+        """Detect Xiaoyi from request context or the channel-qualified session ID."""
+        context = getattr(self, "_runtime_cron_tool_context", None)
+        candidates = [
+            str(getattr(context, "channel_id", "") or "").strip(),
+            str(session_id or getattr(self, "_parent_session_id", "") or "")
+            .strip()
+            .split("_", 1)[0],
+        ]
+        return any(
+            not is_scheduled_task_supported(candidate)
             for candidate in candidates
             if candidate
         )
@@ -3566,6 +3585,53 @@ class JiuWenSwarmDeepAdapter:
         waiters = getattr(lock, "_waiters", None)
         return any(not waiter.cancelled() for waiter in list(waiters or ()))
 
+    @classmethod
+    def _is_managed_voice_task_input(cls, request: AgentRequest) -> bool:
+        """Return whether this is a new full-duplex managed task, not an answer.
+
+        Its prompt is Host-authored (``source``, ``log_as_user: false``), so it
+        is not an external user dispatch and must not cut over Permission.
+        """
+        params = request.params if isinstance(request.params, dict) else {}
+        return (
+            request.channel_id == "video_tool"
+            and request.req_method == ReqMethod.CHAT_SEND
+            and bool(params.get("managed_task_binding"))
+            and not cls._is_interrupt_resume_dispatch(params)
+        )
+
+    def session_has_pending_interrupt(self, session_id: str) -> bool:
+        """Read-only: whether Core still waits for an answer in *session_id*."""
+        if not self._is_session_scoped_adapter:
+            child = self._session_adapters.get(self._session_adapter_key(session_id))
+            return bool(child is not None and child.session_has_pending_interrupt(session_id))
+        sid = self._resolve_interrupt_session_id(session_id)
+        return has_live_pending_interrupt(
+            self._instance, sid, self._deep_agent_loop_session_id()
+        )
+
+    async def _clear_stale_interrupt_before_managed_voice_task(
+        self, request: AgentRequest
+    ) -> None:
+        """Start a managed voice task as a new turn without answering a card (#5486).
+
+        Fed to a pending interrupt, Core reads the task prompt as the answer,
+        re-asks the old approval and replays its tool. Leftover state whose
+        tool results all exist, or that no longer matches the context, is
+        cleared. A question the user still has to
+        answer is neither answered nor cleared; the task is refused and the
+        full-duplex queue holds it until that question settles.
+        """
+        sid = self._resolve_interrupt_session_id(request.session_id)
+        loop_sid = self._deep_agent_loop_session_id()
+        if has_live_pending_interrupt(self._instance, sid, loop_sid):
+            raise RuntimeError("会话里有待回答的审批，语音任务需等待审批处理后再执行。")
+        await discard_pending_permission_interrupt_for_target(
+            self._instance, sid, loop_sid,
+            cancel_reason="managed_voice_task_drops_stale_interrupt", only_stale=True,
+            drop_unproven=True,
+        )
+
     @staticmethod
     def _is_host_permission_update_input(request: AgentRequest) -> bool:
         """Return whether this request may consume a pending Permission version."""
@@ -4392,6 +4458,9 @@ class JiuWenSwarmDeepAdapter:
                 return False
         if not stale_interactive_input:
             if self._should_inject_into_existing_interaction(request.params):
+                return False
+            if self._is_managed_voice_task_input(request):
+                await self._clear_stale_interrupt_before_managed_voice_task(request)
                 return False
             if not self._is_host_permission_update_input(request):
                 return False
@@ -13209,7 +13278,6 @@ class JiuWenSwarmDeepAdapter:
         方法注册，send_file 首次注册后改走 ``update_runtime_context``。
         这里每次请求只做幂等检查和运行时上下文更新。
         """
-        self._ensure_cron_tools_registered(session_id)
         self._ensure_session_messaging_tools_registered(session_id, channel_id)
 
         # send_file 工具：由 channels.<channel>.send_file_allowed 控制。工具实例只建一次，
@@ -13227,6 +13295,13 @@ class JiuWenSwarmDeepAdapter:
             cron_channel = str(_CRON_TOOL_CHANNEL_ID.get() or "").strip()
             if cron_channel:
                 channel = cron_channel
+        if (
+            is_scheduled_task_supported(channel)
+            and not self._scheduled_task_unsupported_for_current_request(session_id)
+        ):
+            self._ensure_cron_tools_registered(session_id)
+        else:
+            self._drop_cron_tools(channel)
         # 心跳工具按渠道能力下发：小艺渠道不下发（见 heartbeat_policy）。
         # 工具由 HeartbeatRail 在 agent 组装期注册，这里每请求兜一次摘除，
         # 覆盖 rail 已被缓存、首次构建时渠道尚未确定的情况。
@@ -13266,6 +13341,38 @@ class JiuWenSwarmDeepAdapter:
                     project_dir=self._project_dir,
                     require_execution_authorization=require_send_authorization,
                 )
+
+    def _drop_cron_tools(self, channel: str) -> None:
+        """Remove cron tools from a channel that does not support scheduled tasks."""
+        ability_manager = getattr(self._instance, "ability_manager", None)
+        removed: list[str] = []
+        if ability_manager is not None:
+            remover = getattr(ability_manager, "remove_ability", None) or getattr(
+                ability_manager, "remove", None
+            )
+            for existing in list(ability_manager.list() or []):
+                name = getattr(existing, "name", "")
+                if name not in _CRON_TOOL_NAMES or remover is None:
+                    continue
+                try:
+                    remover(name)
+                    removed.append(name)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[JiuWenSwarmDeepAdapter] cron tool remove skipped name=%s",
+                        name,
+                        exc_info=True,
+                    )
+        if removed:
+            self._prune_tool_cards(set(removed))
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] cron tools removed for channel=%s: %s",
+                channel,
+                sorted(removed),
+            )
+        self._cron_tools_registered_language = None
+        self._cron_tools_registered_allow_create = None
+        self._cron_tools_registered_allow_update = None
 
     def _drop_heartbeat_tools(self, channel: str) -> None:
         """把已注册的心跳工具从模型可见工具集里摘掉（渠道不支持心跳）。
@@ -14718,9 +14825,13 @@ class JiuWenSwarmDeepAdapter:
             request.params
         ):
             return
-        if self._should_inject_into_existing_interaction(
-            request.params
-        ) or not self._is_host_permission_update_input(request):
+        if self._should_inject_into_existing_interaction(request.params):
+            return
+        if self._is_managed_voice_task_input(request):
+            # No cutover or cancel_round: a voice task never supersedes a card.
+            await self._clear_stale_interrupt_before_managed_voice_task(request)
+            return
+        if not self._is_host_permission_update_input(request):
             return
         if not self._permission_dispatch.publish_cutover(handoff):
             # Queue empty but Core may still hold INTERRUPTION_KEY — clear it.
@@ -19589,6 +19700,10 @@ class JiuWenSwarmDeepAdapter:
             **projection,
             "task_id": subagent_id,
             "description": description,
+            # Parent-stream history persist uses payload.content; without it the
+            # empty-shell filter drops roster frames and refresh loses the panel
+            # (GitCode #4887). Mirror description so parent history rediscovers ids.
+            "content": description,
             "legacy_status": legacy_status,
             "index": index,
             "total": total,

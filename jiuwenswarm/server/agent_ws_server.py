@@ -106,6 +106,7 @@ from jiuwenswarm.server.runtime.session.session_history import (
     enqueue_history_request_completion,
     history_exists,
     is_valid_session_id,
+    list_session_subagent_ids,
     load_history_records,
     read_history_cursor_page,
     read_member_history_records,
@@ -1188,7 +1189,7 @@ class AgentWebSocketServer:
         # dispatch occurs before the legacy handler chain below.
         self._adapter_registry = AdapterRegistry()
         for adapter in (
-            VoiceTaskServerAdapter(),
+            VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt),
             SessionAdapter(),
             WorkspaceFileAdapter(),
             MemoryAdapter(),
@@ -2075,7 +2076,7 @@ class AgentWebSocketServer:
                 self._install_session_message_service()
                 self._adapter_registry = AdapterRegistry()
                 for adapter in (
-                    VoiceTaskServerAdapter(),
+                    VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt),
                     SessionAdapter(),
                     WorkspaceFileAdapter(),
                     MemoryAdapter(),
@@ -2495,7 +2496,12 @@ class AgentWebSocketServer:
                 "project.get_cron_sessions", "project.pinned_sessions", "chat.cancel",
                 "session.stop", "voice.task.checkpoint.ack",
             }
-            if guarded_method not in unguarded_methods:
+            # 仅广场/目录只读 RPC 跳过会话存活校验（#5886）。不要复用
+            # _is_stateless_method_request：其前缀含 skills.toggle / rebuild 等写操作。
+            if (
+                guarded_method not in unguarded_methods
+                and not self._skips_session_lifecycle_guard(request)
+            ):
                 try:
                     guard(
                         str(guarded_params.get("session_id") or request.session_id or ""),
@@ -3241,6 +3247,34 @@ class AgentWebSocketServer:
                  "agent_groups.", "agent_templates.", "plugin_packages.")
             )
         )
+
+    # Skill plaza / catalog reads that must work even when the chat session
+    # attached by the UI has been permanently deleted (#5886). Write RPCs such
+    # as skills.toggle / skills.rebuild keep going through lifecycle.guard.
+    _SESSION_LIFECYCLE_GUARD_SKIP_METHODS = frozenset({
+        "skills.list",
+        "plugins.list",
+    })
+    _SESSION_LIFECYCLE_GUARD_SKIP_PREFIXES = (
+        "skills.swarmskillshub.",
+        "skills.online_search.",
+    )
+
+    @classmethod
+    def _skips_session_lifecycle_guard(cls, request: AgentRequest) -> bool:
+        """Return True when the RPC must not be blocked by a deleted session.
+
+        Narrower than ``_is_stateless_method_request``: that predicate only
+        means "skip adapter rebuild", and includes write methods under
+        ``skills.*`` / ``plugins.*``. This one is the session-lifecycle
+        bypass for plaza/catalog reads only.
+        """
+        if request.req_method is None:
+            return False
+        method = request.req_method.value
+        if method in cls._SESSION_LIFECYCLE_GUARD_SKIP_METHODS:
+            return True
+        return method.startswith(cls._SESSION_LIFECYCLE_GUARD_SKIP_PREFIXES)
 
     @staticmethod
     def _is_readonly_goal_get_request(request: AgentRequest) -> bool:
@@ -8103,22 +8137,43 @@ class AgentWebSocketServer:
                 )
             next_seq += 1
 
+        done_payload: dict[str, Any] = {
+            "event_type": "history.message",
+            "status": "done",
+            "session_id": str(session_id or ""),
+            "subagent_id": str(response_subagent_id or subagent_id or ""),
+            "total_pages": total_pages,
+            "page_idx": page,
+            "cursor": request_cursor if cursor_protocol else None,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "snapshot_id": snapshot_id,
+            "snapshot_end": snapshot_end,
+        }
+        # Parent history cold-start: advertise on-disk subagent buckets so the
+        # frontend can fetch per-subagent transcripts even when parent history
+        # never persisted chat.subtask_update roster frames (GitCode #4887).
+        if (
+            is_initial_history_batch
+            and not (response_subagent_id or subagent_id)
+            and isinstance(session_id, str)
+            and session_id.strip()
+        ):
+            try:
+                discovered_ids = list_session_subagent_ids(session_id.strip())
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[history.get] list_session_subagent_ids failed: session_id=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                discovered_ids = []
+            if discovered_ids:
+                done_payload["subagent_ids"] = discovered_ids
         done_chunk = AgentResponseChunk(
             request_id=request.request_id,
             channel_id=request.channel_id,
-            payload={
-                "event_type": "history.message",
-                "status": "done",
-                "session_id": str(session_id or ""),
-                "subagent_id": str(response_subagent_id or subagent_id or ""),
-                "total_pages": total_pages,
-                "page_idx": page,
-                "cursor": request_cursor if cursor_protocol else None,
-                "next_cursor": next_cursor,
-                "has_more": has_more,
-                "snapshot_id": snapshot_id,
-                "snapshot_end": snapshot_end,
-            },
+            payload=done_payload,
             is_complete=True,
         )
         wire_done = encode_agent_chunk_for_wire(

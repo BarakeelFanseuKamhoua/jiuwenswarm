@@ -259,7 +259,7 @@ def register_video_live_handler(
                 "url": QWEN_OMNI_PROXY_PATH,
                 "model": config.model,
                 "voice": config.voice,
-                "tools": qwen_omni_tools(),
+                "tools": qwen_omni_tools(queue_manager=True),
                 "reply_language": settings.reply_language(),
                 **context_payload,
             },
@@ -273,6 +273,7 @@ def register_video_live_handler(
         search_session_id = str(params.get("search_session_id") or "").strip()
         question = str(params.get("question") or "").strip()
         tool_context = str(params.get("tool_context") or "").strip()
+        approval_context = str(params.get("approval_context") or "").strip()
         frame_time_range = str(params.get("frame_time_range") or "").strip()
         reply_language = joyai_provider.normalize_response_language(
             params.get("reply_language", settings.reply_language())
@@ -317,6 +318,18 @@ def register_video_live_handler(
                 error=(
                     "tool_context must not exceed "
                     f"{joyai_provider.MAX_TOOL_CONTEXT_CHARS} characters"
+                ),
+                code="BAD_REQUEST",
+            )
+            return
+        if len(approval_context) > joyai_provider.MAX_APPROVAL_CONTEXT_CHARS or (
+            approval_context and request_kind != "user"
+        ):
+            await channel.send_response(
+                ws, req_id, ok=False,
+                error=(
+                    "approval_context is allowed only for user requests, up to "
+                    f"{joyai_provider.MAX_APPROVAL_CONTEXT_CHARS} characters"
                 ),
                 code="BAD_REQUEST",
             )
@@ -368,14 +381,17 @@ def register_video_live_handler(
             "frame_chars": len(frame_data_url),
             "frame_time_range": frame_time_range,
             "tool_context_chars": len(tool_context),
+            "approval_context_chars": len(approval_context),
         }
         await asyncio.to_thread(_append_joyai_log, {**request_log, "stage": "requested"})
         try:
             model_instruction = instruction
             if request_kind == "user":
-                model_instruction = (
-                    joyai_provider.ground_user_instruction(instruction, tool_context, reply_language, restore_instructions=restore_instructions)
-                    if restore_instructions else joyai_provider.ground_user_instruction(instruction, tool_context, reply_language)
+                extra = {"restore_instructions": restore_instructions} if restore_instructions else {}
+                if approval_context:
+                    extra["approval_context"] = approval_context
+                model_instruction = joyai_provider.ground_user_instruction(
+                    instruction, tool_context, reply_language, **extra
                 )
             request_args = [frame_data_url, model_instruction, upstream_session_id]
             if frame_time_range:
@@ -451,6 +467,9 @@ def register_video_live_handler(
         scheduling = None
         task_title = ""
         operation_count = 0
+        queue_management = None
+        search_job = None
+        tools_used: list[str] = []
         while operation_count < 3:
             delegation = str(result.get("delegation") or "").strip()
             if result.get("decision") != "delegation" or not delegation.startswith("{"):
@@ -463,12 +482,13 @@ def register_video_live_handler(
                     raise ValueError("Invalid task operation")
                 if value.get("name") not in {
                     "jiuwen_delegate",
+                    "jiuwen_queue_manage",
                     "jiuwen_task_query",
                     "jiuwen_task_modify",
                     "jiuwen_task_cancel",
+                    # Approval cards only; operate() refuses information forms.
+                    "jiuwen_task_answer",
                 }:
-                    if value.get("name") == "jiuwen_task_answer":
-                        raise ValueError("JoyAI voice form answers are disabled; complete the on-screen form")
                     raise ValueError("Unsupported task operation")
                 owner, scope = await search_manager.scope(
                     ws, {"search_session_id": search_session_id}
@@ -479,6 +499,28 @@ def register_video_live_handler(
                         "call_id": f"{params.get('command_id') or req_id}:{operation_count}",
                     }
                 )
+                if call.name == "jiuwen_queue_manage":
+                    if request_kind != "user":
+                        raise ValueError("Queue management requires an explicit user request")
+                    management_instruction = question or instruction
+                    queue_management = await search_manager.manage_queue_call(
+                        owner, scope, call, management_instruction,
+                        allow_answers=False, reply_language=reply_language,
+                    )
+                    tools_used.append(call.name)
+                    response_text = queue_management.get("response", "")
+                    if queue_management.get("state") == "incomplete":
+                        response_text = (
+                            "Queue management did not finish. Check the task list and scheduled jobs for any changes already applied."
+                            if reply_language == "en" or (
+                                reply_language == "match" and not re.search(r"[\u4e00-\u9fff]", question or instruction)
+                            ) else "队列管理未全部完成，请查看任务列表和定时任务确认已执行的操作。"
+                        )
+                    # Only the manager's receipt-based answer reaches chat/TTS.
+                    # Never speak JoyAI's unconfirmed acknowledgement or ask it
+                    # to issue another operation for the same request.
+                    result = {**result, "decision": "response", "response": response_text, "delegation": ""}
+                    break
                 if call.name == "jiuwen_delegate":
                     task_title = call.arguments.get("title", "")
                     scheduling = {
@@ -488,7 +530,9 @@ def register_video_live_handler(
                     }
                     result = {**result, "delegation": call.task}
                     break
-                receipt = await search_manager.operate(owner, scope, call, user_instruction=question or instruction)
+                receipt = await search_manager.operate(
+                    owner, scope, call, ws=ws, approvals_only=True, user_instruction=question or instruction,
+                )
                 operation_count += 1
                 # Feed facts through the same provider conversation, including ids
                 # needed for query -> modify. A receipt cannot manufacture a task.
@@ -510,8 +554,6 @@ def register_video_live_handler(
             )
             return
 
-        search_job = None
-        tools_used: list[str] = []
         delegation = str(result.get("delegation") or "").strip()
         if result.get("decision") == "delegation" and delegation:
             try:
@@ -548,6 +590,7 @@ def register_video_live_handler(
                 "timing": result.get("timing"),
                 "tools_used": tools_used,
                 "search_job": search_job,
+                **({"queue_management": queue_management} if queue_management is not None else {}),
             },
         )
         await channel.send_response(
@@ -557,6 +600,7 @@ def register_video_live_handler(
             payload={
                 "response": result.get("response"),
                 "search_job": search_job,
+                **({"queue_management": queue_management} if queue_management is not None else {}),
             },
         )
 
