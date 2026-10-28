@@ -6,7 +6,7 @@ import { isComfyuiNodeConfig } from './comfyuiWorkflow';
 import { isUploadedMediaNode } from './mediaNodeConfig';
 import type { GenerationKind } from './designGenerationReadiness';
 
-type MaybeNode = {
+export type MaybeNode = {
   type?: string;
   config?: Record<string, unknown> | object;
   output_ref?: { uri?: string } | null;

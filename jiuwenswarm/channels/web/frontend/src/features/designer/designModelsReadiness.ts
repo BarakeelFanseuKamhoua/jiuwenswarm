@@ -9,7 +9,8 @@ import i18n from '../../i18n';
 import { webRequest } from '../../services/webClient';
 import { useSessionStore } from '../../stores/sessionStore';
 import { designChatModelReady } from './designChatModelState';
-import { generationProblemFromConfig } from './designGenerationReadiness';
+import { generationProblemFromConfig, type GenerationKind } from './designGenerationReadiness';
+import { nodeGenerationKind, type MaybeNode } from './designerNodeGenerationKind';
 import type { ModelEntry } from '../../types';
 
 /**
@@ -35,6 +36,34 @@ export async function findDesignChatModelProblem(): Promise<string | null> {
     return null;
   }
   return i18n.t('designer.models.chatMissing');
+}
+
+/**
+ * Problems blocking a run of `nodes` (a whole workflow, or one node), or null.
+ * Only the media kinds those nodes actually generate with are checked, so a
+ * text-only graph is not blocked by an image slot it would never call, and the
+ * chat model keeps its existing handling (see `findDesignModelsProblem`).
+ */
+export async function findDesignRunProblem(nodes: readonly MaybeNode[]): Promise<string | null> {
+  const kinds = new Set<GenerationKind>();
+  for (const node of nodes) {
+    const kind = nodeGenerationKind(node);
+    if (kind) kinds.add(kind);
+  }
+  if (kinds.size === 0) return null;
+  let config: Record<string, unknown> | null = null;
+  try {
+    config = (await webRequest<Record<string, unknown>>('config.get')) ?? {};
+  } catch {
+    config = null;
+  }
+  if (!config) return null;
+  const problems: string[] = [];
+  for (const kind of kinds) {
+    const problem = generationProblemFromConfig(config, kind);
+    if (problem) problems.push(problem);
+  }
+  return problems.length > 0 ? problems.join(' ') : null;
 }
 
 /**
