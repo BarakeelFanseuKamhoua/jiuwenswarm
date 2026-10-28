@@ -8,13 +8,9 @@
 import i18n from '../../i18n';
 import { webRequest } from '../../services/webClient';
 import { useSessionStore } from '../../stores/sessionStore';
-import { isGenerationSlotConfigured } from '../settings/modules/agent/generationModels';
 import { designChatModelReady } from './designChatModelState';
+import { generationProblemFromConfig } from './designGenerationReadiness';
 import type { ModelEntry } from '../../types';
-
-function asConfigBoolean(value: unknown): boolean {
-  return value === true || String(value ?? '').trim().toLowerCase() === 'true';
-}
 
 /**
  * The design chat model problem, or null when a chat model is available.
@@ -59,15 +55,9 @@ export async function findDesignModelsProblem(): Promise<string | null> {
     config = null;
   }
   if (!config) return problems.length > 0 ? problems.join(' ') : null;
-  if (!asConfigBoolean(config.video_gen_enabled)) {
-    problems.push(i18n.t('designer.models.videoOff'));
-  } else if (!isGenerationSlotConfigured(config, 'video_gen')) {
-    problems.push(i18n.t('designer.models.videoMissing'));
-  }
-  if (!asConfigBoolean(config.visual_gen_enabled)) {
-    problems.push(i18n.t('designer.models.imageOff'));
-  } else if (!isGenerationSlotConfigured(config, 'visual_gen')) {
-    problems.push(i18n.t('designer.models.imageMissing'));
+  for (const kind of ['video', 'image'] as const) {
+    const problem = generationProblemFromConfig(config, kind);
+    if (problem) problems.push(problem);
   }
   return problems.length > 0 ? problems.join(' ') : null;
 }
