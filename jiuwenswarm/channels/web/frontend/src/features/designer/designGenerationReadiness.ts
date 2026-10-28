@@ -3,7 +3,6 @@
 // reports exactly the wording the landing page uses.
 
 import i18n from '../../i18n';
-import { webRequest } from '../../services/webClient';
 import {
   isGenerationSlotConfigured,
   type GenerationSlot,
@@ -36,19 +35,4 @@ export function generationProblemFromConfig(
     return i18n.t(`designer.models.${kind}Missing`);
   }
   return null;
-}
-
-/**
- * Fetch the config and report the generation problem. Never throws: when the
- * config cannot be read the action is allowed to try, and the node's own error
- * carries the reason instead of blocking on a guess.
- */
-export async function findGenerationProblem(kind: GenerationKind): Promise<string | null> {
-  let config: Record<string, unknown> = {};
-  try {
-    config = (await webRequest<Record<string, unknown>>('config.get')) ?? {};
-  } catch {
-    return null;
-  }
-  return generationProblemFromConfig(config, kind);
 }
