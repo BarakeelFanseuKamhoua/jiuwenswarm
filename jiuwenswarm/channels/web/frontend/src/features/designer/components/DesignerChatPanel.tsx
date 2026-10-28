@@ -8,6 +8,7 @@ import { InteractionSlot } from '../../../components/InteractionSlot';
 import { webClient } from '../../../services/webClient';
 import { ApplicationPluginTaskInputActions } from '../../../applicationPlugins/ApplicationPluginOutlet';
 import { requestSettingsModule } from '../../settings/settingsNavigation';
+import { toast } from '../../../components/ui';
 import { useChatStore } from '../../../stores/chatStore';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { buildConversationModelPayload } from '../../../multi-session/state/conversationModelSelection';
@@ -18,7 +19,7 @@ import {
   composeDesignerSession,
   sendDesignerLeaderMessage,
 } from '../designerEntry';
-import { findDesignChatModelProblem } from '../designModelsReadiness';
+import { findDesignModelsProblem } from '../designModelsReadiness';
 import { isDesignerPreviewGraph } from '../designerBootstrapGraph';
 import { useDesignerRunStore } from '../designerRunStore';
 import { useDesignerStore } from '../designerStore';
@@ -157,15 +158,15 @@ export function DesignerChatPanel() {
   // run at all, so warn here instead of failing only after the user sends
   // (#5266). Re-checked whenever the catalog size changes, e.g. after the user
   // fixes Settings in another tab.
-  const [chatModelProblem, setChatModelProblem] = useState('');
+  const [blockedProblem, setBlockedProblem] = useState('');
   useEffect(() => {
     if (!sessionId) {
-      setChatModelProblem('');
+      setBlockedProblem('');
       return;
     }
     let cancelled = false;
-    void findDesignChatModelProblem().then((problem) => {
-      if (!cancelled) setChatModelProblem(problem ?? '');
+    void findDesignModelsProblem().then((problem) => {
+      if (!cancelled) setBlockedProblem(problem ?? '');
     });
     return () => {
       cancelled = true;
@@ -242,8 +243,12 @@ export function DesignerChatPanel() {
   const handleSend = useCallback(() => {
     const content = draft.trim();
     if ((!content && attachments.length === 0) || chatBusy) return;
-    // A design round cannot run without the chat model; the banner says why.
-    if (chatModelProblem) return;
+    // Same gate as the landing page: a round needs the chat model and both
+    // generation slots, so refuse loudly instead of failing mid-run (#5266).
+    if (blockedProblem) {
+      toast.open({ content: blockedProblem, variant: 'error' });
+      return;
+    }
     setSending(true);
     const files = attachments.map((item) => item.file);
     void filesToBootstrapReferences(files)
@@ -288,7 +293,7 @@ export function DesignerChatPanel() {
       .finally(() => {
         setSending(false);
       });
-  }, [attachments, chatBusy, chatModelProblem, domainGraph, draft, sessionId, t]);
+  }, [attachments, blockedProblem, chatBusy, domainGraph, draft, sessionId, t]);
 
   const handleStop = useCallback(() => {
     if (!sessionId) return;
@@ -417,13 +422,13 @@ export function DesignerChatPanel() {
         />
         {/* The leader cannot run without a chat model: warn before the user
             types, and point straight at the Settings page (#5266). */}
-        {chatModelProblem ? (
+        {blockedProblem ? (
           <div
             className="designer-chat-panel__model-warning"
             role="status"
             data-testid="designer-chat-model-warning"
           >
-            <span className="designer-chat-panel__model-warning-text">{chatModelProblem}</span>
+            <span className="designer-chat-panel__model-warning-text">{blockedProblem}</span>
             <button
               type="button"
               className="designer-chat-panel__model-warning-action"
@@ -479,10 +484,10 @@ export function DesignerChatPanel() {
                   <button
                     type="button"
                     className="designer-chat-panel__send"
-                    disabled={chatBusy || !canSend || Boolean(chatModelProblem)}
+                    disabled={chatBusy || !canSend}
                     onClick={handleSend}
                     aria-label={t('designer.chat.send')}
-                    title={chatModelProblem || undefined}
+                    title={blockedProblem || undefined}
                     data-testid="designer-chat-panel-send"
                   >
                     <SendPlaneIcon className="designer-chat-panel__send-icon" aria-hidden />

@@ -4,6 +4,8 @@ import { isDesignerPreviewGraph } from './designerBootstrapGraph';
 import { designerGraphClient } from './designerGraphClient';
 import { useDesignerStore } from './designerStore';
 import { derivePrimaryAction, type DesignerRunPrimaryAction } from './designerLayerRun';
+import { findGenerationProblem } from './designGenerationReadiness';
+import { nodeGenerationKind } from './designerNodeGenerationKind';
 import { isActiveDesignerRun, designerRunFailureMessage } from './designerRunView';
 import {
   DESIGNER_LEADER_NODE_ID,
@@ -260,6 +262,17 @@ export const useDesignerRunStore = create<DesignerRunStore>((set, get) => ({
 
   rerunNode: async (graph, nodeId) => {
     if (get().isRunning || !nodeId) return;
+    // No model, no run: regenerating an image / video node with its Settings
+    // slot off or incomplete can only fail, so report the same reason the
+    // landing page uses instead of dispatching a doomed job (#5266).
+    const kind = nodeGenerationKind(graph.nodes.find((node) => node.id === nodeId));
+    if (kind) {
+      const problem = await findGenerationProblem(kind);
+      if (problem) {
+        set({ runError: problem, runWarning: null });
+        return;
+      }
+    }
     await persistBeforeRun();
     set({ runError: null, runWarning: null });
     try {
