@@ -937,9 +937,8 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
           provider: config.provider || 'realtime',
         });
         setModel(config.model);
-        if (config.provider === 'joyai') {
-          await getJoyAIProvider(config.reply_language).start(config.context_restore?.token);
-          return;
+        if (config.provider !== 'qwen_omni') {
+          throw new Error(t('videoLive.qwenOnly'));
         }
         const videoFrames = new RealtimeVideoFrameScheduler(1_000);
         const session = createRealtimeDuplexSession(
@@ -1084,7 +1083,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
                   search_session_id: searchSessionId,
                   frame_data_url: framesRef.current.at(-1)?.data_url || '',
                 },
-                { timeoutMs: call.name === 'jiuwen_queue_manage' ? 45_000 : 10_000 },
+                { timeoutMs: call.name === 'jiuwen_queue_manage' ? 0 : 10_000 },
               )
                 .then((action) => {
                   reportRealtimeEvent('qwen_tool_call_receipt', {
