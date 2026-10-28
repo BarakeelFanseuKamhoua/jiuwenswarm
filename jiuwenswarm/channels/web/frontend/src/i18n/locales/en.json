@@ -468,6 +468,7 @@
       "archivedSessionsDeleted": "Deleted {{count}} archived conversations",
       "batchPartialFailure": "{{succeeded}} succeeded, {{failed}} failed.",
       "removedProjectNote": "This project was removed, so its conversations stay hidden from the workspace. Restoring any conversation restores the project too.",
+      "designModeNote": "Design mode doesn't support archiving yet.",
       "errors": {
         "forbidden": "This operation is not supported for this resource",
         "notFound": "The resource no longer exists or has changed. Refresh and try again.",

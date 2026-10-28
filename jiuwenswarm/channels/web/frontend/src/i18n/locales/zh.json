@@ -461,6 +461,7 @@
       "archivedSessionsDeleted": "已删除 {{count}} 个已归档对话",
       "batchPartialFailure": "成功 {{succeeded}} 项，失败 {{failed}} 项。",
       "removedProjectNote": "该项目已移除，其对话暂不显示在工作区。恢复任一对话会一并恢复该项目。",
+      "designModeNote": "Design 模式暂不支持归档。",
       "errors": {
         "forbidden": "该资源不支持此操作",
         "notFound": "资源不存在或已发生变化，请刷新后重试",
