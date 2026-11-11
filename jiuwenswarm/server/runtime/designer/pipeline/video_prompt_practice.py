@@ -39,6 +39,14 @@ _PHRASES: dict[str, dict[str, str]] = {
         "says_offscreen": '{who}, heard offscreen, says: "{line}".',
         "voice_says": 'A voice says: "{line}".',
         "audio": "Audio: {bits}.",
+        "sound_diegetic_only": (
+            "Sound: diegetic sound of this shot only — action sound and room tone; "
+            "no music, no score, no underscore, no ambient music bed."
+        ),
+        "sound_cues_only": (
+            "Sound: {cues} only; no music, no score, no underscore, no ambient music bed."
+        ),
+        "sound_silent": "Sound: silent — no dialogue, no effects, no music.",
         "dialogue_language": "Spoken dialogue is in {name}.",
         "tod_with_lighting": "It is {label}; {lighting}.",
         "tod": "It is {label}.",
@@ -73,6 +81,9 @@ _PHRASES: dict[str, dict[str, str]] = {
         "says_offscreen": "{who}在画外说：“{line}”。",
         "voice_says": "画外音说：“{line}”。",
         "audio": "音乐：{bits}。",
+        "sound_diegetic_only": "声音：仅本镜头的现场音（动作声与环境底噪）；不要配乐、不要背景音乐、不要氛围音床。",
+        "sound_cues_only": "声音：仅{cues}；不要配乐、不要背景音乐、不要氛围音床。",
+        "sound_silent": "声音：静音，无对白、无音效、无音乐。",
         "dialogue_language": "对白使用{name}。",
         "tod_with_lighting": "时间是{label}；{lighting}。",
         "tod": "时间是{label}。",
@@ -292,7 +303,7 @@ def _speech_lines(
 
 
 def film_scored_by_music_node(graph: dict[str, Any] | None) -> bool:
-    """A music node feeding compose owns the film score."""
+    """A music node feeding compose owns the film score, so no clip may score it."""
     nodes = [n for n in ((graph or {}).get("nodes") or []) if isinstance(n, dict)]
     music = {str(n.get("id") or "") for n in nodes if node_pipeline(n) == PIPELINE_MUSIC}
     music.discard("")
@@ -312,21 +323,35 @@ def film_scored_by_music_node(graph: dict[str, Any] | None) -> bool:
 
 
 def _music_line(cfg: dict[str, Any], lang: str = "en", graph: dict[str, Any] | None = None) -> str:
-    """One positive score phrase. Lock rules and generic defaults stay off the call."""
-    # Each clip would otherwise score itself, so the cut jumps and the film carries two scores.
-    if film_scored_by_music_node(graph):
-        return ""
-    bgm = cfg.get("bgm_lock") if isinstance(cfg.get("bgm_lock"), dict) else {}
-    generic = {"cinematic", "soft underscore", "tasteful non-vocal", "same bed across clips"}
-    bits: list[str] = []
-    for key in ("instruments", "style", "mood"):
-        value = str(bgm.get(key) or "").strip().rstrip(".")
-        if not value or value.casefold() in generic or _BAD_DIRECTIVE.search(value):
-            continue
-        bits.append(value)
-    if not bits:
-        return ""
-    return phrase(_PHRASES, lang, "audio", bits=list_separator(lang).join(bits[:3]))
+    """A clip never describes a score.
+
+    The film's music is generated once by the music node and mixed in at compose,
+    so a clip that asked for music made the cut jump and doubled the score. The
+    phrase table and the ``clip_scores_film_music`` validator stay in place to
+    catch a legacy prompt that still carries an in-clip score.
+    """
+    return ""
+
+
+def _sound_line(cfg: dict[str, Any], lang: str = "en") -> str:
+    """The one audio direction every clip gets: diegetic sound, never a score.
+
+    A native-audio video model fills an unspecified track on its own, and it
+    reaches for a music bed first — so a clip prompt that says nothing about
+    sound ends up scoring itself. When the film's music node then fails, that
+    improvised bed is the only music in the cut and reads as BGM that leaked
+    into the clips. Naming the negative explicitly keeps the track diegetic.
+    """
+    if str(cfg.get("audio_policy") or "") == "silent":
+        return phrase(_PHRASES, lang, "sound_silent")
+    cues = [
+        str(c).strip()
+        for c in (cfg.get("sfx") if isinstance(cfg.get("sfx"), list) else [])
+        if str(c).strip() and not _BAD_DIRECTIVE.search(str(c))
+    ][:3]
+    if cues:
+        return phrase(_PHRASES, lang, "sound_cues_only", cues=list_separator(lang).join(cues))
+    return phrase(_PHRASES, lang, "sound_diegetic_only")
 
 
 def exited_ids(cfg: dict[str, Any] | None) -> list[str]:
@@ -501,17 +526,6 @@ def _tod_covered_in_text(text: str, cfg: dict[str, Any], lang: str = "en") -> bo
     return False
 
 
-_CROWD_EXIT_CUES = ("already left", "clear of", "empty of extras", "crowd gone", "人群已经离开")
-_CROWD_IN_FRAME_CUES = ("extras", "crowd", "colleagues", "background", "群众", "人群")
-_CROWD_COVER_CUES: dict[str, tuple[str, ...]] = {
-    "exited": _CROWD_EXIT_CUES,
-    "empty": ("empty", "没有群众"),
-    "in_frame": _CROWD_IN_FRAME_CUES,
-    "background_hold": _CROWD_IN_FRAME_CUES,
-    "off_camera": ("off-camera", "off camera", "不在镜头内"),
-}
-
-
 def ensure_story_lock_coverage(
     prompt: str,
     cfg: dict[str, Any] | None,
@@ -566,19 +580,13 @@ def ensure_story_lock_coverage(
             notes.append("story_cover_style")
 
     # Crowd disposition as positive prose (never CROWD LOCK banners).
+    # The agent's own hold text is authoritative; we only avoid repeating the
+    # exact same sentence, so nothing here classifies prose by keyword.
     crowd = _ensure_crowd_state(cfg)
     hold = _scrub_lock_phrase(str(crowd.get("hold") or ""))
     if hold and hold.lower() not in pl and not _BAD_DIRECTIVE.search(hold):
-        # Avoid restating if disposition words already present.
-        disp = str(crowd.get("disposition") or "").lower()
-        cues = _CROWD_COVER_CUES.get(disp, ())
-        covered = any(w in pl for w in cues)
-        # "crowd gone" / "人群已经离开" contain the in-frame cues but say the opposite.
-        if covered and disp in {"in_frame", "background_hold"}:
-            covered = not any(w in pl for w in _CROWD_EXIT_CUES)
-        if not covered:
-            additions.append(sentence(hold, content_lang))
-            notes.append("story_cover_crowd_state")
+        additions.append(sentence(hold, content_lang))
+        notes.append("story_cover_crowd_state")
 
     # Opening holds when prior shots exist but prose omitted them.
     for hold_line in (cfg.get("pose_holds") or [])[:3]:
@@ -1076,6 +1084,9 @@ def compose_practice_prompt(
     music = _music_line(cfg, lang, graph)
     if music:
         sentences.append(music)
+    sound = _sound_line(cfg, lang)
+    if sound:
+        sentences.append(sound)
     look = _style_phrase(cfg)
     if look and not _BAD_DIRECTIVE.search(look):
         sentences.append(sentence(look, lang))
@@ -1270,8 +1281,13 @@ def prompt_respects_practice(
         if not re.search(r"(?i)\b(?:continue|continues|same setting|same placement|same room)\b", text):
             reasons.append("missing_prior_continue")
     if film_scored_by_music_node(graph):
-        scored = (_music_line(cfg, lang) for lang in _PHRASES)
-        if any(line and line.casefold() in text.casefold() for line in scored):
+        # A clip never writes a score any more, so a hit here is a stale prompt:
+        # match the score label itself rather than a phrase this build emits.
+        labels = [
+            str(_PHRASES[lang].get("audio") or "").split("{bits}")[0].strip().casefold()
+            for lang in _PHRASES
+        ]
+        if any(label and label in text.casefold() for label in labels):
             reasons.append("clip_scores_film_music")
     # Toolbar user edits are authoritative for beat fidelity; do not force stale clip_action.
     if not honor_user_origin:
