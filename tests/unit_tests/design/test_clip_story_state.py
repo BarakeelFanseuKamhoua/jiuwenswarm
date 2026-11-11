@@ -695,16 +695,10 @@ def test_clip_prompt_leaves_the_score_to_a_music_node_feeding_compose() -> None:
         "clip_action": "Alex pours coffee.",
         "bgm_lock": {"instruments": "solo piano and strings", "mood": "warm morning"},
     }
-    unscored = compose_practice_prompt(cfg=cfg, graph={}, action=cfg["clip_action"])
-    assert "solo piano and strings" in unscored
-
-    scored = compose_practice_prompt(cfg=cfg, graph=_scored_graph(), action=cfg["clip_action"])
-    assert "solo piano and strings" not in scored
-
-    detached = _scored_graph()
-    detached["edges"] = detached["edges"][:1]
-    kept = compose_practice_prompt(cfg=cfg, graph=detached, action=cfg["clip_action"])
-    assert "solo piano and strings" in kept
+    # A clip never scores the film, with or without a music node feeding compose.
+    for graph in ({}, _scored_graph()):
+        prompt = compose_practice_prompt(cfg=cfg, graph=graph, action=cfg["clip_action"])
+        assert "solo piano and strings" not in prompt
 
 
 def test_director_rewrites_a_seed_prompt_that_still_scores_the_clip() -> None:
@@ -720,8 +714,9 @@ def test_director_rewrites_a_seed_prompt_that_still_scores_the_clip() -> None:
         "clip_action": "Alex pours coffee.",
         "bgm_lock": {"instruments": "solo piano and strings"},
     }
+    # A legacy prompt written before the music node existed still carries a score.
     seed = compose_practice_prompt(cfg=cfg, graph={}, action=cfg["clip_action"])
-    assert "clip_scores_film_music" not in prompt_respects_practice(seed, cfg=cfg, graph={})
+    seed = f"{seed} Audio: solo piano and strings."
     assert "clip_scores_film_music" in prompt_respects_practice(seed, cfg=cfg, graph=_scored_graph())
 
     approved, notes = director_prepare_video_prompt(

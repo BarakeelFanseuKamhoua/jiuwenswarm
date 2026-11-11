@@ -30,6 +30,10 @@ def test_extract_finished_events_catches_declared_exit() -> None:
     kinds = {e["type"] for e in events}
     assert "exit" in kinds
     assert "beat" in kinds
+    # Crowd exits are no longer inferred from prose; the storyboard agent
+    # declares them, so only character-level exits remain text-derived here.
+    assert "exit" in kinds
+    assert "crowd_exit" not in kinds
 
 
 def test_pose_holds_and_crowd_state_stamped() -> None:
