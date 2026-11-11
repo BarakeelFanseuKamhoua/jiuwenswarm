@@ -59,6 +59,13 @@ def _llm_character_card(
         "name": name,
         "description": str(raw.get("description") or name)[:600],
     }
+    from jiuwenswarm.server.runtime.designer.script_analysis import detect_cast_form
+
+    cast_form, group_size = detect_cast_form(name, card["description"], raw.get("role"))
+    if cast_form:
+        card["cast_form"] = cast_form
+    if group_size:
+        card["cast_group_size"] = group_size[:40]
     parts = normalize_clothing_parts(raw.get("clothing_parts"))
     if not parts:
         earlier = next(
@@ -69,6 +76,36 @@ def _llm_character_card(
     if parts:
         card["clothing_parts"] = parts
     return card
+
+
+def _merge_analysed_cast(
+    cards: list[dict[str, Any]],
+    analysed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep every analysed character in the cast the Director authored.
+
+    The Director writes its own cast cards, and that list can be a strict subset
+    of ``script_analysis.characters``. A character it drops is still staged by
+    the storyboard, so the clip would be generated with no identity plate and
+    the face drifts between shots. Restore the missing ones from the analysis,
+    in analysis order, so every staged character keeps one spec.
+    """
+    merged = list(cards)
+    present: set[str] = set()
+    for card in merged:
+        for cid in card.get("character_ids") or [card.get("id")]:
+            token = str(cid or "").strip()
+            if token:
+                present.add(token)
+    for entry in analysed:
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("id") or "").strip()
+        if not cid or cid in present:
+            continue
+        merged.append(_llm_character_card(entry, len(merged) + 1, analysed))
+        present.add(cid)
+    return merged
 
 
 def _language_rule() -> str:
@@ -1330,6 +1367,7 @@ class Director:
                 code=LLM_API_ERROR,
             )
         from jiuwenswarm.server.runtime.designer.media_model_playbook import (
+            ensure_audio_statement,
             ensure_visual_style_statement,
             synchronize_graph_style_from_brief,
         )
@@ -1338,6 +1376,7 @@ class Director:
             brief_md,
             analysis.get("style_lock") if isinstance(analysis.get("style_lock"), dict) else {},
         )
+        brief_md = ensure_audio_statement(brief_md, meta.get("audio_plan"))
 
         stamped = False
         for node in graph.get("nodes") or []:
@@ -1434,9 +1473,14 @@ class Director:
                 "NO scene specs. Crowd/extras persist across same-setting shots "
                 "unless they exit. Each shot needs timeline, camera, action, "
                 "on_screen, offscreen, cast_actions, featured_cast_ids, setting_id, "
+                "crowd_spec {present,density,placement} decided from the shot's meaning "
+                "in any language (present=true when unnamed people are visible, false only "
+                "when you are confident the shot is empty of them, null when undetermined), "
                 "start_state {pose,seats,facing,on_screen,offscreen}, "
                 "end_state {pose,seats,facing,exited,speech_done,on_screen}, "
-                "continuity_lock, clip_prompt, exiting_character_ids, "
+                "continuity_lock, clip_prompt, exiting_character_ids (REQUIRED: name every "
+                "character whose body leaves this setting during the shot; an exit written only "
+                "in the action prose is lost downstream), "
                 "speech_by_character (map character_id→exact spoken line for this shot; "
                 "empty {} only when nobody speaks in this window), speech_line (joined fallback). "
                 "Same setting_id: next shot start_state MUST match prior end_state. "
@@ -1460,6 +1504,7 @@ class Director:
                 '"action":"...","on_screen":["char_1"],"offscreen":["char_2"],'
                 '"featured_cast_ids":["char_1"],"cast_actions":{"char_1":"..."},'
                 '"ensemble_cast_ids":["char_1","char_2"],"setting_id":"set_1",'
+                '"crowd_spec":{"present":true,"density":"a dozen","placement":"in_frame"},'
                 '"clip_strategy":"compose_from_character_specs",'
                 '"start_state":{"pose":"...","seats":{},"facing":"..."},'
                 '"end_state":{"pose":"...","exited":[],"speech_done":"..."},'
@@ -1503,7 +1548,7 @@ class Director:
                         continue
                     cleaned_chars.append(_llm_character_card(raw, i, characters))
                 if cleaned_chars:
-                    characters = cleaned_chars
+                    characters = _merge_analysed_cast(cleaned_chars, list(analysis.get("characters") or []))
                     analysis["characters"] = characters
                     notes = "Director LLM authored cast + storyboard."
             llm_shots = parsed.get("clips") if isinstance(parsed.get("clips"), list) else []
@@ -1587,6 +1632,28 @@ class Director:
         analysis = ensure_audio_locks_on_analysis(analysis, user_prompt)
         analysis = apply_shot_scope(analysis, user_prompt)
         shots = list(analysis.get("clips") or shots)
+        # The storyboard schema keeps crowd_spec optional for model reliability, so
+        # decide any shot the model left undecided before the graph is built.
+        try:
+            from jiuwenswarm.server.runtime.designer.script_analysis import (
+                apply_shot_crowds,
+                decide_shot_crowds,
+                shot_has_crowd,
+                shots_missing_crowd,
+            )
+
+            if shots_missing_crowd(shots):
+                decided_before = sum(1 for s in shots if isinstance(s, dict) and shot_has_crowd(s))
+                decided = await decide_shot_crowds(shots, timeout_sec=60.0)
+                if decided:
+                    apply_shot_crowds(shots, decided)
+                    analysis["clips"] = shots
+                    decided_after = sum(
+                        1 for s in shots if isinstance(s, dict) and shot_has_crowd(s)
+                    )
+                    meta["crowd_decided_by_llm"] = decided_after - decided_before
+        except Exception:  # noqa: BLE001 — crowd decision is best-effort
+            logger.warning("crowd decision pass skipped", exc_info=True)
         if shots and not user_declined_speech(user_prompt):
             has_line = any(
                 is_spoken_line(str(s.get("speech_line") or ""))
@@ -1796,6 +1863,7 @@ class Director:
                 "Scene specs ARE required — environment-only Qwen images. "
                 "Each shot: clip_index, timeline, camera, action, on_screen, offscreen, "
                 "cast_actions, featured_cast_ids, ensemble_cast_ids, setting_id, "
+                "crowd_spec {present,density,placement}, "
                 "clip_prompt, exiting_character_ids, clip_strategy, "
                 "speech_by_character, speech_line. "
                 "Schema: "
@@ -1859,7 +1927,7 @@ class Director:
                     "the execution graph.",
                     code=LLM_API_ERROR,
                 )
-            characters = cleaned_chars
+            characters = _merge_analysed_cast(cleaned_chars, list(analysis.get("characters") or []))
             analysis["characters"] = characters
             analysis["source"] = "llm"
             source = "llm"
@@ -2283,10 +2351,14 @@ class Director:
                         cfg["crowd_lock"] = crowd
                     break
         if crowd and role != "clip" and "CROWD LOCK" not in prompt:
+            from jiuwenswarm.server.runtime.designer.pipeline.clip_policy import (
+                crowd_present_label,
+            )
+
             prompt = (
                 prompt
-                + f"\nCROWD LOCK: present={crowd.get('present')}; "
-                f"density={crowd.get('density')}. {str(crowd.get('rule') or '')[:280]}"
+                + f"\nCROWD LOCK: present={crowd_present_label(crowd.get('present'))}; "
+                f"density={crowd.get('density') or 'unspecified'}. {str(crowd.get('rule') or '')[:280]}"
             )
             notes.append("inject_crowd_lock")
             changed = True
@@ -2655,8 +2727,13 @@ class Director:
                 include_speech=include_speech,
                 include_music=bool(flags.get("include_music")),
                 clip_embedded=bool(flags.get("clip_embedded")),
+                can_music=bool(routing.get("can_music")),
+                sfx=list(cfg.get("sfx") or []),
+                silent=str(flags.get("policy") or cfg.get("audio_policy") or "") == "silent",
             )
-            missing_lock = any(lock not in prompt for lock in ("LANGUAGE LOCK", "SPEECH LOCK", "BGM LOCK"))
+            missing_lock = any(
+                lock not in prompt for lock in ("LANGUAGE LOCK", "SPEECH LOCK", "BGM LOCK")
+            )
             if block and missing_lock:
                 # Replace soft fragments with full lock block once.
                 if "LANGUAGE LOCK" not in prompt:
@@ -3269,6 +3346,7 @@ class Director:
             ) from exc
 
         from jiuwenswarm.server.runtime.designer.media_model_playbook import (
+            ensure_audio_statement,
             ensure_visual_style_statement,
             synchronize_graph_style_from_brief,
         )
@@ -3277,6 +3355,7 @@ class Director:
             brief,
             analysis.get("style_lock") if isinstance(analysis.get("style_lock"), dict) else {},
         )
+        brief = ensure_audio_statement(brief, meta.get("audio_plan"))
         meta["approved_brief"] = brief
         graph["metadata"] = meta
         synchronize_graph_style_from_brief(graph, brief)
@@ -4225,10 +4304,30 @@ def _lock_free_media_task(cfg: dict[str, Any]) -> str:
     )
 
 
-def _ensure_all_character_specs_precede_clips(graph: DesignerExecutionGraph) -> list[str]:
-    """Every character spec node is a data predecessor of every clip node.
+def _is_stale_char_edge(edge: dict[str, Any], *, sources: set[str], target: str) -> bool:
+    """True for a leftover ``e_char_*`` edge this clip no longer needs."""
+    return (
+        str(edge.get("source") or "") in sources
+        and str(edge.get("target") or "") == target
+        and str(edge.get("id") or "").startswith("e_char_")
+    )
 
-    Guarantees all character specs finish before any compose/edit clip runs.
+
+def _ensure_all_character_specs_precede_clips(graph: DesignerExecutionGraph) -> list[str]:
+    """Each clip waits for the character specs it actually shows.
+
+    The previous rule wired every character spec into every clip, so an aerial
+    or timelapse shot with no on-screen cast still waited for the slowest
+    character sheet in the film (and carried all of their references). The clip
+    already declares its cast, so gate on that set instead:
+
+    - ``character_node_ids`` wins when the clip declares it;
+    - otherwise ``on_screen`` is mapped through each spec's ``character_ids``;
+    - a clip that explicitly declares no cast takes no character edge at all;
+    - a clip that declares neither keeps the whole-ensemble gate (legacy).
+
+    Stale ``e_char_*`` edges from an earlier pass are pruned so the result is
+    idempotent on re-run.
     """
     notes: list[str] = []
     nodes = [n for n in (graph.get("nodes") or []) if isinstance(n, dict)]
@@ -4240,6 +4339,14 @@ def _ensure_all_character_specs_precede_clips(graph: DesignerExecutionGraph) -> 
     ]
     if not character_spec_node_ids:
         return notes
+    # character id -> spec node id, for clips that only declare on_screen.
+    spec_by_character_id: dict[str, str] = {}
+    for sid in character_spec_node_ids:
+        cfg = by_id[sid].get("config") or {}
+        for cid in cfg.get("character_ids") or []:
+            token = str(cid or "").strip()
+            if token:
+                spec_by_character_id.setdefault(token, sid)
     edge_pairs = {
         (str(e.get("source") or ""), str(e.get("target") or ""))
         for e in (graph.get("edges") or [])
@@ -4253,8 +4360,66 @@ def _ensure_all_character_specs_precede_clips(graph: DesignerExecutionGraph) -> 
             continue
         cfg = dict(node.get("config") or {})
         inputs = [str(x) for x in (cfg.get("inputs") or []) if str(x)]
+        declared_nodes = cfg.get("character_node_ids")
+        declared_cast = cfg.get("on_screen")
+        if isinstance(declared_nodes, list) and declared_nodes:
+            gate_ids = [str(x) for x in declared_nodes if str(x) in character_spec_node_ids]
+        elif isinstance(declared_nodes, list) or isinstance(declared_cast, list):
+            # Declared, but nothing on screen: this shot draws no character.
+            gate_ids = []
+            for cid in declared_cast or []:
+                node_id = spec_by_character_id.get(str(cid).strip())
+                if node_id:
+                    gate_ids.append(node_id)
+        else:
+            gate_ids = list(character_spec_node_ids)
+        # A clip names its cast through several fields. Anyone the clip can draw
+        # (including a partially visible face) must keep the spec edge even when
+        # on_screen was written from only one of them. Offscreen/absent cast is
+        # in the scene but not in frame, so they need no identity reference.
+        named: list[str] = list(gate_ids)
+        for key in ("character_ids", "featured_cast_ids", "compose_cast_ids", "identity_ref_ids"):
+            for cid in cfg.get(key) or []:
+                named.append(str(cid))
+        identity_refs = cfg.get("identity_refs")
+        if isinstance(identity_refs, dict):
+            for cid in identity_refs.get("character_ids") or []:
+                named.append(str(cid))
+            for nid in identity_refs.get("character_node_ids") or []:
+                token = str(nid)
+                if token in character_spec_node_ids:
+                    named.append(token)
+        hidden = {
+            str(x)
+            for key in ("offscreen", "off_screen_cast_ids", "exited_ids", "exiting_character_ids")
+            for x in (cfg.get(key) or [])
+        }
+        for token in named:
+            if not token or token in hidden:
+                continue
+            sid = token if token in character_spec_node_ids else spec_by_character_id.get(token)
+            if sid:
+                gate_ids.append(sid)
+        gate_ids = list(dict.fromkeys(gate_ids))
+        gate_set = set(gate_ids)
+        # Prune character gates this clip no longer needs.
+        stale = {
+            (sid, fid)
+            for sid in character_spec_node_ids
+            if sid not in gate_set and (sid, fid) in edge_pairs
+        }
+        if stale:
+            stale_sources = {s for s, _ in stale}
+            graph["edges"] = [
+                e
+                for e in (graph.get("edges") or [])
+                if not _is_stale_char_edge(e, sources=stale_sources, target=fid)
+            ]
+            edge_pairs -= stale
+            inputs = [x for x in inputs if x not in stale_sources]
+            notes.append(f"{fid}: character_spec_gate pruned {len(stale)}")
         changed = False
-        for sid in character_spec_node_ids:
+        for sid in gate_ids:
             if sid not in inputs:
                 inputs.append(sid)
                 changed = True
@@ -4271,7 +4436,7 @@ def _ensure_all_character_specs_precede_clips(graph: DesignerExecutionGraph) -> 
                 edge_pairs.add((sid, fid))
                 notes.append(f"{fid}: character_spec_gate <- {sid}")
                 changed = True
-        if changed:
+        if changed or stale:
             cfg["inputs"] = list(dict.fromkeys(inputs))
             node["config"] = cfg
     return notes
