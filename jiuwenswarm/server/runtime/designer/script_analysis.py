@@ -764,6 +764,176 @@ def _director_pipeline_decisions(
     }
 
 
+def _normalize_shot_crowd(raw: Any) -> dict[str, Any]:
+    """Carry the agent's per-shot crowd decision, preserving the tri-state.
+
+    The storyboard agent decides crowd presence from meaning, in whatever
+    language the shot was written. Python only normalizes; it never inspects
+    the prose. ``present`` stays ``None`` when the agent declared nothing so
+    downstream emits no crowd sentence instead of asserting the set is empty.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    present = raw.get("present")
+    if isinstance(present, bool):
+        out["present"] = present
+    else:
+        text = str(present).strip().lower()
+        if text in {"", "none", "null", "unknown", "unspecified"}:
+            out["present"] = None
+        elif text in {"true", "yes", "present", "1"}:
+            out["present"] = True
+        elif text in {"false", "no", "absent", "0"}:
+            out["present"] = False
+        else:
+            out["present"] = None
+    for key in ("density", "disposition", "placement", "note", "hold"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            out[key] = value[:240]
+    if raw.get("continue") is True:
+        out["continue"] = True
+    return out
+
+
+def shot_has_crowd(shot: Any) -> bool:
+    """True when the storyboard agent already decided this shot's crowd."""
+    if not isinstance(shot, dict):
+        return False
+    spec = shot.get("crowd_spec")
+    return isinstance(spec, dict) and "present" in spec
+
+
+def shots_missing_crowd(shots: list[Any]) -> bool:
+    """True when at least one shot still has no agent crowd decision."""
+    return any(not shot_has_crowd(shot) for shot in shots)
+
+
+def apply_shot_crowds(shots: list[Any], decisions: list[dict[str, Any]]) -> None:
+    """Attach the model's per-shot crowd decisions, matched by shot number.
+
+    Only shots the storyboard left undecided are filled. Overwriting a decided
+    shot would replace a judgement made with the full storyboard context by one
+    made from a single shot's text, which can flip an empty shot to "crowded".
+    """
+    by_index: dict[int, dict[str, Any]] = {}
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("clip_index"))
+        except (TypeError, ValueError):
+            continue
+        normalized = _normalize_shot_crowd(item)
+        if normalized:
+            by_index[idx] = normalized
+    for i, shot in enumerate(shots, start=1):
+        if not isinstance(shot, dict) or shot_has_crowd(shot):
+            continue
+        idx = int(shot.get("clip_index") or i)
+        decision = by_index.get(idx)
+        if decision:
+            shot["crowd_spec"] = decision
+
+
+async def decide_shot_crowds(
+    shots: list[Any],
+    *,
+    timeout_sec: float = 60.0,
+) -> list[dict[str, Any]]:
+    """Ask the model for the crowd decision of each shot, in a focused call.
+
+    Crowd presence is a semantic, language-dependent judgement, so it is asked
+    of the model rather than inferred from the prose. Keeping this separate
+    leaves the main analysis schema compact (long schemas make the chat model
+    return prose) and gives the decision its own turn to think about.
+    """
+    from jiuwenswarm.server.runtime.designer.model_tools import (
+        call_model_tool,
+        model_text_or_raise,
+    )
+
+    payload = []
+    for i, shot in enumerate(shots, start=1):
+        if not isinstance(shot, dict) or shot_has_crowd(shot):
+            continue
+        payload.append(
+            {
+                "clip_index": int(shot.get("clip_index") or i),
+                "setting_id": str(shot.get("setting_id") or ""),
+                "action": str(shot.get("action") or "")[:400],
+                "clip_prompt": str(shot.get("clip_prompt") or "")[:300],
+                "on_screen": list(shot.get("on_screen") or [])[:8],
+            }
+        )
+    if not payload:
+        return []
+    system = (
+        "You judge whether each shot of a storyboard shows an unnamed crowd. "
+        "A crowd means anonymous extras, a congregation, passers-by, an audience, "
+        "or any group sharing one look — regardless of the language the shot is "
+        "written in and regardless of whether those people also have a character id. "
+        "Decide from the shot's meaning; never look for specific words. "
+        'Reply with ONLY a JSON array, one object per shot, no markdown: '
+        '[{"clip_index":1,"present":true,"density":"a dozen","placement":"background"}, ...]. '
+        '"present" is true when unnamed people are visible, false only when you are '
+        'confident the shot is empty of them, null when the shot genuinely does not '
+        'establish one either way. "density" is a short free-text count '
+        '("sparse", "a dozen", "dense"). "placement" is "in_frame", "background", '
+        'or "off_camera". "disposition" may instead be "in_frame", '
+        '"background_hold", "off_camera", "exited", "empty", or "unspecified". '
+        'Set "continue": true to mean the same unnamed group as the previous shot '
+        "in the same setting. Keep one group consistent across a setting and never "
+        "clear a crowd without an exit beat. Output exactly one object for every "
+        "clip_index you were given."
+    )
+    try:
+        result = await asyncio.wait_for(
+            call_model_tool(
+                prompt=json.dumps({"shots": payload}, ensure_ascii=False),
+                system=system,
+                max_tokens=2048,
+            ),
+            timeout=max(8.0, float(timeout_sec)),
+        )
+        if not isinstance(result, dict) or result.get("unavailable") or result.get("ok") is False:
+            return []
+        text = model_text_or_raise(result)
+        items = _parse_json_array(text)
+    except Exception as exc:  # noqa: BLE001 — the decision is best-effort
+        logger.info("crowd decision call failed: %s", exc)
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _parse_json_array(text: str) -> list[Any]:
+    """Return the JSON array embedded in ``text`` (empty on failure)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        parsed = json.loads(raw[start:end + 1])
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _scene_name_is_placeholder(name: str, scene_id: str) -> bool:
+    """True when a scene "name" is just its id (``set_1``, ``scene_2``)."""
+    value = str(name or "").strip().casefold()
+    sid = str(scene_id or "").strip().casefold()
+    if not value:
+        return True
+    if value == sid:
+        return True
+    return value.startswith("set_") and value[4:].isdigit()
+
+
 def _heuristic_lean_shot(
     prompt: str,
     characters: list[dict[str, Any]],
@@ -1101,7 +1271,21 @@ _CAST_GROUP_NOUN_RE = re.compile(
     r"|一族|一伙|一帮|一班|一批|成群)"
 )
 
-_CAST_CN_COUNT_RE = re.compile(r"[两二三四五六七八九十百千数几]+\s*[个位名人群队组批伙帮]")
+# Chinese headcount: number + classifier. A classifier on its own is not a
+# headcount - "三个货架" counts shelves and "三组数据" counts datasets - so the
+# match only stands when the counted noun is a person, like the English tail check.
+_CAST_CN_COUNT_RE = re.compile(
+    r"([两二三四五六七八九十百千数几]+)"
+    r"\s*([个位名人群队组批伙帮])"
+)
+# "位" and "名" only ever count people; the other classifiers need a person noun.
+_CAST_CN_PERSON_CLASSIFIERS = "位名"
+_CAST_CN_PERSON_RE = re.compile(
+    r"(人|们|男|女|老年|孩子|孩童|学生|工人|农民|士兵"
+    r"|警察|医生|护士|顾客|客人|游客|旅客|路人|行人|观众|听众"
+    r"|记者|演员|歌手|舞者|乐手|队员|成员|员工|同事|朋友|家人"
+    r"|居民|市民|村民|运动员|志愿者|表演者|骑士|侍卫|侍女|仆人|掌柜|店小二)"
+)
 
 _CAST_OF_RE = re.compile(r"(?i)\bof\s+$")
 
@@ -1114,9 +1298,10 @@ _CAST_COUNT_WORD_RE = re.compile(
 
 def _cast_group_size(text: str) -> str:
     """Headcount cue, ignoring ages (``aged fifty to seventy-five``)."""
-    cn = _CAST_CN_COUNT_RE.search(text)
-    if cn:
-        return re.sub(r"\s+", "", cn.group(0))
+    for cn in _CAST_CN_COUNT_RE.finditer(text):
+        tail = text[cn.end():cn.end() + 4]
+        if cn.group(2) in _CAST_CN_PERSON_CLASSIFIERS or _CAST_CN_PERSON_RE.match(tail):
+            return re.sub(r"\s+", "", cn.group(0))
     for match in _CAST_COUNT_WORD_RE.finditer(text):
         # A bare number is only a headcount when people follow it, or when it
         # counts the collective just named ("a family of four").
@@ -1202,11 +1387,18 @@ def _normalize_llm_analysis(
     for i, sc in enumerate(scenes[:_MAX_SCENES], start=1):
         if not isinstance(sc, dict):
             continue
+        sid = str(sc.get("id") or f"scene_{i}")
+        name = str(sc.get("name") or "").strip()
+        desc = str(sc.get("description") or "").strip()
+        if not name or _scene_name_is_placeholder(name, sid):
+            # A name equal to the id carries no place information; the video
+            # prompt quotes it, so prefer the description over the bare id.
+            name = desc or ""
         norm_scenes.append(
             {
-                "id": str(sc.get("id") or f"scene_{i}"),
-                "name": str(sc.get("name") or f"Scene {i}"),
-                "description": str(sc.get("description") or ""),
+                "id": sid,
+                "name": name,
+                "description": desc,
             }
         )
     if not norm_scenes:
@@ -1266,6 +1458,9 @@ def _normalize_llm_analysis(
                 if cid and str(v or "").strip():
                     cast_actions[cid] = str(v).strip()[:240]
         strategy = str(sh.get("clip_strategy") or "").strip()
+        crowd = _normalize_shot_crowd(
+            sh.get("crowd_spec") if isinstance(sh.get("crowd_spec"), dict) else sh.get("crowd_lock")
+        )
         setting_id = str(sh.get("setting_id") or sh.get("scene_id") or f"set_{i}").strip()
         # Prefer on_screen as the drawn cast for this shot.
         cids = list(on_screen) or cids
@@ -1302,19 +1497,23 @@ def _normalize_llm_analysis(
             entry["cast_states"] = sh["cast_states"]
         if strategy in {"compose_from_character_specs", "edit_prior_image"}:
             entry["clip_strategy"] = strategy
+        if crowd:
+            entry["crowd_spec"] = crowd
         from jiuwenswarm.common.schema.designer_node_labels import derive_clip_name
 
         entry["title"] = derive_clip_name(entry, fallback_index=i)
         norm_shots.append(entry)
     if not norm_scenes and norm_shots:
-        seen: dict[str, str] = {}
+        seen: dict[str, dict[str, Any]] = {}
         for sh in norm_shots:
             sid = str(sh.get("setting_id") or "").strip() or "set_1"
-            if sid not in seen:
-                seen[sid] = sid
-        norm_scenes = [
-            {"id": sid, "name": sid, "description": ""} for sid in seen
-        ]
+            seen.setdefault(sid, sh)
+        norm_scenes = []
+        for sid, first in seen.items():
+            # The shot carries its setting text under these keys; the older
+            # name was never part of a shot entry, so the fallback was always "".
+            place = str(first.get("setting_description") or first.get("setting") or "").strip()
+            norm_scenes.append({"id": sid, "name": place, "description": place})
     if not norm_shots:
         return None
     audio = parsed.get("audio") if isinstance(parsed.get("audio"), dict) else base.get("audio")
@@ -1540,6 +1739,20 @@ async def analyze_creative_brief(
             + "Per shot also lock staging: cast_actions (posture/doing), blocking positions "
             "(zone/facing), who looks_at whom, who talks_to whom, adjacency (next_to). "
             "Shots grouped by setting_id (different places = different setting_id). "
+            "REQUIRED on every clip: a crowd_spec object — you must decide it, in any "
+            "language, from the shot's meaning, never by spot-checking keywords. It covers "
+            "unnamed extras, congregations, passers-by, audiences, and any group sharing one "
+            "look, whether or not you also gave them a character id: "
+            '"present": true when unnamed people are visible, false only when you are confident '
+            'the shot is empty of them, null only when the shot genuinely does not establish one '
+            'either way. "density" is a short free-text count such as "sparse", "a dozen", '
+            '"dense". "placement" is "in_frame", "background", or "off_camera". "disposition" '
+            'may override placement with "in_frame", "background_hold", "off_camera", "exited", '
+            '"empty", or "unspecified". Set "continue": true to mean "same unnamed group as the '
+            'previous shot in this setting". Never invent a new crowd mid-setting and never '
+            'clear one without an exit beat. '
+            "scenes[]: one per setting_id; name is a real 2-6 word place label (never "
+            "the id, never empty). "
             "Infer one film-wide visual style from the user's exact wording. Preserve "
             "non-English style cues verbatim. If no style can be inferred, use cartoonish "
             "animation with flat shapes, soft rendering, and rounded forms. "
@@ -1567,8 +1780,10 @@ async def analyze_creative_brief(
             '"action":"...","camera":"...","on_screen":["char_1"],'
             '"offscreen":[],"cast_actions":{"char_1":"..."},"featured_cast_ids":["char_1"],'
             '"ensemble_cast_ids":["char_1"],"setting_id":"set_1","clip_prompt":"...","timeline":"0-5s",'
+            '"crowd_spec":{"present":true,"density":"sparse","placement":"background","note":"..."},'
             '"emotion":"setup","irreversible":"what is newly true at the end",'
             '"cast_states":{"char_1":{"wardrobe":"","emotion":"","presence":"on_screen"}}}],'
+            '"scenes":[{"id":"set_1","name":"2-6 word place label","description":"..."}],'
             '"target_clip_count":N'
             + (f',"target_duration_sec":{duration_sec}' if duration_sec else "")
             + (
@@ -1600,7 +1815,8 @@ async def analyze_creative_brief(
                     '"clips":[{"clip_index":1,"action":"...","camera":"...",'
                     '"character_ids":["char_1"],"ensemble_cast_ids":["char_1"],'
                     '"featured_cast_ids":["char_1"],"setting_id":"set_1",'
-                    '"clip_prompt":"...","timeline":"0-5s"}]}'
+                    '"clip_prompt":"...","timeline":"0-5s",'
+                    '"crowd_spec":{"present":true,"density":"sparse","placement":"background"}}]}'
                 )
                 payload["retry"] = True
             sys_msg = sys_msg + language_rules
@@ -1667,6 +1883,7 @@ async def analyze_creative_brief(
         # Prefer LLM; one reinforce if first reply empty/non-JSON (max 2 attempts).
         # Billing / credential failures raise immediately (no second attempt).
         first = await asyncio.wait_for(_call(), timeout=max(3.0, float(timeout_sec)))
+        analysis = None
         if isinstance(first, dict) and first.get("source") == "llm":
             return first
         remaining = max(8.0, float(timeout_sec) * 0.4)
