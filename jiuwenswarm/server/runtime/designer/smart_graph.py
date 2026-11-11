@@ -130,7 +130,13 @@ def bgm_node_wanted(audio: dict[str, Any], prompt: str, *, can_music: bool) -> b
     """A configured music backend puts a BGM node on every film the user did not want silent or unscored."""
     from jiuwenswarm.server.runtime.designer.audio_locks import prompt_declines_music
 
-    return can_music and audio.get("policy") != "silent" and not prompt_declines_music(prompt)
+    # Opt-in: a configured backend renders music only when the request asked for it.
+    return (
+        can_music
+        and bool(audio.get("include_music"))
+        and audio.get("policy") != "silent"
+        and not prompt_declines_music(prompt)
+    )
 
 
 def bgm_node(story_name: str, *, inputs: list[str]) -> dict[str, Any]:
@@ -238,11 +244,16 @@ def _specs_referenced_by_clips(nodes: list[dict[str, Any]]) -> set[str]:
         pipeline = node_pipeline(node)
         if pipeline == "character":
             ids = {str(c) for c in (cfg.get("character_ids") or []) if str(c or "").strip()}
-            names = {
-                str(v).strip().lower()
-                for v in [*(cfg.get("character_names") or []), cfg.get("character_name"), cfg.get("label"), node.get("label")]
-                if str(v or "").strip()
-            }
+            names: set[str] = set()
+            for raw_name in [
+                *(cfg.get("character_names") or []),
+                cfg.get("character_name"),
+                cfg.get("label"),
+                node.get("label"),
+            ]:
+                token = str(raw_name or "").strip()
+                if token:
+                    names.add(token.lower())
             if ids & wanted_chars or names & wanted_names:
                 keep.add(str(node.get("id")))
         elif pipeline == "scene":
@@ -297,12 +308,13 @@ def prune_non_contributing_nodes(graph: DesignerExecutionGraph) -> list[str]:
     # later), so identity plates and scene masters are production assets, never
     # optional branches. Combined cast sheets stay prunable: they duplicate what
     # the per-character plates already provide.
-    keep_specs = {
-        str(n.get("id"))
-        for n in nodes
-        if node_pipeline(n) in {"character", "scene"}
-        and not bool((n.get("config") or {}).get("combined_cast"))
-    }
+    keep_specs: set[str] = set()
+    for n in nodes:
+        if node_pipeline(n) not in {"character", "scene"}:
+            continue
+        if bool((n.get("config") or {}).get("combined_cast")):
+            continue
+        keep_specs.add(str(n.get("id")))
     keep_referenced = keep_specs | _specs_referenced_by_clips(nodes)
     orphan = ids - contributing - keep_referenced
     preserved = sorted(orphan & user_added)
@@ -493,6 +505,8 @@ def _plan_cast_sheets(
                 ),
                 "costume_lock": costume[:320],
                 "clothing_parts": dict(ch.get("clothing_parts") or {}),
+                "cast_form": str(ch.get("cast_form") or ""),
+                "cast_group_size": str(ch.get("cast_group_size") or ""),
             }
         )
 
@@ -742,6 +756,7 @@ def build_smart_video_graph(
     """
     from jiuwenswarm.server.runtime.designer.pipeline.clip_policy import (
         apply_compose_character_specs_setting_policy,
+        crowd_present_label,
     )
 
     prompt_text = prompt.strip()
@@ -964,6 +979,8 @@ def build_smart_video_graph(
                 "character_name": names[0] if names else display,
                 "character_names": names,
                 "costume_lock": wardrobe or str(sheet.get("costume_lock") or ""),
+                "cast_form": str(sheet.get("cast_form") or ""),
+                "cast_group_size": str(sheet.get("cast_group_size") or ""),
             }
             prompt = compose_character_sheet_prompt(cfg=seed_cfg, graph=None, seed="")
         except Exception:  # noqa: BLE001
@@ -989,6 +1006,8 @@ def build_smart_video_graph(
                     "character_names": names,
                     "combined_cast": False,
                     "identity_source": True,
+                    "cast_form": str(sheet.get("cast_form") or ""),
+                    "cast_group_size": str(sheet.get("cast_group_size") or ""),
                     "costume_lock": str(sheet.get("costume_lock") or ""),
                     "style_lock": dict(film_style),
                     "max_image_calls": 1,
@@ -1440,8 +1459,9 @@ def build_smart_video_graph(
         crowd_bits = ""
         if crowd:
             crowd_bits = (
-                f"CROWD LOCK: present={crowd.get('present')}; "
-                f"density={crowd.get('density')}; {str(crowd.get('rule') or '')[:220]} "
+                f"CROWD LOCK: present={crowd_present_label(crowd.get('present'))}; "
+                f"density={crowd.get('density') or 'unspecified'}; "
+                f"{str(crowd.get('rule') or '')[:220]} "
             )
         done_bits = ""
         scene_bits = ""
@@ -1699,15 +1719,42 @@ def build_smart_video_graph(
     backends = detect_audio_backends()
     can_speech = bool(backends.get("can_speech"))
     can_music = bool(backends.get("can_music"))
+    # Three separate audio dimensions: speech and diegetic sound are rendered by
+    # the clips themselves, music is opt-in and only a film-level score.
+    # One film-level score: the music node renders it and compose mixes it in,
+    # so no clip ever asks the video model for music.
+    music_node = bgm_node_wanted(audio, prompt_text, can_music=can_music)
+    audio_plan = {
+        "speech": dict(audio.get("speech_intent") or {}) or {
+            "include": bool(audio.get("include_speech")),
+            "kind": "dialogue" if audio.get("include_speech") else "none",
+        },
+        "sfx": dict(audio.get("sfx_intent") or {}) or {"include": True},
+        "music": {
+            "requested": bool(audio.get("include_music")),
+            "supported": can_music,
+            "rendered": bool(music_node),
+            "node": "n_music" if music_node else "",
+            "notes": "",
+        },
+        "clip_audio": "dialogue + diegetic sound only; a clip never carries music",
+    }
+    audio_support_note = ""
+    if audio_plan["music"]["requested"] and not can_music:
+        audio_support_note = (
+            "BGM 配乐未接入：本次不生成背景音乐，成片为旁白/对白 + 现场音效，不含配乐。 "
+            "(Music/BGM is not available in this build: the film will have narration, "
+            "dialogue and diegetic sound only — no score.)"
+        )
+        audio_plan["music"]["notes"] = audio_support_note
+    audio_plan["note"] = audio_support_note
+    # Dialogue stays clip-native; the score belongs to the music node only.
     clip_embedded = False
-    want_music = False
     if audio.get("policy") != "silent":
         want_speech = bool(audio.get("include_speech"))
-        want_music = bool(
-            audio.get("include_music")
-            or audio.get("policy") in {"optional_music", "music", "speech_and_music"}
-        )
-        clip_embedded = want_speech or want_music
+        # Only dialogue is clip-native; music is opt-in and generated once by the
+        # music node, which is created below from the same flag.
+        clip_embedded = want_speech
         if clip_embedded:
             from jiuwenswarm.server.runtime.designer.audio_locks import stamp_audio_fields_on_clip_config
 
@@ -1745,7 +1792,6 @@ def build_smart_video_graph(
                 pass
 
     compose_inputs = list(shot_ids)
-    music_node = bgm_node_wanted(audio, prompt_text, can_music=can_music)
     if music_node:
         nodes.append(bgm_node(story_name, inputs=["n_brief"]))
         edges.append(_edge("e_brief_music", "n_brief", "n_music"))
@@ -1795,7 +1841,11 @@ def build_smart_video_graph(
                 "video_audio_model": str(backends.get("video_audio_model") or ""),
                 "speech_nodes": False,
                 "music_nodes": music_node,
+                "music_requested": bool(audio.get("include_music")),
+                "music_supported": bool(can_music),
             },
+            "audio_plan": audio_plan,
+            "audio_support_note": audio_support_note,
             "language_lock": str(
                 analysis.get("language_lock") or audio.get("language_lock") or "en"
             ),
