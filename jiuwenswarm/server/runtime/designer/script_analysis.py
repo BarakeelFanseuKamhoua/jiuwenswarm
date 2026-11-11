@@ -797,7 +797,7 @@ def _normalize_shot_crowd(raw: Any) -> dict[str, Any]:
     return out
 
 
-def _shot_has_crowd(shot: Any) -> bool:
+def shot_has_crowd(shot: Any) -> bool:
     """True when the storyboard agent already decided this shot's crowd."""
     if not isinstance(shot, dict):
         return False
@@ -805,12 +805,12 @@ def _shot_has_crowd(shot: Any) -> bool:
     return isinstance(spec, dict) and "present" in spec
 
 
-def _shots_missing_crowd(shots: list[Any]) -> bool:
+def shots_missing_crowd(shots: list[Any]) -> bool:
     """True when at least one shot still has no agent crowd decision."""
-    return any(not _shot_has_crowd(shot) for shot in shots)
+    return any(not shot_has_crowd(shot) for shot in shots)
 
 
-def _apply_shot_crowds(shots: list[Any], decisions: list[dict[str, Any]]) -> None:
+def apply_shot_crowds(shots: list[Any], decisions: list[dict[str, Any]]) -> None:
     """Attach the model's per-shot crowd decisions, matched by shot number.
 
     Only shots the storyboard left undecided are filled. Overwriting a decided
@@ -829,7 +829,7 @@ def _apply_shot_crowds(shots: list[Any], decisions: list[dict[str, Any]]) -> Non
         if normalized:
             by_index[idx] = normalized
     for i, shot in enumerate(shots, start=1):
-        if not isinstance(shot, dict) or _shot_has_crowd(shot):
+        if not isinstance(shot, dict) or shot_has_crowd(shot):
             continue
         idx = int(shot.get("clip_index") or i)
         decision = by_index.get(idx)
@@ -837,7 +837,7 @@ def _apply_shot_crowds(shots: list[Any], decisions: list[dict[str, Any]]) -> Non
             shot["crowd_spec"] = decision
 
 
-async def _decide_shot_crowds(
+async def decide_shot_crowds(
     shots: list[Any],
     *,
     timeout_sec: float = 60.0,
@@ -856,7 +856,7 @@ async def _decide_shot_crowds(
 
     payload = []
     for i, shot in enumerate(shots, start=1):
-        if not isinstance(shot, dict) or _shot_has_crowd(shot):
+        if not isinstance(shot, dict) or shot_has_crowd(shot):
             continue
         payload.append(
             {
@@ -921,6 +921,17 @@ def _parse_json_array(text: str) -> list[Any]:
     except (ValueError, TypeError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _scene_name_is_placeholder(name: str, scene_id: str) -> bool:
+    """True when a scene "name" is just its id (``set_1``, ``scene_2``)."""
+    value = str(name or "").strip().casefold()
+    sid = str(scene_id or "").strip().casefold()
+    if not value:
+        return True
+    if value == sid:
+        return True
+    return value.startswith("set_") and value[4:].isdigit()
 
 
 def _heuristic_lean_shot(
@@ -1224,6 +1235,114 @@ def _reference_reads(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     return reads
 
 
+# A cast entry is either one individual or a shared-look group (a team, a pack,
+# a crowd of residents). ``cast_kind`` already means human/brand_mascot/prop, so
+# the group/one split is tracked separately as ``cast_form``.
+_CAST_SINGLE_RE = re.compile(
+    r"(?i)(\bone\s+(?:man|woman|person|individual|adult|figure|hero|girl|boy)\b"
+    r"|\ba\s+single\s+(?:person|individual|man|woman|figure|hero)\b"
+    r"|\bonly\s+one\b|\bthe only\b|\bsolo\b|\balone\b"
+    r"|独自|单独|一名|一位|一个人|孤身|孤零零|唯一)"
+)
+
+_CAST_PLURAL_PERSON_RE = re.compile(
+    r"(?i)\b(?:adults|men|women|children|kids|people|folks|residents|citizens"
+    r"|commuters|shoppers|students|runners|joggers|players|guests|fans|tourists"
+    r"|passers-?by|bystanders|onlookers|spectators|pedestrians|workers"
+    r"|villagers|monks|soldiers|dancers|musicians|singers|pilgrims|worshippers"
+    r"|vendors|teens|teenagers|colleagues|visitors|travellers|travelers"
+    r"|neighbours|neighbors|strangers|relatives|elders|seniors|athletes"
+    r"|exercisers|swimmers|cyclists|volunteers|performers|members)\b"
+)
+
+# Collectives that are groups by definition, in either authoring language.
+# Chinese is matched by whole compound words only: a bare 群/队/组/班/帮/众
+# would also match inside 排队, 组织, 上班, 帮忙 and 观众-shaped words that are
+# not a group, so each cue carries its own disambiguating characters.
+_CAST_GROUP_NOUN_RE = re.compile(
+    r"(?i)(\bcrowd\b|\bgroup\b|\bteam\b|\bensemble\b|\bpack\b|\bflock\b|\bherd\b"
+    r"|\baudience\b|\bcongregation\b|\bfamily\b|\bcouple\b|\bduo\b|\btrio\b|\btwins?\b"
+    r"|\bcrew\b|\bextras\b|\btownsfolk\b|\bprocession\b"
+    r"|团队|群体|人群|群众|群众演员|众人|大家|家族|家族成员|同事|工人们|孩子们"
+    r"|市民|居民|观众|听众|路人|行人|游客|旅客|乘客|顾客|旁观者|围观者|看客"
+    r"|队伍|小队|大队|车队|球队|乐队|舞队|合唱团|仪仗队|方阵|列队"
+    r"|上班族|学生|学生们|年轻人|老人们|老年人|居民们|顾客们|朋友们"
+    r"|晨练者|运动员|志愿者|表演者|晨练市民"
+    r"|一族|一伙|一帮|一班|一批|成群)"
+)
+
+# Chinese headcount: number + classifier. A classifier on its own is not a
+# headcount - "三个货架" counts shelves and "三组数据" counts datasets - so the
+# match only stands when the counted noun is a person, like the English tail check.
+_CAST_CN_COUNT_RE = re.compile(
+    r"([两二三四五六七八九十百千数几]+)"
+    r"\s*([个位名人群队组批伙帮])"
+)
+# "位" and "名" only ever count people; the other classifiers need a person noun.
+_CAST_CN_PERSON_CLASSIFIERS = "位名"
+_CAST_CN_PERSON_RE = re.compile(
+    r"(人|们|男|女|老年|孩子|孩童|学生|工人|农民|士兵"
+    r"|警察|医生|护士|顾客|客人|游客|旅客|路人|行人|观众|听众"
+    r"|记者|演员|歌手|舞者|乐手|队员|成员|员工|同事|朋友|家人"
+    r"|居民|市民|村民|运动员|志愿者|表演者|骑士|侍卫|侍女|仆人|掌柜|店小二)"
+)
+
+_CAST_OF_RE = re.compile(r"(?i)\bof\s+$")
+
+_CAST_COUNT_WORD_RE = re.compile(
+    r"(?i)(a\s+dozen|dozens|a\s+few|several|many|numerous|scores"
+    r"|\b(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty"
+    r"|thirty|fifty|hundred)\b)"
+)
+
+
+def _cast_group_size(text: str) -> str:
+    """Headcount cue, ignoring ages (``aged fifty to seventy-five``)."""
+    for cn in _CAST_CN_COUNT_RE.finditer(text):
+        tail = text[cn.end():cn.end() + 4]
+        if cn.group(2) in _CAST_CN_PERSON_CLASSIFIERS or _CAST_CN_PERSON_RE.match(tail):
+            return re.sub(r"\s+", "", cn.group(0))
+    for match in _CAST_COUNT_WORD_RE.finditer(text):
+        # A bare number is only a headcount when people follow it, or when it
+        # counts the collective just named ("a family of four").
+        tail = text[match.end():match.end() + 48]
+        head = text[max(0, match.start() - 8):match.start()]
+        if _CAST_PLURAL_PERSON_RE.search(tail) or _CAST_OF_RE.search(head):
+            return re.sub(r"\s+", " ", match.group(0)).strip()
+    return ""
+
+
+def detect_cast_form(name: Any, description: Any = "", role: Any = "") -> tuple[str, str]:
+    """Return ``(cast_form, group_size)`` for one cast entry.
+
+    ``group`` when the entry is a shared-look crowd; the sheet then draws the
+    whole group instead of one stand-in, which every shot asking for a seated
+    team or a running pack would otherwise contradict. Cues are read from any
+    authoring language, and a collective name outranks a one-person plate; with
+    no cue the entry stays ``single`` so nothing about a one-person character
+    changes.
+    """
+    text = " ".join(str(v or "").strip() for v in (name, description, role)).strip()
+    if not text:
+        return "", ""
+    name_text = str(name or "").strip()
+    # A collective subject names the group, so a plate that describes one
+    # stand-in member does not shrink it: "路人" with "one adult passer-by"
+    # still draws a small shared-look group of passers-by.
+    named_group = bool(name_text) and bool(
+        _CAST_GROUP_NOUN_RE.search(name_text) or _CAST_PLURAL_PERSON_RE.search(name_text)
+    )
+    if not named_group and _CAST_SINGLE_RE.search(text):
+        return "single", ""
+    size = _cast_group_size(text)
+    # A plural person noun already means more than one person, so it is a group
+    # even without a count or a collective noun ("seniors in the park").
+    group_cue = named_group or _CAST_GROUP_NOUN_RE.search(text) or _CAST_PLURAL_PERSON_RE.search(text)
+    if size or group_cue:
+        return "group", size
+    return "single", ""
+
+
 def _normalize_llm_analysis(
     parsed: dict[str, Any],
     base: dict[str, Any],
@@ -1255,6 +1374,11 @@ def _normalize_llm_analysis(
             "description": desc,
             "match_terms": _match_terms_for_character(name, desc),
         }
+        cast_form, group_size = detect_cast_form(name, desc, ch.get("role"))
+        if cast_form:
+            entry["cast_form"] = cast_form
+        if group_size:
+            entry["cast_group_size"] = group_size[:40]
         norm_chars.append(entry)
     if not norm_chars and not allow_empty_cast:
         return None
@@ -1263,11 +1387,18 @@ def _normalize_llm_analysis(
     for i, sc in enumerate(scenes[:_MAX_SCENES], start=1):
         if not isinstance(sc, dict):
             continue
+        sid = str(sc.get("id") or f"scene_{i}")
+        name = str(sc.get("name") or "").strip()
+        desc = str(sc.get("description") or "").strip()
+        if not name or _scene_name_is_placeholder(name, sid):
+            # A name equal to the id carries no place information; the video
+            # prompt quotes it, so prefer the description over the bare id.
+            name = desc or ""
         norm_scenes.append(
             {
-                "id": str(sc.get("id") or f"scene_{i}"),
-                "name": str(sc.get("name") or f"Scene {i}"),
-                "description": str(sc.get("description") or ""),
+                "id": sid,
+                "name": name,
+                "description": desc,
             }
         )
     if not norm_scenes:
@@ -1373,14 +1504,16 @@ def _normalize_llm_analysis(
         entry["title"] = derive_clip_name(entry, fallback_index=i)
         norm_shots.append(entry)
     if not norm_scenes and norm_shots:
-        seen: dict[str, str] = {}
+        seen: dict[str, dict[str, Any]] = {}
         for sh in norm_shots:
             sid = str(sh.get("setting_id") or "").strip() or "set_1"
-            if sid not in seen:
-                seen[sid] = sid
-        norm_scenes = [
-            {"id": sid, "name": sid, "description": ""} for sid in seen
-        ]
+            seen.setdefault(sid, sh)
+        norm_scenes = []
+        for sid, first in seen.items():
+            # The shot carries its setting text under these keys; the older
+            # name was never part of a shot entry, so the fallback was always "".
+            place = str(first.get("setting_description") or first.get("setting") or "").strip()
+            norm_scenes.append({"id": sid, "name": place, "description": place})
     if not norm_shots:
         return None
     audio = parsed.get("audio") if isinstance(parsed.get("audio"), dict) else base.get("audio")
@@ -1618,6 +1751,8 @@ async def analyze_creative_brief(
             '"empty", or "unspecified". Set "continue": true to mean "same unnamed group as the '
             'previous shot in this setting". Never invent a new crowd mid-setting and never '
             'clear one without an exit beat. '
+            "scenes[]: one per setting_id; name is a real 2-6 word place label (never "
+            "the id, never empty). "
             "Infer one film-wide visual style from the user's exact wording. Preserve "
             "non-English style cues verbatim. If no style can be inferred, use cartoonish "
             "animation with flat shapes, soft rendering, and rounded forms. "
@@ -1648,6 +1783,7 @@ async def analyze_creative_brief(
             '"crowd_spec":{"present":true,"density":"sparse","placement":"background","note":"..."},'
             '"emotion":"setup","irreversible":"what is newly true at the end",'
             '"cast_states":{"char_1":{"wardrobe":"","emotion":"","presence":"on_screen"}}}],'
+            '"scenes":[{"id":"set_1","name":"2-6 word place label","description":"..."}],'
             '"target_clip_count":N'
             + (f',"target_duration_sec":{duration_sec}' if duration_sec else "")
             + (
