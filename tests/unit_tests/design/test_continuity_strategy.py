@@ -12,21 +12,24 @@
     }
 
 
-def test_the_storyboard_shot_count_is_never_merged_away(monkeypatch) -> None:
+def test_by_default_shots_render_in_parallel(monkeypatch) -> None:
     from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
-    monkeypatch.setattr(cs, "_vision_available", lambda: False)
+    monkeypatch.delenv(cs.CONTINUITY_ENV, raising=False)
+    monkeypatch.setattr(cs, "_vision_available", lambda: True)
     shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
 
     out, strategy = cs.apply_continuity_plan(shots, max_seconds=15, beat_seconds=5)
 
+    assert strategy == cs.STRATEGY_SINGLE_CLIP
     assert len(out) == 2
-    assert strategy != cs.STRATEGY_SINGLE_CLIP
+    assert out[1]["camera"] == "medium / eye-level"
 
 
 def test_without_vision_the_following_shot_keeps_a_locked_wide_camera(monkeypatch) -> None:
     from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
+    monkeypatch.setenv(cs.CONTINUITY_ENV, "observe")
     monkeypatch.setattr(cs, "_vision_available", lambda: False)
     shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
 
@@ -40,6 +43,7 @@ def test_without_vision_the_following_shot_keeps_a_locked_wide_camera(monkeypatc
 def test_a_cast_that_changes_between_shots_is_left_alone(monkeypatch) -> None:
     from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
+    monkeypatch.setenv(cs.CONTINUITY_ENV, "observe")
     monkeypatch.setattr(cs, "_vision_available", lambda: False)
     shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1"])]
 
@@ -52,6 +56,7 @@ def test_a_cast_that_changes_between_shots_is_left_alone(monkeypatch) -> None:
 def test_with_vision_the_director_reads_the_previous_shot_instead(monkeypatch) -> None:
     from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
+    monkeypatch.setenv(cs.CONTINUITY_ENV, "observe")
     monkeypatch.setattr(cs, "_vision_available", lambda: True)
     shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
 
@@ -182,6 +187,9 @@ def _two_shot_graph(vision: bool, monkeypatch):
 
 
 def test_shots_run_in_order_only_when_something_reads_them(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+
+    monkeypatch.setenv(cs.CONTINUITY_ENV, "observe")
     read_graph = _two_shot_graph(True, monkeypatch)
     assert [e for e in read_graph["edges"] if e.get("label") == "sequence"]
 

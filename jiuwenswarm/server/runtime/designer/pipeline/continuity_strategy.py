@@ -160,13 +160,23 @@ def chat_model_reads_images() -> bool:
     return _CHAT_VISION_VERDICT
 
 
-def director_reads_shots() -> bool:
-    """Whether the Director can read a finished shot (a vision slot or a multimodal chat model).
+CONTINUITY_ENV = "DESIGNER_SHOT_CONTINUITY"
 
-    Shots of one setting only need to run in order when something actually reads the
-    earlier shot; otherwise they stay parallel.
+
+def shots_run_in_order() -> bool:
+    """Whether shots must run in order: reading a shot is opt-in and gated.
+
+    Sequencing a setting costs its parallelism (shots render one after another),
+    so it stays off unless the build is explicitly asked for observed continuity.
     """
+    if str(os.getenv(CONTINUITY_ENV) or "").strip().casefold() not in {"observe", "on", "1", "true"}:
+        return False
     return _vision_available()
+
+
+def director_reads_shots() -> bool:
+    """Whether the Director can read a finished shot (a vision slot or a multimodal chat model)."""
+    return shots_run_in_order()
 
 
 def _vision_available() -> bool:
@@ -266,6 +276,9 @@ def continuity_strategy(
     vision backend is configured; without one, the only lever the text has is a
     locked wide camera on the shots that follow.
     """
+    if str(os.getenv(CONTINUITY_ENV) or "").strip().casefold() not in {"observe", "on", "1", "true"}:
+        # Default: plain parallel rendering, no sequencing, no camera rewrite.
+        return STRATEGY_SINGLE_CLIP
     grouped = shots_by_setting(shots)
     if not any(len(group) > 1 and same_cast(group) for group in grouped.values()):
         return STRATEGY_SINGLE_CLIP
