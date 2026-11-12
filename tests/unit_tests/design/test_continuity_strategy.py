@@ -119,3 +119,33 @@ def test_the_composed_prompt_states_what_the_previous_shot_looked_like() -> None
 
     assert "Ruth is seated at the left of the table, holding a cup" in prompt
     assert "continues from that state" in prompt
+
+def test_the_chat_model_can_be_the_directors_eyes(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"\xff\xd8\xff\xd9")
+    monkeypatch.setattr(cs, "_vision_available", lambda: True)
+    monkeypatch.setattr(
+        cs, "chat_model_config", lambda: {"api_base": "https://x", "api_key": "k", "model": "m"}
+    )
+    monkeypatch.setattr(cs, "sample_clip_frames", lambda *a, **k: [frame])
+    monkeypatch.setattr(
+        cs, "_chat_completion", lambda conf, content, timeout=0: "Five people; mother sits left"
+    )
+
+    observed = asyncio.run(cs.observe_previous_clip(["clip.mp4"], count=2))
+
+    assert observed == "Five people; mother sits left"
+
+
+def test_the_image_probe_accepts_a_colour_answer(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+
+    conf = {"api_base": "https://x", "api_key": "k", "model": "m"}
+    monkeypatch.setattr(cs, "_chat_completion", lambda *a, **k: "Blue")
+    assert cs._probe_chat_image_support(conf) is True
+    monkeypatch.setattr(cs, "_chat_completion", lambda *a, **k: "I cannot see images.")
+    assert cs._probe_chat_image_support(conf) is False

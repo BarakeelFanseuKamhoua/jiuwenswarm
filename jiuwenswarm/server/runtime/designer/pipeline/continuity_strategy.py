@@ -13,10 +13,13 @@ or leaves mid-shot.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +41,137 @@ _STATIC_WIDE_CAMERA = {
 }
 
 
+_CHAT_VISION_VERDICT: bool | None = None
+
+
+def chat_model_config() -> dict[str, Any]:
+    """The Director's own chat model: base url, key, model id, declared image support."""
+    try:
+        from jiuwenswarm.common.config import get_config, resolve_env_vars
+    except Exception:  # noqa: BLE001
+        return {}
+    models = (get_config() or {}).get("models") or {}
+    for entry in models.get("defaults") or []:
+        if not isinstance(entry, dict):
+            continue
+        mc = entry.get("model_client_config")
+        if not isinstance(mc, dict):
+            continue
+        base = resolve_env_vars(str(mc.get("api_base") or "")).strip()
+        key = resolve_env_vars(str(mc.get("api_key") or "")).strip()
+        name = resolve_env_vars(str(mc.get("model_name") or "")).strip()
+        if not (base and key and name):
+            continue
+        declared = mc.get("supports_vision")
+        return {
+            "api_base": base,
+            "api_key": key,
+            "model": name,
+            "declared_vision": declared if isinstance(declared, bool) else None,
+        }
+    return {}
+
+
+def _chat_completion(conf: dict[str, Any], content: list[dict[str, Any]], *, timeout: int) -> str:
+    """One chat round-trip with image parts; empty string on any failure."""
+    payload = {
+        "model": conf["model"],
+        "messages": [{"role": "user", "content": content}],
+        # Reasoning models spend tokens on reasoning first; a small cap returns
+        # an empty answer even when the image was read correctly.
+        "max_tokens": 1200,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        conf["api_base"].rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {conf['api_key']}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.load(response)
+    except Exception:
+        logger.debug("chat completion failed", exc_info=True)
+        return ""
+    choices = data.get("choices") or []
+    message = (choices[0] or {}).get("message") if choices else {}
+    message = message or {}
+    # Only the answer: a reasoning model's private reasoning is off-task text.
+    return str(message.get("content") or "").strip()
+
+
+def _image_part(image_path: Path, mime: str = "image/jpeg") -> dict[str, Any]:
+    import base64
+
+    data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+
+
+def _solid_png(size: int = 48, rgb: tuple[int, int, int] = (0, 0, 255)) -> bytes:
+    import base64
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = struct.pack(">I", len(data)) + tag + data
+        return body + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png)
+
+
+def _probe_chat_image_support(conf: dict[str, Any]) -> bool:
+    """One tiny colour question decides whether the chat model accepts images."""
+    content = [
+        {"type": "text", "text": "What colour is this square? One word."},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + _solid_png().decode()},
+        },
+    ]
+    answer = _chat_completion(conf, content, timeout=60).casefold()
+    return "blue" in answer
+
+
+def chat_model_reads_images() -> bool:
+    """Cached verdict: does the Director's chat model accept image input?"""
+    global _CHAT_VISION_VERDICT
+    if _CHAT_VISION_VERDICT is not None:
+        return _CHAT_VISION_VERDICT
+    conf = chat_model_config()
+    if not conf:
+        _CHAT_VISION_VERDICT = False
+        return False
+    declared = conf.get("declared_vision")
+    _CHAT_VISION_VERDICT = (
+        bool(declared) if declared is not None else _probe_chat_image_support(conf)
+    )
+    return _CHAT_VISION_VERDICT
+
+
 def _vision_available() -> bool:
-    """True when a vision backend is configured, so the Director can read a frame."""
+    """True when the Director can read a frame: a vision slot, or a multimodal chat model."""
     try:
         from jiuwenswarm.server.runtime.designer.capabilities import (
             _vision_backend_configured,
         )
-    except Exception:  # noqa: BLE001
-        return False
-    return bool(_vision_backend_configured().get("available"))
+
+        if _vision_backend_configured().get("available"):
+            return True
+    except Exception:
+        logger.debug("vision slot lookup failed", exc_info=True)
+    return chat_model_reads_images()
 
 
 def video_max_seconds() -> float:
@@ -346,13 +471,19 @@ async def observe_previous_clip(
     except Exception:  # noqa: BLE001
         return ""
     question = _OBSERVE_QUESTION.get(lang, _OBSERVE_QUESTION["en"])
+    conf = chat_model_config()
     seen: list[str] = []
     for frame in frames[:max_frames]:
-        try:
-            text = await inspect_image_for_rating(str(frame), question)
-        except Exception:
-            logger.debug("frame observation failed: %s", frame, exc_info=True)
-            continue
+        text = ""
+        if conf:
+            content = [{"type": "text", "text": question}, _image_part(frame)]
+            text = await asyncio.to_thread(_chat_completion, conf, content, timeout=90)
+        if not text:
+            try:
+                text = await inspect_image_for_rating(str(frame), question)
+            except Exception:
+                logger.debug("frame observation failed: %s", frame, exc_info=True)
+                continue
         text = str(text or "").strip()
         if text and text not in seen:
             seen.append(text)
