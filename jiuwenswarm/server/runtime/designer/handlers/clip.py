@@ -834,6 +834,20 @@ class ClipNodeHandler:
         )
 
         wired_video = first_connected_video_file(edge_video_inputs(ctx, node))
+        if wired_video:
+            # A previous shot of this setting arrives only to order the work; its
+            # file is not a reference for this shot (the Director reads its frames
+            # instead), so never hand it to the video model.
+            try:
+                from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
+                    previous_clip_paths,
+                )
+
+                earlier = {str(path.resolve()) for path in previous_clip_paths(ctx, node)}
+                if str(Path(wired_video).resolve()) in earlier:
+                    wired_video = None
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("sequence edge check skipped: %s", exc)
         user_video = user_reference_video_path(ctx.graph)
         reference_file = (
             wired_video

@@ -1729,6 +1729,14 @@ def build_smart_video_graph(
         )
         for src in clip_inputs:
             edges.append(_edge(f"e_{src}_{shot_id}", src, shot_id))
+        prior = prev_shot_by_setting.get(setting_id)
+        if prior:
+            # Sequence, not a media reference: the next shot starts after this one
+            # so the Director can read what it actually looked like.
+            shot_cfg["sequence_from"] = prior
+            edges.append(
+                _edge(f"e_seq_{prior}_{shot_id}", prior, shot_id, label="sequence")
+            )
         prev_shot_by_setting[setting_id] = shot_id
         prev_shot_global = shot_id
 
