@@ -860,6 +860,21 @@ def build_smart_video_graph(
         analysis["clips"] = shots
     except Exception:  # noqa: BLE001
         pass
+    # Continuity: one take per setting while the video model can hold it, so a
+    # cut never re-stages the seating or the cast.
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
+            apply_continuity_plan,
+        )
+
+        shots, continuity = apply_continuity_plan(shots, analysis=analysis)
+        analysis["continuity_strategy"] = continuity
+        for i, shot in enumerate(shots, start=1):
+            shot["clip_index"] = i
+        analysis["target_clip_count"] = len(shots)
+        analysis["clips"] = shots
+    except Exception:  # noqa: BLE001
+        pass
     # Continuity: scene specs + on-screen character specs; storyboard start/end owns continuity.
     analysis["scene_consistency_mode"] = "scene_specs_plus_clips"
 
