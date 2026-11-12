@@ -748,6 +748,24 @@ class ClipNodeHandler:
         cfg = scrub_restated_speech(cfg)
         node["config"] = cfg
 
+        if not str(cfg.get("observed_previous_state") or "").strip():
+            # What the previous shot actually looked like: a set of sampled frames,
+            # read by the Director's vision model, so the next beat starts from it.
+            try:
+                from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
+                    observe_previous_clip,
+                    previous_clip_paths,
+                )
+
+                earlier = previous_clip_paths(ctx, node)
+                if earlier:
+                    observed = await observe_previous_clip(earlier)
+                    if observed:
+                        cfg["observed_previous_state"] = observed
+                        node["config"] = cfg
+            except Exception as exc:  # noqa: BLE001
+                logger.info("continuity observation skipped: %s", exc)
+
         binding: dict[str, Any] = {}
         refs = collect_clip_reference_images(ctx, clip_index, node=node, bindings=binding)
         if binding:

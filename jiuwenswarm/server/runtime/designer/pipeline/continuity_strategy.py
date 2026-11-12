@@ -125,90 +125,19 @@ def continuity_strategy(
     max_seconds: float | None = None,
     beat_seconds: float | None = None,
 ) -> str:
-    """Which continuity the shots need, given the model and the Director's eyes."""
+    """Which continuity the shots need, given the model and the Director's eyes.
+
+    The storyboard's shot count is the plan, so shots are never merged. Continuity
+    inside a setting comes from the Director reading the shot before it when a
+    vision backend is configured; without one, the only lever the text has is a
+    locked wide camera on the shots that follow.
+    """
     grouped = shots_by_setting(shots)
-    if not any(len(group) > 1 for group in grouped.values()):
+    if not any(len(group) > 1 and same_cast(group) for group in grouped.values()):
         return STRATEGY_SINGLE_CLIP
     if _vision_available():
         return STRATEGY_DIRECTOR_FRAME
-    window = float(max_seconds) if max_seconds is not None else video_max_seconds()
-    beat = float(beat_seconds) if beat_seconds is not None else video_beat_seconds()
-    per_shot = per_shot_seconds(shots, analysis)
-    for group in grouped.values():
-        if len(group) < 2 or not same_cast(group):
-            # A cast that changes between shots is the storyboard's own cut.
-            continue
-        if per_shot > beat or per_shot * len(group) > window:
-            return STRATEGY_STATIC_WIDE
-    return STRATEGY_SINGLE_CLIP
-
-
-def _merge_list_field(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
-    merged: list[Any] = []
-    for part in (target.get(key), source.get(key)):
-        if not isinstance(part, list):
-            continue
-        for item in part:
-            if item not in merged:
-                merged.append(item)
-    if merged:
-        target[key] = merged
-
-
-def _merge_map_field(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
-    merged: dict[str, Any] = {}
-    for part in (target.get(key), source.get(key)):
-        if isinstance(part, dict):
-            merged.update(part)
-    if merged:
-        target[key] = merged
-
-
-_LIST_FIELDS = (
-    "on_screen",
-    "offscreen",
-    "character_ids",
-    "featured_cast_ids",
-    "ensemble_cast_ids",
-    "already_done",
-    "exited_ids",
-)
-_MAP_FIELDS = (
-    "cast_actions",
-    "speech_by_character",
-    "wardrobe_by_character",
-    "cast_states",
-    "screen_positions",
-)
-
-
-def merge_shots(shots: list[dict[str, Any]], *, seconds: float) -> dict[str, Any]:
-    """One take: the beats stay in order, the cast and its wardrobe stay put."""
-    merged = dict(shots[0])
-    actions = [str(s.get("action") or "").strip() for s in shots if str(s.get("action") or "").strip()]
-    speech = [str(s.get("speech_line") or "").strip() for s in shots if str(s.get("speech_line") or "").strip()]
-    for shot in shots[1:]:
-        for key in _LIST_FIELDS:
-            _merge_list_field(merged, shot, key)
-        for key in _MAP_FIELDS:
-            _merge_map_field(merged, shot, key)
-        for key in ("crowd_spec", "start_state", "continuity_lock", "occupancy", "time_of_day_lock"):
-            if not merged.get(key) and shot.get(key):
-                merged[key] = shot[key]
-        if shot.get("end_state"):
-            merged["end_state"] = shot["end_state"]
-        if shot.get("timeline"):
-            merged["timeline"] = shot["timeline"]
-    if actions:
-        merged["action"] = "；".join(dict.fromkeys(actions))
-    if speech:
-        merged["speech_line"] = " ".join(dict.fromkeys(speech))
-    merged["duration_sec"] = round(float(seconds), 3)
-    merged["merged_from"] = [
-        int(s.get("clip_index") or 0) for s in shots if s.get("clip_index") is not None
-    ]
-    merged["first_of_setting"] = True
-    return merged
+    return STRATEGY_STATIC_WIDE
 
 
 def _static_wide(shot: dict[str, Any], lang: str = "en") -> dict[str, Any]:
@@ -228,15 +157,18 @@ def apply_continuity_plan(
     beat_seconds: float | None = None,
     lang: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Return the shot list the graph should build, plus the strategy used."""
+    """Return the shot list the graph should build, plus the strategy used.
+
+    The storyboard owns the shot count, so shots are never merged here: continuity
+    comes from the Director reading the previous shot when a vision backend is
+    configured, and from a locked wide camera when there is none.
+    """
     ordered = [s for s in (shots or []) if isinstance(s, dict)]
     if not ordered:
         return [], STRATEGY_SINGLE_CLIP
     strategy = continuity_strategy(
         ordered, analysis=analysis, max_seconds=max_seconds, beat_seconds=beat_seconds
     )
-    window = float(max_seconds) if max_seconds is not None else video_max_seconds()
-    per_shot = per_shot_seconds(ordered, analysis)
     if lang is None:
         try:
             from jiuwenswarm.server.runtime.designer.pipeline.content_language import (
@@ -246,23 +178,15 @@ def apply_continuity_plan(
             lang = current_content_language()
         except Exception:  # noqa: BLE001
             lang = "en"
+    if strategy != STRATEGY_STATIC_WIDE:
+        return ordered, strategy
     out: list[dict[str, Any]] = []
-    for setting, group in shots_by_setting(ordered).items():
-        if len(group) < 2:
+    for group in shots_by_setting(ordered).values():
+        if len(group) < 2 or not same_cast(group):
             out.extend(group)
             continue
-        stable_cast = same_cast(group)
-        fits = len(group) * per_shot <= window
-        if strategy == STRATEGY_SINGLE_CLIP and stable_cast and fits:
-            merged = merge_shots(group, seconds=len(group) * per_shot)
-            merged["setting_id"] = setting
-            out.append(merged)
-            continue
-        if strategy == STRATEGY_STATIC_WIDE and stable_cast and (not fits or per_shot > video_beat_seconds()):
-            out.append(group[0])
-            out.extend(_static_wide(shot, lang) for shot in group[1:])
-            continue
-        out.extend(group)
+        out.append(group[0])
+        out.extend(_static_wide(shot, lang) for shot in group[1:])
     return out, strategy
 
 
@@ -383,3 +307,94 @@ def previous_clip_frame_sets(
         if frames:
             sets.append(frames)
     return sets
+
+_OBSERVE_QUESTION = {
+    "zh": (
+        "???????????????????????????????????"
+        "?????/?/??????????????????????????????????"
+    ),
+    "en": (
+        "These are sampled frames from a finished shot. Report only what you see: who is "
+        "in frame, where each person sits or stands relative to the table, door or window, "
+        "and what each is holding. No judgement, no advice."
+    ),
+}
+
+
+async def observe_previous_clip(
+    clip_paths: list[str | Path] | None,
+    *,
+    count: int = _DEFAULT_FRAME_SAMPLES,
+    lang: str = "en",
+    max_frames: int = 6,
+) -> str:
+    """What the earlier shot actually looked like, read from a set of its frames.
+
+    Empty when no vision backend is configured or nothing could be read.
+    """
+    if not _vision_available():
+        return ""
+    frames: list[Path] = []
+    for clip in clip_paths or []:
+        frames.extend(sample_clip_frames(clip, count=count))
+    if not frames:
+        return ""
+    try:
+        from jiuwenswarm.server.runtime.designer.capabilities import (
+            inspect_image_for_rating,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    question = _OBSERVE_QUESTION.get(lang, _OBSERVE_QUESTION["en"])
+    seen: list[str] = []
+    for frame in frames[:max_frames]:
+        try:
+            text = await inspect_image_for_rating(str(frame), question)
+        except Exception:
+            logger.debug("frame observation failed: %s", frame, exc_info=True)
+            continue
+        text = str(text or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return " / ".join(seen)[:1200]
+
+
+def previous_clip_paths(ctx: Any, node: dict[str, Any]) -> list[Path]:
+    """Files of the shot just before this one in the same setting."""
+    cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+    try:
+        index = int(cfg.get("clip_index") or 1)
+    except (TypeError, ValueError):
+        index = 1
+    setting = str(cfg.get("setting_id") or "").strip()
+    graph = getattr(ctx, "graph", None) or {}
+    states = ((getattr(ctx, "run", None) or {}).get("node_states") or {})
+    best_index = -1
+    best_node = ""
+    for other in graph.get("nodes") or []:
+        if not isinstance(other, dict):
+            continue
+        ocfg = other.get("config") if isinstance(other.get("config"), dict) else {}
+        if str(ocfg.get("pipeline") or "") != "clip":
+            continue
+        if str(ocfg.get("setting_id") or "").strip() != setting:
+            continue
+        try:
+            other_index = int(ocfg.get("clip_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if other_index <= 0 or other_index >= index or other_index <= best_index:
+            continue
+        best_index = other_index
+        best_node = str(other.get("id") or "")
+    if not best_node:
+        return []
+    paths: list[Path] = []
+    for ref in (states.get(best_node) or {}).get("output_refs") or []:
+        uri = str((ref or {}).get("uri") or "")
+        if not uri.startswith("file:///"):
+            continue
+        path = Path(uri[8:])
+        if path.is_file():
+            paths.append(path)
+    return paths

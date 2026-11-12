@@ -61,6 +61,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "props_in_view": "Props in view: {props}.",
         "headcount": "{count} people stay in frame together: {cast}.",
         "staging": "Staging, unchanged across the shots of this setting: {layout}.",
+        "observed_state": (
+            "The shot before this one ended like this — {observed} "
+            "This shot continues from that state: the same people keep those places and poses."
+        ),
         "connected_still": "{word} is the connected still {label}, and that subject is visible in this shot.",
         "cast_references": "the cast references",
         "camera": "The camera {cam}.",
@@ -105,6 +109,10 @@ _PHRASES: dict[str, dict[str, str]] = {
         "props_in_view": "画面中的道具：{props}。",
         "headcount": "画面内共 {count} 人：{cast}。",
         "staging": "本场景的座位与站位（同一场景的各镜头保持一致）：{layout}。",
+        "observed_state": (
+            "上一镜结束时的画面：{observed}。本镜从这一状态接着演，"
+            "这些人留在原来的位置与姿态。"
+        ),
         "connected_still": "{word} 是相连的静帧「{label}」，该主体在本镜头中可见。",
         "cast_references": "角色参考图",
         "camera": "镜头：{cam}。",
@@ -1272,6 +1280,10 @@ def compose_practice_prompt(
     for line in _staging_lines(cfg, graph, tokens, lang):
         if line and line not in sentences and not _BAD_DIRECTIVE.search(line):
             sentences.append(line)
+
+    observed = strip_phrase(_scrub_lock_phrase(str(cfg.get("observed_previous_state") or "").strip()))
+    if observed and not _BAD_DIRECTIVE.search(observed):
+        sentences.append(phrase(_PHRASES, lang, "observed_state", observed=observed))
 
     # The storyboard's own action text always leads the cast lines: it carries
     # the causal order and any enumerated content (props, groups, icons).

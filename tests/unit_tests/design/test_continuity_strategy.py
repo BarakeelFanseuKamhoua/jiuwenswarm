@@ -1,4 +1,4 @@
-def _shot(idx: int, *, setting: str = "set_1", action: str = "beat", cast: list[str] | None = None) -> dict:
+﻿def _shot(idx: int, *, setting: str = "set_1", action: str = "beat", cast: list[str] | None = None) -> dict:
     return {
         "clip_index": idx,
         "setting_id": setting,
@@ -12,68 +12,64 @@ def _shot(idx: int, *, setting: str = "set_1", action: str = "beat", cast: list[
     }
 
 
-def test_two_shots_in_a_setting_become_one_take_when_the_model_can_hold_them() -> None:
-    from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
-        STRATEGY_SINGLE_CLIP,
-        apply_continuity_plan,
-    )
+def test_the_storyboard_shot_count_is_never_merged_away(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
-    shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_2", "char_1"])]
-    out, strategy = apply_continuity_plan(shots, max_seconds=15)
+    monkeypatch.setattr(cs, "_vision_available", lambda: False)
+    shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
 
-    assert strategy == STRATEGY_SINGLE_CLIP
-    assert len(out) == 1
-    merged = out[0]
-    assert merged["duration_sec"] == 10.0
-    assert merged["merged_from"] == [1, 2]
-    assert merged["on_screen"] == ["char_1", "char_2"]
-    assert "beat" in merged["action"]
-    assert merged["speech_line"] == "line 1 line 2"
+    out, strategy = cs.apply_continuity_plan(shots, max_seconds=15, beat_seconds=5)
+
+    assert len(out) == 2
+    assert strategy != cs.STRATEGY_SINGLE_CLIP
 
 
-def test_a_cast_that_changes_between_shots_keeps_its_cut() -> None:
-    from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
-        apply_continuity_plan,
-    )
+def test_without_vision_the_following_shot_keeps_a_locked_wide_camera(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
+    monkeypatch.setattr(cs, "_vision_available", lambda: False)
+    shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
+
+    out, strategy = cs.apply_continuity_plan(shots, max_seconds=15, beat_seconds=5, lang="en")
+
+    assert strategy == cs.STRATEGY_STATIC_WIDE
+    assert out[1]["camera"] == cs._STATIC_WIDE_CAMERA["en"]
+    assert out[1]["exiting_character_ids"] == []
+
+
+def test_a_cast_that_changes_between_shots_is_left_alone(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+
+    monkeypatch.setattr(cs, "_vision_available", lambda: False)
     shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1"])]
-    out, _ = apply_continuity_plan(shots, max_seconds=15)
 
+    out, strategy = cs.apply_continuity_plan(shots, max_seconds=15, beat_seconds=5, lang="en")
+
+    assert strategy != cs.STRATEGY_STATIC_WIDE
+    assert out[1]["camera"] == "medium / eye-level"
+
+
+def test_with_vision_the_director_reads_the_previous_shot_instead(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+
+    monkeypatch.setattr(cs, "_vision_available", lambda: True)
+    shots = [_shot(1, cast=["char_1", "char_2"]), _shot(2, cast=["char_1", "char_2"])]
+
+    assert cs.continuity_strategy(shots, max_seconds=5) == cs.STRATEGY_DIRECTOR_FRAME
+    out, strategy = cs.apply_continuity_plan(shots, max_seconds=5)
+    assert strategy == cs.STRATEGY_DIRECTOR_FRAME
     assert len(out) == 2
     assert out[1]["camera"] == "medium / eye-level"
 
 
-def test_each_setting_is_planned_independently() -> None:
-    from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
-        apply_continuity_plan,
-    )
+def test_the_observation_is_empty_without_a_vision_backend(monkeypatch) -> None:
+    import asyncio
 
-    shots = [
-        _shot(1, setting="set_1", cast=["char_1", "char_2"]),
-        _shot(2, setting="set_1", cast=["char_1", "char_2"]),
-        _shot(3, setting="set_2", cast=["char_1", "char_3"]),
-        _shot(4, setting="set_2", cast=["char_1", "char_3"]),
-    ]
-    out, _ = apply_continuity_plan(shots, max_seconds=15)
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
 
-    assert [s["setting_id"] for s in out] == ["set_1", "set_2"]
-    assert [s["merged_from"] for s in out] == [[1, 2], [3, 4]]
+    monkeypatch.setattr(cs, "_vision_available", lambda: False)
 
-
-def test_a_setting_longer_than_the_window_keeps_its_cut_and_locks_the_camera() -> None:
-    from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
-        STRATEGY_STATIC_WIDE,
-        _STATIC_WIDE_CAMERA,
-        apply_continuity_plan,
-    )
-
-    shots = [_shot(1), _shot(2)]
-    out, strategy = apply_continuity_plan(shots, max_seconds=6, lang="en")
-
-    assert strategy == STRATEGY_STATIC_WIDE
-    assert len(out) == 2
-    assert out[1]["camera"] == _STATIC_WIDE_CAMERA["en"]
-    assert out[1]["exiting_character_ids"] == []
+    assert asyncio.run(cs.observe_previous_clip(["does-not-exist.mp4"])) == ""
 
 
 def test_the_director_reads_a_set_of_sampled_frames_not_one_frame(tmp_path) -> None:
@@ -88,18 +84,9 @@ def test_the_director_reads_a_set_of_sampled_frames_not_one_frame(tmp_path) -> N
     clip = tmp_path / "clip.mp4"
     made = cs.subprocess.run(
         [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=320x180:rate=12:duration=2",
-            "-pix_fmt",
-            "yuv420p",
-            str(clip),
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=320x180:rate=12:duration=2",
+            "-pix_fmt", "yuv420p", str(clip),
         ],
         capture_output=True,
         text=True,
@@ -116,13 +103,19 @@ def test_the_director_reads_a_set_of_sampled_frames_not_one_frame(tmp_path) -> N
     assert len({frame.read_bytes() for frame in frames}) == 4
 
 
-def test_the_director_reads_the_previous_beats_when_a_vision_backend_exists(monkeypatch) -> None:
-    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+def test_the_composed_prompt_states_what_the_previous_shot_looked_like() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+        compose_practice_prompt,
+    )
 
-    monkeypatch.setattr(cs, "_vision_available", lambda: True)
-    shots = [_shot(1), _shot(2)]
+    cfg = {
+        "pipeline": "clip",
+        "on_screen": ["char_1"],
+        "clip_action": "Ruth waits.",
+        "observed_previous_state": "Ruth is seated at the left of the table, holding a cup",
+    }
 
-    assert cs.continuity_strategy(shots, max_seconds=5) == cs.STRATEGY_DIRECTOR_FRAME
-    out, strategy = cs.apply_continuity_plan(shots, max_seconds=5)
-    assert strategy == cs.STRATEGY_DIRECTOR_FRAME
-    assert len(out) == 2
+    prompt = compose_practice_prompt(cfg=cfg, graph=None, action="Ruth waits.")
+
+    assert "Ruth is seated at the left of the table, holding a cup" in prompt
+    assert "continues from that state" in prompt
