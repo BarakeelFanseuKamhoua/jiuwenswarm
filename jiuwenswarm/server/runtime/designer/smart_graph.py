@@ -743,6 +743,18 @@ def _ensure_setting_ids(
         prev = sid
 
 
+def _observe_previous_shot() -> bool:
+    """True when the Director can read an earlier shot, so shots must run in order."""
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
+            director_reads_shots,
+        )
+
+        return director_reads_shots()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def build_smart_video_graph(
     *,
     project_id: str,
@@ -1730,9 +1742,10 @@ def build_smart_video_graph(
         for src in clip_inputs:
             edges.append(_edge(f"e_{src}_{shot_id}", src, shot_id))
         prior = prev_shot_by_setting.get(setting_id)
-        if prior:
+        if prior and _observe_previous_shot():
             # Sequence, not a media reference: the next shot starts after this one
-            # so the Director can read what it actually looked like.
+            # so the Director can read what it actually looked like. Without a
+            # reader the shots stay parallel, which is what concurrency needs.
             shot_cfg["sequence_from"] = prior
             edges.append(
                 _edge(f"e_seq_{prior}_{shot_id}", prior, shot_id, label="sequence")

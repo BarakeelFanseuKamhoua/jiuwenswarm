@@ -149,3 +149,43 @@ def test_the_image_probe_accepts_a_colour_answer(monkeypatch) -> None:
     assert cs._probe_chat_image_support(conf) is True
     monkeypatch.setattr(cs, "_chat_completion", lambda *a, **k: "I cannot see images.")
     assert cs._probe_chat_image_support(conf) is False
+
+def _two_shot_graph(vision: bool, monkeypatch):
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+    from jiuwenswarm.server.runtime.designer.smart_graph import build_smart_video_graph
+
+    monkeypatch.setattr(cs, "_vision_available", lambda: vision)
+    analysis = {
+        "characters": [{"id": "char_1", "name": "Ann", "description": "green blouse"}],
+        "scenes": [{"id": "set_1", "name": "kitchen", "description": "table"}],
+        "clips": [
+            {
+                "clip_index": 1,
+                "setting_id": "set_1",
+                "action": "Ann sits.",
+                "on_screen": ["char_1"],
+                "camera": "wide",
+                "timeline": "0-5s",
+            },
+            {
+                "clip_index": 2,
+                "setting_id": "set_1",
+                "action": "Ann eats.",
+                "on_screen": ["char_1"],
+                "camera": "medium",
+                "timeline": "5-10s",
+            },
+        ],
+        "target_duration_sec": 10,
+    }
+    return build_smart_video_graph(project_id="p_seq", prompt="two shots", analysis=analysis)
+
+
+def test_shots_run_in_order_only_when_something_reads_them(monkeypatch) -> None:
+    read_graph = _two_shot_graph(True, monkeypatch)
+    assert [e for e in read_graph["edges"] if e.get("label") == "sequence"]
+
+    blind_graph = _two_shot_graph(False, monkeypatch)
+    assert not [e for e in blind_graph["edges"] if e.get("label") == "sequence"]
+    clip2 = next(n for n in blind_graph["nodes"] if n["id"] == "n_clip_2")
+    assert not (clip2.get("config") or {}).get("sequence_from")

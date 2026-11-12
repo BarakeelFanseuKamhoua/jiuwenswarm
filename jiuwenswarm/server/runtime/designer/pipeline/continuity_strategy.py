@@ -160,6 +160,15 @@ def chat_model_reads_images() -> bool:
     return _CHAT_VISION_VERDICT
 
 
+def director_reads_shots() -> bool:
+    """Whether the Director can read a finished shot (a vision slot or a multimodal chat model).
+
+    Shots of one setting only need to run in order when something actually reads the
+    earlier shot; otherwise they stay parallel.
+    """
+    return _vision_available()
+
+
 def _vision_available() -> bool:
     """True when the Director can read a frame: a vision slot, or a multimodal chat model."""
     try:
