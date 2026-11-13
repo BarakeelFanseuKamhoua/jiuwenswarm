@@ -90,7 +90,7 @@ def _ref_media_family(ref: Any) -> str | None:
         if path is None:
             try:
                 path = Path(uri)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 path = None
         if path is None or not path.is_file() or path.stat().st_size < 512:
             return None
@@ -100,7 +100,7 @@ def _ref_media_family(ref: Any) -> str | None:
         if path is None:
             try:
                 path = Path(uri)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 path = None
         if path is None or not path.is_file() or path.stat().st_size < 64:
             return None
@@ -163,7 +163,7 @@ def _upstream_image_uri_keys(ctx: NodeExecutionContext | None) -> set[str]:
         from jiuwenswarm.server.runtime.designer.handlers.common import (
             node_output_image_paths,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         return set()
     graph = ctx.graph if isinstance(getattr(ctx, "graph", None), dict) else {}
     for node in graph.get("nodes") or []:
@@ -177,7 +177,7 @@ def _upstream_image_uri_keys(ctx: NodeExecutionContext | None) -> set[str]:
             continue
         try:
             paths = node_output_image_paths(ctx, node_id)
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
         for path in paths or []:
             try:
@@ -266,7 +266,7 @@ def _path_from_file_uri(uri: str) -> Path | None:
         parsed = urlparse(raw)
         try:
             path = Path(url2pathname(unquote(parsed.path)))
-        except Exception:  # noqa: BLE001
+        except Exception:
             path = Path(unquote(parsed.path.lstrip("/")))
         return path if str(path) else None
     path = Path(raw)
@@ -623,7 +623,7 @@ def build_node_user_query(node: DesignerGraphNode, ctx: NodeExecutionContext) ->
             ),
         )
         extra["previous_clip_story_state"] = agent_prior_story_block(cfg)
-    except Exception:  # noqa: BLE001
+    except Exception:
         extra = {}
     snapshot = {
         "node_id": node["id"],
@@ -963,7 +963,7 @@ class DesignerGraphToolkit:
             )
 
             refs = [str(path) for path in uploaded_material_image_paths(node)]
-        except Exception:  # noqa: BLE001
+        except Exception:
             refs = []
         role = str(node_pipeline(node) or node_role(node) or "")
         if role == "scene":
@@ -989,7 +989,7 @@ class DesignerGraphToolkit:
                     refs.extend(
                         str(p) for p in node_ids_output_image_paths(self.ctx, pred_ids)
                     )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         # Toolbar user edits win over leaf narration before the image call.
         try:
@@ -1000,7 +1000,7 @@ class DesignerGraphToolkit:
             user_surface = resolve_user_origin_prompt(cfg, "")
             if user_surface:
                 text = user_surface
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         if role in {"scene", "character"}:
             try:
@@ -1009,7 +1009,7 @@ class DesignerGraphToolkit:
                 )
 
                 text = apply_image_call_locks(text, cfg=cfg, graph=self.ctx.graph)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         try:
             from jiuwenswarm.server.runtime.designer.pipeline.media_prompt_limits import (
@@ -1026,7 +1026,7 @@ class DesignerGraphToolkit:
                     lim.max_chars,
                     lim.model,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         cfg["prompt"] = text
         # Per-node check before the model call, so a Settings gap names this node
@@ -1058,7 +1058,7 @@ class DesignerGraphToolkit:
                     detail = str(generated.get("error") or "").strip()
                 raise RuntimeError(detail or "call_image_model produced no file")
             out = f"Saved to: {path}"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.fail_media(exc)
             logger.warning("call_image_model failed: %s", exc, exc_info=True)
             raise
@@ -1124,7 +1124,7 @@ class DesignerGraphToolkit:
             )
 
             cfg = ensure_prior_clip_story_on_cfg(cfg, graph)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         node["config"] = cfg
 
@@ -1142,11 +1142,23 @@ class DesignerGraphToolkit:
         ref_paths = [p for p in refs if p.is_file() and p.suffix.lower() in image_suffixes]
         ref_files = [str(p) for p in ref_paths]
 
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+
+            # Agent clips write their own prompt, so the memory of what earlier
+            # shots rendered has to be ready before that prompt is written.
+            digest = await staging_memory.observe_new_shots(self.ctx, node)
+            if digest:
+                cfg["observed_previous_state"] = digest
+                node["config"] = cfg
+        except Exception as exc:
+            logger.info("staging observation skipped (agent path): %s", exc)
+
         # Agent writes P2 (continuation). Structured prompt is fallback / lock scaffold.
         structured = ""
         try:
             structured = str(build_clip_prompt(self.ctx.graph, node, self.ctx) or "").strip()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("build_clip_prompt failed in call_video_model", exc_info=True)
         agent_text = str(prompt or "").strip()
         prior_p1 = str(cfg.get("previous_clip_action") or cfg.get("previous_clip_wan_prompt") or "").strip()
@@ -1160,7 +1172,7 @@ class DesignerGraphToolkit:
 
             cfg, _ = merge_storyboard_consistency(cfg, graph=graph)
             node["config"] = cfg
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         if agent_text:
             try:
@@ -1190,7 +1202,7 @@ class DesignerGraphToolkit:
                     agent_text = ""
                 elif prompt_violates_consistency(body, cfg=cfg):
                     agent_text = ""
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         if (
             prior_p1
@@ -1212,6 +1224,22 @@ class DesignerGraphToolkit:
                 or graph_prompt(self.ctx.graph, node)
                 or ""
             )
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline.content_language import (
+                current_content_language,
+            )
+            from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+                observed_state_sentence,
+            )
+
+            # Whatever the agent wrote, the staging memory is appended verbatim: it
+            # is the only part of the prompt that is a measured fact about this film.
+            cfg_now = node.get("config") if isinstance(node.get("config"), dict) else {}
+            memory_sentence = observed_state_sentence(cfg_now, current_content_language())
+            if memory_sentence and memory_sentence not in text:
+                text = f"{text.rstrip()}\n\n{memory_sentence}"
+        except Exception:
+            logger.debug("staging memory sentence failed", exc_info=True)
         clause = attach_order_clause(ref_paths, edge_image_flow(self.ctx, node))
         payload = connected_payload_clause(
             edge_text_inputs(self.ctx, node),
@@ -1239,7 +1267,7 @@ class DesignerGraphToolkit:
                     vlim.max_chars,
                     vlim.model,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         cfg = node.get("config") if isinstance(node.get("config"), dict) else cfg
         cfg = scrub_restated_speech(dict(cfg))
@@ -1284,7 +1312,7 @@ class DesignerGraphToolkit:
         if callable(getattr(self.ctx, "on_prompt_artifact", None)):
             try:
                 self.ctx.on_prompt_artifact(text)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("call_video_model early prompt handoff failed", exc_info=True)
         dur = video_duration_seconds(self.ctx, node)
         note_video_duration(self.ctx, node, dur)
@@ -1338,7 +1366,7 @@ class DesignerGraphToolkit:
                 resolution=video.resolution,
                 node_label=f"designer_video_{self.ctx.run_id}_{self.ctx.node_id}",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.fail_media(exc)
             logger.warning("call_video_model failed: %s", exc, exc_info=True)
             raise
@@ -1366,7 +1394,7 @@ class DesignerGraphToolkit:
                 prompt=str(text),
                 reference_images=list(ref_files),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("regenerate packet stamp failed", exc_info=True)
         try:
             from jiuwenswarm.server.runtime.designer.pipeline.clip_prompt_handoff import (
@@ -1381,7 +1409,7 @@ class DesignerGraphToolkit:
                 clip_action=str(cfg.get("clip_action") or ""),
                 speech_line=str(cfg.get("speech_line") or ""),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("call_video_model wan-prompt stamp failed", exc_info=True)
         try:
             stamp_speech_onto_next_clips(
@@ -1392,7 +1420,7 @@ class DesignerGraphToolkit:
                     cfg.get("speech_line") or cfg.get("previous_clip_speech") or ""
                 ),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("call_video_model speech handoff stamp failed", exc_info=True)
         self.completed = NodeResult(
             output_ref=file_output_ref(path, kind="video", mime_type="video/mp4"),
@@ -1472,7 +1500,7 @@ class DesignerGraphToolkit:
             cfg["prompt"] = prompt.strip()
         try:
             media = await get_node_handler(node).execute(node, self.ctx)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return f"ffmpeg_compose error: {exc}"
         self.completed = media
         ref = media.output_ref if media else None
@@ -1824,7 +1852,7 @@ def build_designer_tools(toolkit: DesignerGraphToolkit) -> list[Any]:
             )
 
             image_tool_hint = image_prompt_limit_guidance()
-        except Exception:  # noqa: BLE001
+        except Exception:
             image_tool_hint = (
                 "Follow the configured image backend's documented prompt length."
             )
@@ -1855,7 +1883,7 @@ def build_designer_tools(toolkit: DesignerGraphToolkit) -> list[Any]:
             )
 
             video_tool_hint = video_prompt_limit_guidance()
-        except Exception:  # noqa: BLE001
+        except Exception:
             video_tool_hint = (
                 "Follow the configured video backend's documented prompt length."
             )

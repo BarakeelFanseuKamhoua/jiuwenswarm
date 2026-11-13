@@ -581,8 +581,24 @@ def build_clip_prompt(
         )
         if isinstance(node, dict):
             node["config"] = cfg
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+
+        # Everything earlier shots of this setting actually rendered, so this shot
+        # keeps their layout (including shots it does not touch, e.g. a bird's-eye).
+        memory = staging_memory.digest(
+            graph,
+            setting_id=str(cfg.get("setting_id") or "set_1"),
+            upto_index=int(cfg.get("clip_index") or 1),
+        )
+        if memory:
+            cfg["observed_previous_state"] = memory
+            if isinstance(node, dict):
+                node["config"] = cfg
+    except Exception:
+        logger.debug("staging memory digest failed", exc_info=True)
     try:
         from jiuwenswarm.server.runtime.designer.pipeline.clip_last_frame_handoff import (
             scrub_restated_speech,
@@ -591,7 +607,7 @@ def build_clip_prompt(
         cfg = scrub_restated_speech(cfg)
         if isinstance(node, dict):
             node["config"] = cfg
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     sb_action = _storyboard_narrative_action(shot if isinstance(shot, dict) else None)
     action = str(sb_action or cfg.get("clip_action") or "").strip()
@@ -605,7 +621,7 @@ def build_clip_prompt(
 
             if local and not looks_like_full_story_restatement(local, user) and len(local) <= 400:
                 action = local
-        except Exception:  # noqa: BLE001
+        except Exception:
             if local and len(local) <= 220:
                 action = local
     camera = str(
@@ -628,7 +644,7 @@ def build_clip_prompt(
                 or []
             )
             ensure_cfg_clothing_lock(cfg, characters=analysis_chars)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("ensure_cfg_clothing_lock failed in build_clip_prompt", exc_info=True)
     from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
         director_approve_video_prompt,
@@ -748,23 +764,15 @@ class ClipNodeHandler:
         cfg = scrub_restated_speech(cfg)
         node["config"] = cfg
 
-        if not str(cfg.get("observed_previous_state") or "").strip():
-            # What the previous shot actually looked like: a set of sampled frames,
-            # read by the Director's vision model, so the next beat starts from it.
-            try:
-                from jiuwenswarm.server.runtime.designer.pipeline.continuity_strategy import (
-                    observe_previous_clip,
-                    previous_clip_paths,
-                )
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
 
-                earlier = previous_clip_paths(ctx, node)
-                if earlier:
-                    observed = await observe_previous_clip(earlier)
-                    if observed:
-                        cfg["observed_previous_state"] = observed
-                        node["config"] = cfg
-            except Exception as exc:  # noqa: BLE001
-                logger.info("continuity observation skipped: %s", exc)
+            digest = await staging_memory.observe_new_shots(ctx, node)
+            if digest:
+                cfg["observed_previous_state"] = digest
+                node["config"] = cfg
+        except Exception as exc:
+            logger.info("staging observation skipped: %s", exc)
 
         binding: dict[str, Any] = {}
         refs = collect_clip_reference_images(ctx, clip_index, node=node, bindings=binding)
@@ -819,12 +827,12 @@ class ClipNodeHandler:
                     vlim.max_chars,
                     vlim.model,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         if ctx is not None and callable(getattr(ctx, "on_prompt_artifact", None)):
             try:
                 ctx.on_prompt_artifact(prompt)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("clip early prompt handoff failed", exc_info=True)
         from jiuwenswarm.server.runtime.designer.media_settings import video_settings
 
@@ -846,7 +854,7 @@ class ClipNodeHandler:
                 earlier = {str(path.resolve()) for path in previous_clip_paths(ctx, node)}
                 if str(Path(wired_video).resolve()) in earlier:
                     wired_video = None
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.debug("sequence edge check skipped: %s", exc)
         user_video = user_reference_video_path(ctx.graph)
         reference_file = (
@@ -904,7 +912,7 @@ class ClipNodeHandler:
                     prompt=str(prompt),
                     reference_images=[str(p) for p in ref_files],
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("regenerate packet stamp failed", exc_info=True)
             try:
                 from jiuwenswarm.server.runtime.designer.pipeline.clip_prompt_handoff import (
@@ -919,7 +927,7 @@ class ClipNodeHandler:
                     clip_action=str(cfg.get("clip_action") or ""),
                     speech_line=str(cfg.get("speech_line") or ""),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("post-clip wan-prompt stamp failed", exc_info=True)
             try:
                 stamp_speech_onto_next_clips(
@@ -930,7 +938,7 @@ class ClipNodeHandler:
                         cfg.get("speech_line") or cfg.get("previous_clip_speech") or ""
                     ),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("post-clip speech handoff stamp failed", exc_info=True)
         except Exception as exc:
             raise RuntimeError(

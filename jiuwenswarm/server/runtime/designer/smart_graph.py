@@ -755,6 +755,44 @@ def _observe_previous_shot() -> bool:
         return False
 
 
+def _ensure_sequence_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+    """Chain every setting's shots in index order, whatever order they were built in.
+
+    Doing it from the finished nodes (not from loop bookkeeping) keeps a second
+    setting from silently losing its order.
+    """
+    if not _observe_previous_shot():
+        return
+    by_setting: dict[str, list[tuple[int, str]]] = {}
+    for node in nodes:
+        cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+        if str(cfg.get("pipeline") or "") != "clip":
+            continue
+        try:
+            index = int(cfg.get("clip_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        setting = str(cfg.get("setting_id") or "set_1").strip() or "set_1"
+        by_setting.setdefault(setting, []).append((index, str(node.get("id") or "")))
+    seen = {str(edge.get("id") or "") for edge in edges}
+    for setting, items in by_setting.items():
+        items.sort()
+        for (prev_index, prev_id), (index, node_id) in zip(items, items[1:]):
+            if not prev_id or not node_id:
+                continue
+            edge_id = f"e_seq_{prev_id}_{node_id}"
+            if edge_id in seen:
+                continue
+            for node in nodes:
+                if str(node.get("id") or "") == node_id:
+                    cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+                    cfg["sequence_from"] = prev_id
+                    node["config"] = cfg
+                    break
+            edges.append(_edge(edge_id, prev_id, node_id, label="sequence"))
+            seen.add(edge_id)
+
+
 def build_smart_video_graph(
     *,
     project_id: str,
@@ -790,6 +828,7 @@ def build_smart_video_graph(
         )
         graph = normalize_execution_graph(graph)
         prune_non_contributing_nodes(graph)
+        _ensure_sequence_edges(graph.get("nodes") or [], graph.get("edges") or [])
         return attach_skills_metadata(graph, prompt_text)
     from jiuwenswarm.server.runtime.designer.audio_locks import ensure_audio_locks_on_analysis
 
@@ -1915,4 +1954,5 @@ def build_smart_video_graph(
     }
     graph = normalize_execution_graph(graph)
     prune_non_contributing_nodes(graph)
+    _ensure_sequence_edges(graph.get("nodes") or [], graph.get("edges") or [])
     return attach_skills_metadata(graph, prompt_text)

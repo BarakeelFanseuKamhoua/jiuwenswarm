@@ -123,7 +123,7 @@ def test_the_composed_prompt_states_what_the_previous_shot_looked_like() -> None
     prompt = compose_practice_prompt(cfg=cfg, graph=None, action="Ruth waits.")
 
     assert "Ruth is seated at the left of the table, holding a cup" in prompt
-    assert "continues from that state" in prompt
+    assert "Keep those positions" in prompt
 
 def test_the_chat_model_can_be_the_directors_eyes(monkeypatch, tmp_path) -> None:
     import asyncio
@@ -197,3 +197,77 @@ def test_shots_run_in_order_only_when_something_reads_them(monkeypatch) -> None:
     assert not [e for e in blind_graph["edges"] if e.get("label") == "sequence"]
     clip2 = next(n for n in blind_graph["nodes"] if n["id"] == "n_clip_2")
     assert not (clip2.get("config") or {}).get("sequence_from")
+
+def test_the_staging_memory_remembers_earlier_shots_of_the_same_setting() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    graph = {"metadata": {}}
+    sm.record(graph, setting_id="set_1", clip_index=1, camera="bird's eye", observation="Saul on the ridge north")
+    sm.record(graph, setting_id="set_1", clip_index=2, camera="low angle", observation="Goliath in the valley")
+    sm.record(graph, setting_id="set_2", clip_index=5, camera="wide", observation="road")
+
+    digest = sm.digest(graph, setting_id="set_1", upto_index=5)
+
+    assert "Saul on the ridge north" in digest
+    assert "Goliath in the valley" in digest
+    assert "road" not in digest
+    assert digest.index("Saul") < digest.index("Goliath")
+
+
+def test_a_later_shot_only_sees_the_shots_before_it() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    graph = {"metadata": {}}
+    sm.record(graph, setting_id="set_1", clip_index=1, camera="", observation="shot one")
+    sm.record(graph, setting_id="set_1", clip_index=6, camera="", observation="shot six")
+
+    digest = sm.digest(graph, setting_id="set_1", upto_index=5)
+
+    assert "shot one" in digest
+    assert "shot six" not in digest
+
+
+def test_recording_the_same_shot_twice_keeps_one_entry() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    graph = {"metadata": {}}
+    sm.record(graph, setting_id="set_1", clip_index=3, camera="a", observation="first read")
+    sm.record(graph, setting_id="set_1", clip_index=3, camera="a", observation="second read")
+
+    digest = sm.digest(graph, setting_id="set_1", upto_index=4)
+
+    assert "second read" in digest
+    assert "first read" not in digest
+
+
+def test_every_setting_gets_its_shot_order(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import continuity_strategy as cs
+    from jiuwenswarm.server.runtime.designer.smart_graph import build_smart_video_graph
+
+    monkeypatch.setenv(cs.CONTINUITY_ENV, "observe")
+    monkeypatch.setattr(cs, "_vision_available", lambda: True)
+    analysis = {
+        "characters": [
+            {"id": "char_1", "name": "David", "description": "tunic"},
+            {"id": "char_2", "name": "Saul", "description": "armour"},
+            {"id": "char_3", "name": "Goliath", "description": "bronze"},
+        ],
+        "scenes": [
+            {"id": "set_1", "name": "valley", "description": "two armies"},
+            {"id": "set_2", "name": "camp", "description": "tents"},
+        ],
+        "clips": [
+            {"clip_index": i, "setting_id": "set_1", "action": f"beat {i}", "on_screen": ["char_1"], "camera": "wide", "timeline": f"{(i-1)*5}-{i*5}s"}
+            for i in range(1, 3)
+        ] + [
+            {"clip_index": i, "setting_id": "set_2", "action": f"beat {i}", "on_screen": ["char_2"], "camera": "wide", "timeline": f"{(i-1)*5}-{i*5}s"}
+            for i in range(3, 5)
+        ],
+        "target_duration_sec": 20,
+    }
+    graph = build_smart_video_graph(project_id="p_two", prompt="four shots", analysis=analysis)
+
+    seq = {(e["source"], e["target"]) for e in graph["edges"] if e.get("label") == "sequence"}
+    assert ("n_clip_1", "n_clip_2") in seq
+    assert ("n_clip_3", "n_clip_4") in seq, "the second setting lost its order"
+    assert len(seq) == 2

@@ -62,8 +62,9 @@ _PHRASES: dict[str, dict[str, str]] = {
         "headcount": "{count} people stay in frame together: {cast}.",
         "staging": "Staging, unchanged across the shots of this setting: {layout}.",
         "observed_state": (
-            "The shot before this one ended like this — {observed} "
-            "This shot continues from that state: the same people keep those places and poses."
+            "What the earlier shots of this setting actually rendered — {observed} "
+            "Keep those positions: the same people and armies stay on those sides of the "
+            "frame, seated or standing as reported."
         ),
         "connected_still": "{word} is the connected still {label}, and that subject is visible in this shot.",
         "cast_references": "the cast references",
@@ -110,8 +111,8 @@ _PHRASES: dict[str, dict[str, str]] = {
         "headcount": "画面内共 {count} 人：{cast}。",
         "staging": "本场景的座位与站位（同一场景的各镜头保持一致）：{layout}。",
         "observed_state": (
-            "上一镜结束时的画面：{observed}。本镜从这一状态接着演，"
-            "这些人留在原来的位置与姿态。"
+            "已拍镜头在本场景中实际呈现的画面：{observed}。本镜沿用这些位置——"
+            "同一批人、同一批队伍留在画面原来的那一侧，坐姿与站姿与记录一致。"
         ),
         "connected_still": "{word} 是相连的静帧「{label}」，该主体在本镜头中可见。",
         "cast_references": "角色参考图",
@@ -1196,6 +1197,15 @@ def _story_cast_sentence(
     return out
 
 
+def observed_state_sentence(cfg: dict[str, Any] | None, lang: str = "en") -> str:
+    """The staging memory phrased as one sentence, or ""."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    observed = strip_phrase(_scrub_lock_phrase(str(cfg.get("observed_previous_state") or "").strip()))
+    if not observed or _BAD_DIRECTIVE.search(observed):
+        return ""
+    return phrase(_PHRASES, lang, "observed_state", observed=observed)
+
+
 def compose_practice_prompt(
     *,
     cfg: dict[str, Any] | None,
@@ -1281,9 +1291,9 @@ def compose_practice_prompt(
         if line and line not in sentences and not _BAD_DIRECTIVE.search(line):
             sentences.append(line)
 
-    observed = strip_phrase(_scrub_lock_phrase(str(cfg.get("observed_previous_state") or "").strip()))
-    if observed and not _BAD_DIRECTIVE.search(observed):
-        sentences.append(phrase(_PHRASES, lang, "observed_state", observed=observed))
+    observed_sentence = observed_state_sentence(cfg, lang)
+    if observed_sentence:
+        sentences.append(observed_sentence)
 
     # The storyboard's own action text always leads the cast lines: it carries
     # the causal order and any enumerated content (props, groups, icons).
