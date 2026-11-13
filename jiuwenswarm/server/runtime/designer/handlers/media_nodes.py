@@ -8,6 +8,7 @@ Pipeline recipes (character, clip, …) keep specialized handlers via
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from jiuwenswarm.common.schema.designer_graph import (
@@ -30,6 +31,8 @@ from jiuwenswarm.server.runtime.designer.handlers.compose import ComposeNodeHand
 from jiuwenswarm.server.runtime.designer.handlers.image_nodes import _require_image
 from jiuwenswarm.server.runtime.designer.handlers.types import NodeExecutionContext, NodeResult
 from jiuwenswarm.server.runtime.designer.media_settings import image_settings, video_settings
+
+logger = logging.getLogger(__name__)
 from jiuwenswarm.server.runtime.designer.user_references import (
     user_reference_image_paths,
     user_reference_node_file,
@@ -108,6 +111,29 @@ class VideoNodeHandler:
         video = video_settings(ctx.graph)
         duration = video_duration_seconds(ctx, node)
         note_video_duration(ctx, node, duration)
+        cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline.content_language import (
+                current_content_language,
+            )
+            from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+            from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+                observed_state_sentence,
+            )
+
+            # This handler sends the node's stored prompt, so the staging memory is
+            # phrased here: what earlier shots of this setting actually rendered must
+            # reach the request, whichever builder wrote the seed.
+            digest = await staging_memory.observe_new_shots(ctx, node)
+            if digest:
+                cfg = node.get("config") if isinstance(node.get("config"), dict) else cfg
+                cfg["observed_previous_state"] = digest
+                node["config"] = cfg
+            sentence = observed_state_sentence(cfg, current_content_language())
+            if sentence and sentence not in prompt:
+                prompt = f"{prompt.rstrip()}\n\n{sentence}"
+        except Exception as exc:
+            logger.warning("staging memory not applied to this video call: %s", exc)
         generated = await generate_clip_video(
             prompt,
             save_dir=str(graph_workspace_dir(ctx.graph)),
@@ -122,6 +148,23 @@ class VideoNodeHandler:
         path = Path(str(generated.get("video_path") or ""))
         if not path.is_file():
             raise RuntimeError("video generation returned no file")
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+
+            staging_memory.register_output(
+                ctx.graph,
+                setting_id=str(cfg.get("setting_id") or "set_1"),
+                clip_index=int(cfg.get("clip_index") or 0),
+                path=path,
+            )
+            logger.warning(
+                "staging: shot %s of %s recorded as %s",
+                cfg.get("clip_index"),
+                cfg.get("setting_id"),
+                path.name,
+            )
+        except Exception as exc:
+            logger.warning("staging output not recorded: %s", exc)
         return NodeResult(
             output_ref=file_output_ref(path, kind=NODE_TYPE_VIDEO, mime_type="video/mp4"),
             message="video generated",

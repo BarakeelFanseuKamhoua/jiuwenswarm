@@ -284,3 +284,57 @@ def test_a_finished_shot_is_remembered_by_its_file(tmp_path) -> None:
     recorded = sm.recorded_outputs(graph, "set_1")
     assert recorded[1] == clip.resolve()
     assert sm.recorded_outputs(graph, "set_2") == {}
+
+def test_the_video_handler_sends_and_records_the_staging_memory(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from jiuwenswarm.server.runtime.designer.handlers import media_nodes
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    prev = tmp_path / "prev.mp4"
+    prev.write_bytes(b"\x00")
+    graph = {
+        "metadata": {},
+        "edges": [],
+        "nodes": [
+            {"id": "n_clip_1", "type": "video", "config": {"pipeline": "clip", "setting_id": "set_1", "clip_index": 1}},
+            {
+                "id": "n_clip_2",
+                "type": "video",
+                "config": {
+                    "pipeline": "clip",
+                    "setting_id": "set_1",
+                    "clip_index": 2,
+                    "prompt": "seed prompt for shot two",
+                },
+            },
+        ],
+    }
+    sm.record(graph, setting_id="set_1", clip_index=1, camera="bird's eye", observation="Saul north, Philistines south")
+    sm.register_output(graph, setting_id="set_1", clip_index=1, path=prev)
+
+    captured: dict[str, str] = {}
+
+    async def fake_generate(prompt, **_kwargs):
+        captured["prompt"] = prompt
+        out = tmp_path / "out.mp4"
+        out.write_bytes(b"\x00")
+        return {"video_path": str(out)}
+
+    monkeypatch.setattr(media_nodes, "generate_clip_video", fake_generate)
+    monkeypatch.setattr(
+        media_nodes,
+        "video_settings",
+        lambda _g: type("V", (), {"aspect_ratio": "16:9", "resolution": "720P"})(),
+    )
+    from jiuwenswarm.server.runtime.designer.handlers import clip as clip_handler
+
+    monkeypatch.setattr(clip_handler, "video_duration_seconds", lambda _c, _n: 5)
+    monkeypatch.setattr(clip_handler, "note_video_duration", lambda *_a, **_k: None)
+
+    ctx = type("C", (), {"graph": graph, "run": {"node_states": {}}, "run_id": "r", "node_id": "n_clip_2", "media_dir": tmp_path})()
+    asyncio.run(media_nodes.VideoNodeHandler().execute(graph["nodes"][1], ctx))
+
+    assert "Saul north, Philistines south" in captured["prompt"]
+    assert captured["prompt"].startswith("seed prompt for shot two")
+    assert sm.recorded_outputs(graph, "set_1").get(2) is not None
