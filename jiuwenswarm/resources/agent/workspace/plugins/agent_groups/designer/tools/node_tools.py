@@ -375,6 +375,25 @@ def _prompt_limit(kind: str) -> dict[str, Any] | None:
 _MISSING = object()
 
 
+def _positive(prompt: str, node_id: str) -> str:
+    """Strip negative phrasing from an image or clip prompt (sound excepted)."""
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+        cleaned = scrub(prompt)
+        if cleaned != prompt:
+            logger.warning(
+                "[design-tools] negative phrasing removed: node=%s before=%d after=%d",
+                node_id,
+                len(prompt),
+                len(cleaned),
+            )
+        return cleaned
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[design-tools] prompt not scrubbed: node=%s err=%s", node_id, exc)
+        return prompt
+
+
 async def _apply_staging_memory(
     env: dict[str, Any],
     node: dict[str, Any],
@@ -478,6 +497,8 @@ async def generate_node_output(
         focused = f"{lead}\n{focused}"
     if kind == "video":
         focused = await _apply_staging_memory(env, node, node_id, focused)
+    if kind in {"image", "video"}:
+        focused = _positive(focused, node_id)
     injected: dict[str, Any] = {"prompt": focused}
     authored_duration = (node.get("config") or {}).get("duration_sec")
     has_authored_duration = isinstance(authored_duration, (int, float)) and not isinstance(

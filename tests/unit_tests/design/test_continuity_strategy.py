@@ -338,3 +338,51 @@ def test_the_video_handler_sends_and_records_the_staging_memory(tmp_path, monkey
     assert "Saul north, Philistines south" in captured["prompt"]
     assert captured["prompt"].startswith("seed prompt for shot two")
     assert sm.recorded_outputs(graph, "set_1").get(2) is not None
+
+def test_a_negative_clause_is_removed_from_an_image_prompt() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+    out = scrub("AERIAL view of one camp at dawn. No people anywhere in frame.")
+
+    assert "people" in out  # rewritten to "the place completely empty of people"
+    assert "No people" not in out
+    assert "\u65e0" not in out
+
+
+def test_plate_phrases_are_rewritten_into_the_positive() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+    plate = "Character identity plate, group cast sheet — one single image, no scene, no environment."
+    out = scrub(plate)
+    assert "no scene" not in out.lower()
+    assert "plain neutral studio background" in out
+
+    count = scrub("SUBJECT: nine men, all in frame. No more, no fewer.")
+    assert "No more" not in count
+
+
+def test_a_sound_negative_survives() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+    sound = "Sound: diegetic sound only — no music, no score, no ambient bed."
+    assert scrub(sound) == sound
+    assert "\u4e0d\u8981\u914d\u4e50" in scrub("\u58f0\u97f3\uff1a\u73b0\u573a\u97f3\uff1b\u4e0d\u8981\u914d\u4e50\u3002")
+
+
+def test_an_observation_is_stored_without_negatives() -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    graph = {"metadata": {}}
+    sm.record(
+        graph,
+        setting_id="set_1",
+        clip_index=1,
+        camera="wide",
+        observation="Five people around a table. No door is visible. Camps on both ridges.",
+    )
+
+    digest = sm.digest(graph, setting_id="set_1", upto_index=2)
+
+    assert "No door" not in digest
+    assert "Five people around a table" in digest
+    assert "Camps on both ridges" in digest

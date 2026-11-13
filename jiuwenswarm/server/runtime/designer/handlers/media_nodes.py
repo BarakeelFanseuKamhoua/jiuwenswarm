@@ -76,6 +76,12 @@ class ImageNodeHandler:
         payload = connected_payload_clause(edge_text_inputs(ctx, node), edge_video_inputs(ctx, node))
         if payload:
             prompt = f"{prompt.rstrip()}\n\n{payload}".strip()
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+            prompt = scrub(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("image prompt not scrubbed: %s", exc)
         refs = _upstream_images(ctx, node)
         return await _require_image(
             prompt=prompt,

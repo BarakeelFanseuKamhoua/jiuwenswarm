@@ -45,7 +45,11 @@ def _memory(graph: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
 
 def record(graph: dict[str, Any] | None, *, setting_id: str, clip_index: int, camera: str, observation: str) -> None:
     """Store one shot's reading, replacing any earlier reading of the same shot."""
-    text = str(observation or "").strip()
+    from jiuwenswarm.server.runtime.designer.pipeline.positive_prompt import scrub
+
+    # A reading is fed to the video model later, so it must be positive too:
+    # "no door is visible" would pull a door into the shot.
+    text = scrub(str(observation or "")).strip()
     if not text:
         return
     store = _memory(graph)
