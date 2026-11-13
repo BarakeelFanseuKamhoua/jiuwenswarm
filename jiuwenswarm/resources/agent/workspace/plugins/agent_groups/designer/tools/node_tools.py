@@ -375,6 +375,75 @@ def _prompt_limit(kind: str) -> dict[str, Any] | None:
 _MISSING = object()
 
 
+async def _apply_staging_memory(
+    env: dict[str, Any],
+    node: dict[str, Any],
+    node_id: str,
+    focused: str,
+) -> str:
+    """Read the earlier shots of this setting and append what they looked like.
+
+    Every clip request passes through here, whichever handler renders it, so this
+    is the one place the staging memory is guaranteed to reach the prompt.
+    """
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+        from jiuwenswarm.server.runtime.designer.pipeline.content_language import (
+            current_content_language,
+        )
+        from jiuwenswarm.server.runtime.designer.pipeline.video_prompt_practice import (
+            observed_state_sentence,
+        )
+
+        ctx = _execution_context(env, node_id)
+        digest = await staging_memory.observe_new_shots(ctx, node)
+        cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+        cfg = dict(cfg)
+        if digest:
+            cfg["observed_previous_state"] = digest
+            node["config"] = cfg
+        sentence = observed_state_sentence(cfg, current_content_language())
+        if sentence and sentence not in focused:
+            logger.warning(
+                "[design-tools] staging memory applied: node=%s shot=%s chars=%d",
+                node_id,
+                cfg.get("clip_index"),
+                len(digest),
+            )
+            return f"{focused.rstrip()}\n\n{sentence}"
+        if not digest:
+            logger.warning("[design-tools] staging memory empty: node=%s", node_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[design-tools] staging memory not applied: node=%s err=%s", node_id, exc)
+    return focused
+
+
+def _record_staging_output(env: dict[str, Any], node: dict[str, Any]) -> None:
+    """Remember the file this shot produced, so later shots can be sampled."""
+    try:
+        from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+        from jiuwenswarm.server.runtime.designer.handlers.common import path_from_uri
+
+        cfg = node.get("config") if isinstance(node.get("config"), dict) else {}
+        ref = node.get("output_ref") if isinstance(node.get("output_ref"), dict) else {}
+        path = path_from_uri(str(ref.get("uri") or ""))
+        if path is None:
+            return
+        staging_memory.register_output(
+            env.get("graph"),
+            setting_id=str(cfg.get("setting_id") or "set_1"),
+            clip_index=int(cfg.get("clip_index") or 0),
+            path=path,
+        )
+        logger.warning(
+            "[design-tools] staging output recorded: shot=%s file=%s",
+            cfg.get("clip_index"),
+            getattr(path, "name", ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[design-tools] staging output not recorded: %s", exc)
+
+
 async def generate_node_output(
     shot_ticket: Any,
     *,
@@ -407,6 +476,8 @@ async def generate_node_output(
     lead = (subject or setting or "").strip()
     if lead and lead not in focused:
         focused = f"{lead}\n{focused}"
+    if kind == "video":
+        focused = await _apply_staging_memory(env, node, node_id, focused)
     injected: dict[str, Any] = {"prompt": focused}
     authored_duration = (node.get("config") or {}).get("duration_sec")
     has_authored_duration = isinstance(authored_duration, (int, float)) and not isinstance(
@@ -449,6 +520,8 @@ async def generate_node_output(
         _note_member_error(env, node_id, f"{member} generation failed: {last_error}")
         return failure(f"generation_failed: {last_error}")
     _note_member_error(env, node_id, None)
+    if kind == "video":
+        _record_staging_output(env, node)
     env["generations"][node_id] = result
     primary = result.output_ref or {}
     return {
