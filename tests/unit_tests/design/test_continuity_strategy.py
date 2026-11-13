@@ -271,3 +271,16 @@ def test_every_setting_gets_its_shot_order(monkeypatch) -> None:
     assert ("n_clip_1", "n_clip_2") in seq
     assert ("n_clip_3", "n_clip_4") in seq, "the second setting lost its order"
     assert len(seq) == 2
+
+def test_a_finished_shot_is_remembered_by_its_file(tmp_path) -> None:
+    from jiuwenswarm.server.runtime.designer.pipeline import staging_memory as sm
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00")
+    graph = {"metadata": {}}
+
+    sm.register_output(graph, setting_id="set_1", clip_index=1, path=clip)
+
+    recorded = sm.recorded_outputs(graph, "set_1")
+    assert recorded[1] == clip.resolve()
+    assert sm.recorded_outputs(graph, "set_2") == {}

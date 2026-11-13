@@ -1422,6 +1422,17 @@ class DesignerGraphToolkit:
             )
         except Exception:
             logger.debug("call_video_model speech handoff stamp failed", exc_info=True)
+        try:
+            from jiuwenswarm.server.runtime.designer.pipeline import staging_memory
+
+            staging_memory.register_output(
+                graph,
+                setting_id=str(cfg.get("setting_id") or "set_1"),
+                clip_index=node_clip_index(node),
+                path=path,
+            )
+        except Exception:
+            logger.debug("clip output not recorded for staging", exc_info=True)
         self.completed = NodeResult(
             output_ref=file_output_ref(path, kind="video", mime_type="video/mp4"),
             output_refs=[file_output_ref(path, kind="video", mime_type="video/mp4")],

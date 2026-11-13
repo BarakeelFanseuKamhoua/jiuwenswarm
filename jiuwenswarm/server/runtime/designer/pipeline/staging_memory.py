@@ -80,6 +80,61 @@ def digest(graph: dict[str, Any] | None, *, setting_id: str, upto_index: int, li
     return text[:limit]
 
 
+OUTPUTS_KEY = "clip_outputs"
+
+
+def register_output(graph: dict[str, Any] | None, *, setting_id: str, clip_index: int, path: Any) -> None:
+    """Remember where one finished shot's file is, so later shots can read it.
+
+    The run state is not always reachable from a node's tool context, so the file
+    is recorded on the graph itself the moment the shot is written.
+    """
+    from pathlib import Path
+
+    if not path:
+        return
+    try:
+        resolved = Path(str(path)).resolve()
+    except (OSError, ValueError):
+        return
+    if not resolved.is_file():
+        return
+    graph = graph if isinstance(graph, dict) else {}
+    meta = graph.get("metadata") if isinstance(graph.get("metadata"), dict) else {}
+    store = meta.get(OUTPUTS_KEY)
+    if not isinstance(store, dict):
+        store = {}
+        meta[OUTPUTS_KEY] = store
+        graph["metadata"] = meta
+    setting = str(setting_id or "set_1").strip() or "set_1"
+    per_setting = store.get(setting)
+    if not isinstance(per_setting, dict):
+        per_setting = {}
+        store[setting] = per_setting
+    per_setting[str(int(clip_index or 0))] = str(resolved)
+
+
+def recorded_outputs(graph: dict[str, Any] | None, setting_id: str) -> dict[int, Any]:
+    from pathlib import Path
+
+    graph = graph if isinstance(graph, dict) else {}
+    meta = graph.get("metadata") if isinstance(graph.get("metadata"), dict) else {}
+    store = meta.get(OUTPUTS_KEY) if isinstance(meta.get(OUTPUTS_KEY), dict) else {}
+    per_setting = store.get(str(setting_id or "set_1").strip() or "set_1")
+    out: dict[int, Path] = {}
+    if not isinstance(per_setting, dict):
+        return out
+    for key, value in per_setting.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        path = Path(str(value))
+        if path.is_file():
+            out[index] = path
+    return out
+
+
 def observed_clip_indexes(graph: dict[str, Any] | None, setting_id: str) -> set[int]:
     store = _memory(graph)
     setting = str(setting_id or "set_1").strip() or "set_1"
@@ -98,7 +153,7 @@ def completed_clip_paths(ctx: Any, *, setting_id: str, upto_index: int) -> dict[
     run = getattr(ctx, "run", None) or {}
     states = run.get("node_states") if isinstance(run, dict) else None
     states = states if isinstance(states, dict) else {}
-    out: dict[int, Path] = {}
+    out: dict[int, Path] = recorded_outputs(graph, setting_id)
     for node in graph.get("nodes") or []:
         if not isinstance(node, dict):
             continue
@@ -144,7 +199,7 @@ async def observe_new_shots(ctx: Any, node: dict[str, Any], *, lang: str | None 
             continue
         try:
             observation = await cs.observe_previous_clip([path], lang=lang or "en")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("staging observation failed for shot %s", earlier_index, exc_info=True)
             continue
         if not observation:
